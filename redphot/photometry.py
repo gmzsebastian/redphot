@@ -467,11 +467,11 @@ def loadimage(image_name, gain = '', rdnoise = '', RA = '', DEC = '', airmass = 
 
     # Import Header Values
     gain_value    = header_value(header_data, ['GAIN', 'EGAIN', 'HIERARCH CELL.GAIN', 'GAINDL'], gain        )
-    rdnoise_value = header_value(header_data, ['RDNOISE', 'ENOISE', 'HIERARCH CELL.READNOISE'] , rdnoise     )
+    rdnoise_value = header_value(header_data, ['RDNOISE', 'ENOISE', 'HIERARCH CELL.READNOISE','READNOI'] , rdnoise     )
     ra_value      = header_value(header_data, ['RA']                                           , RA          , vartype = str)
     dec_value     = header_value(header_data, ['DEC']                                          , DEC         , vartype = str)
     airmass_value = header_value(header_data, ['AIR', 'AIRMASS', 'SECZ']                       , airmass     )
-    mjd_value     = header_value(header_data, ['MJD', 'MJD-OBS', 'JD']                         , mjd         )
+    mjd_value     = header_value(header_data, ['MJD', 'MJD-OBS', 'JD', 'OBSMJD']               , mjd         )
     filter_value  = header_value(header_data, ['FILTER', 'HIERARCH FPA.FILTER', 'CCDFLTID']    , color       , vartype = str)
     object_value  = header_value(header_data, ['OBJECT']                                       , object_name , vartype = str)
     exptime_value = header_value(header_data, ['EXPTIME']                                      , exptime     )
@@ -508,11 +508,11 @@ def loadimage(image_name, gain = '', rdnoise = '', RA = '', DEC = '', airmass = 
     coord = SkyCoord(ra_value, dec_value, unit=(u.hourangle, u.deg))
 
     # Fix filter if not a normal filter
-    g_filters = ['g-ZTF', 'g_filter', 'g-SM-SkyMapper', 'g-Sloan', 'g_Sloan', 'Sloan_g', 'g_sloan', 'g.00000', 'gS', 'gp']
-    r_filters = ['r-ZTF', 'r_filter', 'R', 'R-Cousins', 'r-SM-SkyMapper', 'r_Sloan', 'Sloan_r', 'r_sloan', 'r.00000', 'rS', 'rp']
-    i_filters = ['i-ZTF', 'i_filter', 'i-Sloan', 'i-sloan', 'I-Cousins', 'I', 'i_Sloan', 'Sloan_i', 'i_sloan', 'i.00000', 'iS', 'ip']
-    z_filters = ['z-ZTF', 'z_filter', 'z-Sloan', 'z-sloan', 'Z', 'z_Sloan', 'Z_sloan', 'z.00000', 'zS', 'zp']
-    y_filters = ['y-ZTF', 'y_filter', 'y-Sloan', 'y-sloan', 'Y', 'y_Sloan', 'Y_sloan', 'y.00000', 'yS', 'yp']
+    g_filters = ['g-ZTF', 'ZTF_g', 'ZTF g', 'g-SM-SkyMapper', 'g-Sloan', 'g_Sloan', 'g_sloan', 'g.00000', 'gS', 'gp']
+    r_filters = ['r-ZTF', 'ZTF_r', 'ZTF r', 'R', 'R-Cousins', 'r-SM-SkyMapper', 'r_Sloan', 'r_sloan', 'r.00000', 'rS', 'rp']
+    i_filters = ['i-ZTF', 'ZTF_i', 'ZTF i', 'i-Sloan', 'i-sloan', 'I-Cousins', 'I', 'i_Sloan', 'i_sloan', 'i.00000', 'iS', 'ip']
+    z_filters = ['z-ZTF', 'ZTF_z', 'ZTF z', 'z-Sloan', 'z-sloan', 'Z', 'z_Sloan', 'Z_sloan', 'z.00000', 'zS', 'zp']
+    y_filters = ['y-ZTF', 'ZTF_y', 'ZTF y', 'y-Sloan', 'y-sloan', 'Y', 'y_Sloan', 'Y_sloan', 'y.00000', 'yS', 'yp']
 
     if   filter_value in g_filters: filter_value = 'g'
     elif filter_value in r_filters: filter_value = 'r'
