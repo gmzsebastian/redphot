@@ -16,6 +16,7 @@ setup(
         'numpy',
         'matplotlib',
         'astropy',
+        'photutils',
         'scipy',
         'emcee'
     ]

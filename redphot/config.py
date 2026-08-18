@@ -427,22 +427,33 @@ DEFAULT_SETTINGS = {
         "method": "Background2D",
         "box_size": [128, 128],
         "filter_size": [3, 3],
+        "enforce_broad_scale": True,
+        "minimum_mesh_fwhm": 10.0,
         "sigma_clip": 3.0,
         "maximum_iterations": 10,
         "exclude_percentile": 20.0,
         "estimator": "SExtractorBackground",
         "rms_estimator": "StdBackgroundRMS",
+        "fallback_to_global": True,
         "source_mask_enabled": True,
         "source_mask_sigma": 3.0,
         "source_mask_min_pixels": 5,
         "source_mask_grow_fwhm": 3.0,
+        "source_mask_kernel_fwhm": 1.0,
         "protect_target": True,
         "target_protection_fwhm": 5.0,
         "protect_host": False,
+        "host_protection_fwhm": 10.0,
         "host_protection_region": None,
         "measure_residual_gradient": True,
+        "gradient_max_samples": 50000,
+        "measure_source_preservation": True,
+        "source_preservation_max_sources": 50,
+        "source_preservation_tolerance": 0.02,
         "save_background": True,
         "save_background_rms": True,
+        "save_corrected": True,
+        "save_source_mask": False,
     },
     "source_detection": {
         "enabled": True,
@@ -1128,6 +1139,28 @@ def validate_settings(settings):
             "background.mode must be off, measure_only, subtract_broad, "
             "local_only, or broad_plus_local"
         )
+
+    background_box = settings["background"].get("box_size", [128, 128])
+    if isinstance(background_box, (int, float)):
+        background_box = [background_box, background_box]
+    if len(background_box) != 2 or any(int(value) <= 0 for value in background_box):
+        raise ValueError("background.box_size must contain two positive integers")
+
+    background_filter = settings["background"].get("filter_size", [3, 3])
+    if isinstance(background_filter, (int, float)):
+        background_filter = [background_filter, background_filter]
+    if (
+        len(background_filter) != 2
+        or any(int(value) <= 0 for value in background_filter)
+        or any(int(value) % 2 == 0 for value in background_filter)
+    ):
+        raise ValueError(
+            "background.filter_size must contain two positive odd integers"
+        )
+
+    exclude_percentile = settings["background"].get("exclude_percentile", 20.0)
+    if not 0 <= float(exclude_percentile) <= 100:
+        raise ValueError("background.exclude_percentile must be between 0 and 100")
 
     subtraction_method = settings["subtraction"]["method"]
     if subtraction_method not in {"hotpants", "pyzogy"}:

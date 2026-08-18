@@ -23,6 +23,7 @@ from astropy.nddata import (
     StdDevUncertainty,
     VarianceUncertainty,
 )
+from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.table import MaskedColumn, Table
 from astropy.time import Time
 from astropy.wcs import WCS
@@ -3074,6 +3075,741 @@ def correct_fringe(ccd, metadata=None, settings=None, crop_slices=None, source_m
     return working, products, info
 
 
+# ---------------------------------------------------------------------------
+# Broad two-dimensional background
+#
+# Source, target, and optional host masks are constructed before Photutils
+# Background2D is called. The interpolated broad model is kept separate from
+# local sky measurements, which remain the responsibility of the later
+# photometry stage.
+# ---------------------------------------------------------------------------
+
+
+def _background_pair(value, name, odd=False):
+    """Normalize a scalar or two-element background setting to ``(ny, nx)``."""
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        pair = (int(value), int(value))
+    else:
+        try:
+            pair = tuple(int(item) for item in value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("{} must be an integer or two integers".format(name)) from error
+    if len(pair) != 2 or any(item <= 0 for item in pair):
+        raise ValueError("{} must contain two positive integers".format(name))
+    if odd and any(item % 2 == 0 for item in pair):
+        raise ValueError("{} values must be odd".format(name))
+    return pair
+
+
+def _background_estimators(settings):
+    """Construct the configured Photutils background and RMS estimators."""
+
+    from photutils.background import (
+        BiweightScaleBackgroundRMS,
+        MADStdBackgroundRMS,
+        MMMBackground,
+        MeanBackground,
+        MedianBackground,
+        ModeEstimatorBackground,
+        SExtractorBackground,
+        StdBackgroundRMS,
+    )
+
+    background_settings = settings.get("background", {})
+    estimators = {
+        "SExtractorBackground": SExtractorBackground,
+        "MedianBackground": MedianBackground,
+        "MeanBackground": MeanBackground,
+        "MMMBackground": MMMBackground,
+        "ModeEstimatorBackground": ModeEstimatorBackground,
+    }
+    rms_estimators = {
+        "StdBackgroundRMS": StdBackgroundRMS,
+        "MADStdBackgroundRMS": MADStdBackgroundRMS,
+        "BiweightScaleBackgroundRMS": BiweightScaleBackgroundRMS,
+    }
+    estimator_name = background_settings.get(
+        "estimator", "SExtractorBackground"
+    )
+    rms_name = background_settings.get(
+        "rms_estimator", "StdBackgroundRMS"
+    )
+    if estimator_name not in estimators:
+        raise ValueError(
+            "Unknown background estimator {!r}; choose from {}".format(
+                estimator_name, ", ".join(sorted(estimators))
+            )
+        )
+    if rms_name not in rms_estimators:
+        raise ValueError(
+            "Unknown background RMS estimator {!r}; choose from {}".format(
+                rms_name, ", ".join(sorted(rms_estimators))
+            )
+        )
+    return estimators[estimator_name](sigma_clip=None), rms_estimators[rms_name](
+        sigma_clip=None
+    )
+
+
+def _ellipse_mask(shape, x, y, semi_major, semi_minor=None, theta_deg=0.0):
+    """Return a boolean ellipse mask in pixel coordinates."""
+
+    if semi_minor is None:
+        semi_minor = semi_major
+    semi_major = float(semi_major)
+    semi_minor = float(semi_minor)
+    if semi_major <= 0 or semi_minor <= 0:
+        return np.zeros(shape, dtype=bool)
+
+    yy, xx = np.ogrid[:shape[0], :shape[1]]
+    angle = np.deg2rad(float(theta_deg))
+    cosine = np.cos(angle)
+    sine = np.sin(angle)
+    dx = xx - float(x)
+    dy = yy - float(y)
+    major_axis = dx * cosine + dy * sine
+    minor_axis = -dx * sine + dy * cosine
+    return (
+        (major_axis / semi_major) ** 2
+        + (minor_axis / semi_minor) ** 2
+        <= 1.0
+    )
+
+
+def _background_region_mask(ccd, metadata, settings, target, region):
+    """Convert a target or host protection region into a pixel mask."""
+
+    shape = np.asarray(ccd.data).shape
+    background_settings = settings.get("background", {})
+    fwhm = _fwhm_guess_pixels(settings)
+
+    if region is None:
+        position = _project_target_pixel(ccd, metadata, settings, target)
+        if position is None:
+            return np.zeros(shape, dtype=bool), None
+        radius = float(
+            background_settings.get("host_protection_fwhm", 10.0)
+        ) * fwhm
+        return _ellipse_mask(shape, position[0], position[1], radius), {
+            "x": position[0],
+            "y": position[1],
+            "semi_major_pixels": radius,
+            "semi_minor_pixels": radius,
+        }
+
+    if not isinstance(region, Mapping):
+        raise TypeError("background.host_protection_region must be a mapping")
+
+    pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
+    x = region.get("x")
+    y = region.get("y")
+    if x is None or y is None:
+        ra = region.get("ra")
+        dec = region.get("dec")
+        coordinate = _coerce_target_coordinate(
+            None if ra is None or dec is None else (ra, dec), settings
+        )
+        wcs = getattr(ccd, "wcs", None)
+        if coordinate is None or wcs is None or not wcs.has_celestial:
+            return np.zeros(shape, dtype=bool), None
+        try:
+            x, y = wcs.world_to_pixel(coordinate)
+        except Exception:
+            return np.zeros(shape, dtype=bool), None
+
+    semi_major = region.get("semi_major_pixels", region.get("radius_pixels"))
+    semi_minor = region.get("semi_minor_pixels", semi_major)
+    if semi_major is None:
+        semi_major_arcsec = region.get(
+            "semi_major_arcsec", region.get("radius_arcsec")
+        )
+        semi_minor_arcsec = region.get("semi_minor_arcsec", semi_major_arcsec)
+        if semi_major_arcsec is None or pixel_scale is None:
+            return np.zeros(shape, dtype=bool), None
+        semi_major = float(semi_major_arcsec) / pixel_scale
+        semi_minor = float(semi_minor_arcsec) / pixel_scale
+
+    theta = float(region.get("theta_deg", 0.0))
+    mask = _ellipse_mask(shape, x, y, semi_major, semi_minor, theta)
+    return mask, {
+        "x": float(x),
+        "y": float(y),
+        "semi_major_pixels": float(semi_major),
+        "semi_minor_pixels": float(semi_minor),
+        "theta_deg": theta,
+    }
+
+
+def make_background_source_mask(ccd, metadata=None, settings=None, target=None):
+    """Build an expanded source mask with target and optional host protection.
+
+    A sigma-clipped global estimate is used only to create the preliminary
+    segmentation image. Detected sources are dilated by the configured number
+    of FWHM before any broad background mesh is measured.
+
+    Returns
+    -------
+    mask : numpy.ndarray
+        Combined source, target, host, invalid-pixel, and input mask.
+    products : dict
+        Separate source, target, host, base, and segmentation arrays.
+    info : dict
+        Detection thresholds, dilation size, source count, and mask fractions.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    background_settings = settings.get("background", {})
+    data = np.asarray(ccd.data, dtype=float)
+    shape = data.shape
+    base_mask = ~np.isfinite(data)
+    if getattr(ccd, "mask", None) is not None:
+        base_mask |= np.asarray(ccd.mask, dtype=bool)
+
+    source_mask = np.zeros(shape, dtype=bool)
+    segmentation = np.zeros(shape, dtype=np.int32)
+    detection_threshold = None
+    source_count = 0
+    fwhm = _fwhm_guess_pixels(settings)
+    grow_radius = int(
+        np.ceil(float(background_settings.get("source_mask_grow_fwhm", 3.0)) * fwhm)
+    )
+    grow_size = max(1, 2 * grow_radius + 1)
+
+    if background_settings.get("source_mask_enabled", True):
+        usable = ~base_mask
+        if np.count_nonzero(usable) >= 20:
+            sigma = float(background_settings.get("source_mask_sigma", 3.0))
+            maxiters = int(background_settings.get("maximum_iterations", 10))
+            _, median, std = sigma_clipped_stats(
+                data, mask=base_mask, sigma=sigma, maxiters=maxiters
+            )
+            if np.isfinite(std) and std > 0:
+                from astropy.convolution import convolve
+                from photutils.segmentation import (
+                    detect_sources,
+                    make_2dgaussian_kernel,
+                )
+
+                kernel_fwhm = max(
+                    1.0,
+                    float(
+                        background_settings.get("source_mask_kernel_fwhm", 1.0)
+                    )
+                    * fwhm,
+                )
+                kernel_size = max(3, 2 * int(np.ceil(2.0 * kernel_fwhm)) + 1)
+                kernel = make_2dgaussian_kernel(kernel_fwhm, size=kernel_size)
+                filled = np.where(base_mask, median, data)
+                convolved = convolve(
+                    filled - median,
+                    kernel,
+                    boundary="extend",
+                    normalize_kernel=True,
+                )
+                detection_threshold = sigma * float(std)
+                minimum_pixels = int(
+                    background_settings.get("source_mask_min_pixels", 5)
+                )
+                try:
+                    segment_image = detect_sources(
+                        convolved,
+                        detection_threshold,
+                        n_pixels=minimum_pixels,
+                        mask=base_mask,
+                    )
+                except TypeError:
+                    segment_image = detect_sources(
+                        convolved,
+                        detection_threshold,
+                        npixels=minimum_pixels,
+                        mask=base_mask,
+                    )
+                if segment_image is not None:
+                    segmentation = np.asarray(segment_image.data, dtype=np.int32)
+                    if hasattr(segment_image, "n_labels"):
+                        source_count = int(segment_image.n_labels)
+                    else:
+                        source_count = int(segment_image.nlabels)
+                    source_mask = np.asarray(
+                        segment_image.make_source_mask(size=grow_size), dtype=bool
+                    )
+
+    target_mask = np.zeros(shape, dtype=bool)
+    target_info = None
+    if background_settings.get("protect_target", True):
+        position = _project_target_pixel(ccd, metadata, settings, target)
+        if position is not None:
+            radius = float(
+                background_settings.get("target_protection_fwhm", 5.0)
+            ) * fwhm
+            target_mask = _ellipse_mask(
+                shape, position[0], position[1], radius
+            )
+            target_info = {
+                "x": position[0],
+                "y": position[1],
+                "radius_pixels": radius,
+            }
+
+    host_mask = np.zeros(shape, dtype=bool)
+    host_info = None
+    if background_settings.get("protect_host", False):
+        host_mask, host_info = _background_region_mask(
+            ccd,
+            metadata,
+            settings,
+            target,
+            background_settings.get("host_protection_region"),
+        )
+
+    protected = source_mask | target_mask | host_mask
+    combined = base_mask | protected
+    products = {
+        "base_mask": base_mask,
+        "detected_source_mask": source_mask,
+        "target_mask": target_mask,
+        "host_mask": host_mask,
+        "protected_source_mask": protected,
+        "background_mask": combined,
+        "segmentation": segmentation,
+    }
+    info = {
+        "source_count": source_count,
+        "detection_threshold": detection_threshold,
+        "grow_size_pixels": grow_size,
+        "fwhm_pixels": fwhm,
+        "target": target_info,
+        "host": host_info,
+        "source_mask_fraction": float(protected.mean()),
+        "combined_mask_fraction": float(combined.mean()),
+    }
+    return combined, products, info
+
+
+def _effective_background_box(shape, settings):
+    """Return a mesh size safely broader than the configured PSF scale."""
+
+    background_settings = settings.get("background", {})
+    requested = _background_pair(
+        background_settings.get("box_size", [128, 128]),
+        "background.box_size",
+    )
+    fwhm = _fwhm_guess_pixels(settings)
+    minimum_multiple = float(
+        background_settings.get("minimum_mesh_fwhm", 10.0)
+    )
+    minimum = max(1, int(np.ceil(minimum_multiple * fwhm)))
+
+    if background_settings.get("enforce_broad_scale", True):
+        effective = tuple(max(value, minimum) for value in requested)
+    else:
+        effective = requested
+    effective = tuple(min(value, size) for value, size in zip(effective, shape))
+    return requested, effective, minimum
+
+
+def _background_gradient(data, mask, max_samples=50000):
+    """Fit a robustly sampled plane and summarize its image-wide amplitude."""
+
+    array = np.asarray(data, dtype=float)
+    valid = np.isfinite(array) & ~np.asarray(mask, dtype=bool)
+    flat_indices = np.flatnonzero(valid)
+    if flat_indices.size < 20:
+        return {
+            "slope_x_per_pixel": None,
+            "slope_y_per_pixel": None,
+            "peak_to_peak": None,
+            "fit_rms": None,
+            "sample_count": int(flat_indices.size),
+        }
+    if flat_indices.size > int(max_samples):
+        selection = np.linspace(
+            0, flat_indices.size - 1, int(max_samples), dtype=int
+        )
+        flat_indices = flat_indices[selection]
+
+    y, x = np.unravel_index(flat_indices, array.shape)
+    values = array.ravel()[flat_indices]
+    design = np.column_stack((x, y, np.ones(values.size)))
+    coefficients, _, _, _ = np.linalg.lstsq(design, values, rcond=None)
+    fitted = design @ coefficients
+    slope_x, slope_y, _ = coefficients
+    ny, nx = array.shape
+    peak_to_peak = abs(slope_x) * max(nx - 1, 1) + abs(slope_y) * max(ny - 1, 1)
+    return {
+        "slope_x_per_pixel": float(slope_x),
+        "slope_y_per_pixel": float(slope_y),
+        "peak_to_peak": float(peak_to_peak),
+        "fit_rms": float(np.sqrt(np.mean((values - fitted) ** 2))),
+        "sample_count": int(values.size),
+    }
+
+
+def _background_profiles(data, background, corrected, mask):
+    """Return masked median row and column profiles for diagnostics."""
+
+    def profiles(array):
+        if array is None:
+            return None, None
+        values = np.where(mask, np.nan, np.asarray(array, dtype=float))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            rows = np.nanmedian(values, axis=1)
+            columns = np.nanmedian(values, axis=0)
+        return rows, columns
+
+    data_rows, data_columns = profiles(data)
+    background_rows, background_columns = profiles(background)
+    corrected_rows, corrected_columns = profiles(corrected)
+    return {
+        "row_input": data_rows,
+        "row_background": background_rows,
+        "row_corrected": corrected_rows,
+        "column_input": data_columns,
+        "column_background": background_columns,
+        "column_corrected": corrected_columns,
+    }
+
+
+def _source_preservation(data, corrected, segmentation, mask, settings):
+    """Compare local-background-subtracted source flux before and after."""
+
+    labels = np.unique(segmentation)
+    labels = labels[labels > 0]
+    result = {
+        "source_count": 0,
+        "median_fractional_change": None,
+        "maximum_fractional_change": None,
+    }
+    if labels.size == 0:
+        return result
+
+    ndimage = _try_ndimage()
+    if ndimage is None:
+        return result
+
+    maximum_sources = int(
+        settings.get("background", {}).get(
+            "source_preservation_max_sources", 50
+        )
+    )
+    areas = [(label, int(np.count_nonzero(segmentation == label))) for label in labels]
+    areas.sort(key=lambda item: item[1], reverse=True)
+    changes = []
+
+    for label, _ in areas[:maximum_sources]:
+        source = segmentation == label
+        ring = ndimage.binary_dilation(source, iterations=3) & ~source
+        ring &= ~mask
+        source_valid = source & ~mask
+        if np.count_nonzero(source_valid) < 3 or np.count_nonzero(ring) < 10:
+            continue
+        original_sky = float(np.median(data[ring]))
+        corrected_sky = float(np.median(corrected[ring]))
+        original_flux = float(
+            np.sum(data[source_valid] - original_sky)
+        )
+        corrected_flux = float(
+            np.sum(corrected[source_valid] - corrected_sky)
+        )
+        if not np.isfinite(original_flux) or abs(original_flux) <= 0:
+            continue
+        changes.append(abs(corrected_flux - original_flux) / abs(original_flux))
+
+    if changes:
+        result.update(
+            {
+                "source_count": len(changes),
+                "median_fractional_change": float(np.median(changes)),
+                "maximum_fractional_change": float(np.max(changes)),
+            }
+        )
+    return result
+
+
+def model_background(ccd, metadata=None, settings=None, target=None):
+    """Measure and optionally subtract a broad two-dimensional background.
+
+    Supported modes are ``off``, ``measure_only``, ``subtract_broad``,
+    ``local_only``, and ``broad_plus_local``. Broad subtraction never performs
+    a local sky measurement; ``local_only`` and the local part of
+    ``broad_plus_local`` are consumed later by aperture and PSF photometry.
+
+    Returns
+    -------
+    working : astropy.nddata.CCDData
+        Background-subtracted image for the broad-subtraction modes, otherwise
+        the input image.
+    products : dict
+        Source masks, segmentation, background, RMS, corrected derivative,
+        mesh arrays, exclusion mask, and row/column profiles.
+    info : dict
+        Mode, effective mesh scale, excluded-mesh fraction, gradient metrics,
+        source-preservation metrics, flags, and fallback state.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    background_settings = settings.get("background", {})
+    mode = background_settings.get("mode", "broad_plus_local")
+    if not background_settings.get("enabled", True):
+        mode = "off"
+    allowed_modes = {
+        "off",
+        "measure_only",
+        "subtract_broad",
+        "local_only",
+        "broad_plus_local",
+    }
+    if mode not in allowed_modes:
+        raise ValueError("Unknown background mode: {}".format(mode))
+
+    data = np.asarray(ccd.data, dtype=float)
+    empty_mask = np.zeros(data.shape, dtype=bool)
+    products = {
+        "base_mask": empty_mask,
+        "detected_source_mask": empty_mask,
+        "target_mask": empty_mask,
+        "host_mask": empty_mask,
+        "protected_source_mask": empty_mask,
+        "background_mask": empty_mask,
+        "segmentation": np.zeros(data.shape, dtype=np.int32),
+        "background": None,
+        "background_rms": None,
+        "background_subtracted": None,
+        "mesh_background": None,
+        "mesh_rms": None,
+        "mesh_excluded": None,
+        "profiles": {},
+    }
+    info = {
+        "mode": mode,
+        "measured": False,
+        "subtracted": False,
+        "use_local_background": mode in {"local_only", "broad_plus_local"},
+        "skipped": None,
+        "fallback": None,
+        "flags": [],
+        "source_mask": None,
+        "requested_box_size": None,
+        "effective_box_size": None,
+        "minimum_box_pixels": None,
+        "excluded_mesh_fraction": None,
+        "gradient_before": None,
+        "gradient_after": None,
+        "gradient_reduction_fraction": None,
+        "source_preservation": None,
+    }
+
+    if mode in {"off", "local_only"}:
+        info["skipped"] = "off" if mode == "off" else "local_only"
+        return ccd, products, info
+
+    background_mask, mask_products, mask_info = make_background_source_mask(
+        ccd, metadata, settings, target=target
+    )
+    products.update(mask_products)
+    info["source_mask"] = mask_info
+
+    requested_box, effective_box, minimum_box = _effective_background_box(
+        data.shape, settings
+    )
+    filter_size = _background_pair(
+        background_settings.get("filter_size", [3, 3]),
+        "background.filter_size",
+        odd=True,
+    )
+    info["requested_box_size"] = requested_box
+    info["effective_box_size"] = effective_box
+    info["minimum_box_pixels"] = minimum_box
+
+    sigma_clip = SigmaClip(
+        sigma=float(background_settings.get("sigma_clip", 3.0)),
+        maxiters=int(background_settings.get("maximum_iterations", 10)),
+    )
+    bkg_estimator, rms_estimator = _background_estimators(settings)
+
+    try:
+        from photutils.background import Background2D
+
+        estimator = Background2D(
+            np.ascontiguousarray(data, dtype=float),
+            effective_box,
+            mask=background_mask,
+            filter_size=filter_size,
+            exclude_percentile=float(
+                background_settings.get("exclude_percentile", 20.0)
+            ),
+            sigma_clip=sigma_clip,
+            bkg_estimator=bkg_estimator,
+            bkg_rms_estimator=rms_estimator,
+        )
+        background = np.asarray(estimator.background, dtype=float)
+        background_rms = np.asarray(estimator.background_rms, dtype=float)
+        mesh_background = np.asarray(estimator.background_mesh, dtype=float)
+        mesh_rms = np.asarray(estimator.background_rms_mesh, dtype=float)
+        mesh_excluded = np.asarray(estimator.n_pixels_mesh == 0, dtype=bool)
+    except (ImportError, TypeError, ValueError) as error:
+        if not background_settings.get("fallback_to_global", True):
+            raise
+        _, median, std = sigma_clipped_stats(
+            data,
+            mask=background_mask,
+            sigma=float(background_settings.get("sigma_clip", 3.0)),
+            maxiters=int(background_settings.get("maximum_iterations", 10)),
+        )
+        if not np.isfinite(median) or not np.isfinite(std):
+            warnings.warn(
+                "Background estimation failed and no global fallback was possible.",
+                RuntimeWarning,
+            )
+            info["skipped"] = "estimation_failed"
+            info["flags"].append("BACKGROUND_UNRELIABLE")
+            return ccd, products, info
+        background = np.full(data.shape, float(median), dtype=float)
+        background_rms = np.full(data.shape, float(std), dtype=float)
+        mesh_background = np.array([[float(median)]])
+        mesh_rms = np.array([[float(std)]])
+        mesh_excluded = np.array([[False]])
+        info["fallback"] = "global_sigma_clipped"
+        info["fallback_error"] = str(error)
+        info["flags"].append("BACKGROUND_UNRELIABLE")
+
+    corrected = data - background
+    products["background"] = background
+    products["background_rms"] = background_rms
+    products["background_subtracted"] = corrected
+    products["mesh_background"] = mesh_background
+    products["mesh_rms"] = mesh_rms
+    products["mesh_excluded"] = mesh_excluded
+    products["profiles"] = _background_profiles(
+        data, background, corrected, background_mask
+    )
+    info["measured"] = True
+    info["excluded_mesh_fraction"] = float(mesh_excluded.mean())
+
+    if background_settings.get("measure_residual_gradient", True):
+        maximum = int(background_settings.get("gradient_max_samples", 50000))
+        before = _background_gradient(data, background_mask, maximum)
+        after = _background_gradient(corrected, background_mask, maximum)
+        info["gradient_before"] = before
+        info["gradient_after"] = after
+        before_amplitude = before.get("peak_to_peak")
+        after_amplitude = after.get("peak_to_peak")
+        if before_amplitude is not None and before_amplitude > 0:
+            info["gradient_reduction_fraction"] = float(
+                1.0 - after_amplitude / before_amplitude
+            )
+
+    if background_settings.get("measure_source_preservation", True):
+        preservation = _source_preservation(
+            data,
+            corrected,
+            products["segmentation"],
+            products["base_mask"],
+            settings,
+        )
+        info["source_preservation"] = preservation
+        change = preservation.get("median_fractional_change")
+        tolerance = float(
+            background_settings.get("source_preservation_tolerance", 0.02)
+        )
+        if change is not None and change > tolerance:
+            info["flags"].append("BACKGROUND_UNRELIABLE")
+
+    if mode in {"subtract_broad", "broad_plus_local"}:
+        working = CCDData(
+            np.array(corrected, copy=True),
+            unit=ccd.unit,
+            meta=ccd.meta.copy() if getattr(ccd, "meta", None) is not None else None,
+            wcs=getattr(ccd, "wcs", None),
+            mask=(
+                np.asarray(ccd.mask, dtype=bool)
+                if getattr(ccd, "mask", None) is not None
+                else None
+            ),
+            uncertainty=getattr(ccd, "uncertainty", None),
+        )
+        info["subtracted"] = True
+    else:
+        working = ccd
+
+    return working, products, info
+
+
+def _background_output_stem(filename):
+    """Remove supported compound FITS endings from an output stem."""
+
+    name = Path(filename).name
+    for ending in sorted(FITS_ENDINGS, key=len, reverse=True):
+        if name.lower().endswith(ending):
+            return name[: -len(ending)]
+    return Path(name).stem
+
+
+def save_background_products(
+    products,
+    output_directory,
+    filename,
+    header=None,
+    settings=None,
+    overwrite=None,
+):
+    """Save requested background products as independent FITS files.
+
+    Returns a dictionary mapping product names to written paths. No input FITS
+    file is ever modified.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    background_settings = settings.get("background", {})
+    if overwrite is None:
+        overwrite = settings.get("output", {}).get("overwrite", False)
+
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    stem = _background_output_stem(filename)
+    output_header = header.copy() if header is not None else None
+    requests = {
+        "background": (
+            background_settings.get("save_background", True),
+            "{}_background.fits".format(stem),
+        ),
+        "background_rms": (
+            background_settings.get("save_background_rms", True),
+            "{}_background_rms.fits".format(stem),
+        ),
+        "background_subtracted": (
+            background_settings.get("save_corrected", True),
+            "{}_background_subtracted.fits".format(stem),
+        ),
+        "protected_source_mask": (
+            background_settings.get("save_source_mask", False),
+            "{}_background_mask.fits".format(stem),
+        ),
+    }
+    paths = {}
+    for name, (enabled, output_name) in requests.items():
+        array = products.get(name)
+        if not enabled or array is None:
+            continue
+        output_path = output_directory / output_name
+        output_data = np.asarray(array)
+        if output_data.dtype == bool:
+            output_data = output_data.astype(np.uint8)
+        fits.writeto(
+            output_path,
+            output_data,
+            header=output_header,
+            overwrite=bool(overwrite),
+        )
+        paths[name] = str(output_path)
+    return paths
+
+
 def metadata_table(metadata_rows):
     """Convert normalized metadata dictionaries into a masked Astropy table."""
 
@@ -3181,12 +3917,15 @@ __all__ = [
     "header_section_region",
     "is_fits_path",
     "make_amplifier_seam_mask",
+    "make_background_source_mask",
     "make_line_defect_mask",
     "make_manual_mask",
     "make_saturation_mask",
     "metadata_table",
+    "model_background",
     "parse_fits_section",
     "read_fits_batch",
     "read_fits_image",
+    "save_background_products",
     "select_science_hdu",
 ]
