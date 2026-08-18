@@ -2,7 +2,7 @@
 .DS_Store
 build/
 dist/
-FLEET.egg-info/
+*.egg-info
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
