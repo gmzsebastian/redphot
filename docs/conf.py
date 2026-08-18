@@ -6,12 +6,14 @@
 
 import os
 import sys
-from pkg_resources import DistributionNotFound, get_distribution
+from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = get_distribution("redphot").version
-except DistributionNotFound:
-    __version__ = "unknown version"
+    release = version("redphot")
+except PackageNotFoundError:
+    release = "unknown"
+
+version = release
 
 # -- Path setup --------------------------------------------------------------
 
