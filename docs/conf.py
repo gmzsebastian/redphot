@@ -13,7 +13,7 @@ try:
 except PackageNotFoundError:
     release = "unknown"
 
-version = release
+__version__ = release
 
 # -- Path setup --------------------------------------------------------------
 
