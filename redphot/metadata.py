@@ -95,7 +95,8 @@ def _header_indices(hdulist, settings):
 
 
 def collect_header_candidates(hdulist, settings, field, keywords=None):
-    """Collect every usable card matching a normalized metadata field.
+    """
+    Collect every usable card matching a normalized metadata field.
 
     Returns a list of dictionaries containing ``value``, ``keyword``, ``hdu``,
     and ``card_index``.  Duplicate cards are therefore preserved rather than
@@ -664,15 +665,9 @@ def _validate_required_fields(metadata, settings, flags):
     return missing
 
 
-def normalize_and_validate_metadata(
-    hdulist,
-    metadata,
-    settings,
-    wcs=None,
-    shape=None,
-    target=None,
-):
-    """Return complete normalized and validated metadata for one FITS image.
+def normalize_and_validate_metadata(hdulist, metadata, settings, wcs=None, shape=None, target=None):
+    """
+    Return complete normalized and validated metadata for one FITS image.
 
     The input dictionary is copied.  Header provenance is retained in
     ``_sources``; machine-readable issues appear in ``quality_flags`` and

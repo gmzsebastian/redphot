@@ -1,7 +1,7 @@
 """
 Discover and read reduced optical FITS images for redphot.
 
-The functions in this module never modify an input file.  They locate science,
+The functions in this module never modify an input file. They locate science,
 mask, variance, and WCS information across ordinary or compressed FITS HDUs and
 return an Astropy ``CCDData`` object with a separate normalized metadata
 dictionary.
@@ -28,7 +28,7 @@ from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 
-from .config import get_default_settings, normalize_filter_name
+from .config import get_default_settings, normalize_filter_name, normalize_instrument_name
 from .metadata import normalize_and_validate_metadata
 
 
@@ -44,6 +44,7 @@ FITS_ENDINGS = (
     ".fts.gz",
 )
 
+# Common extension names for science, mask, and uncertainty HDUs.
 SCIENCE_EXTNAMES = ("SCI", "IMAGE", "IM1", "IM2")
 MASK_EXTNAMES = ("MASK", "DQ", "BPM", "BADPIX", "BAD_PIXEL_MASK")
 VARIANCE_EXTNAMES = ("VAR", "VARIANCE")
@@ -56,6 +57,8 @@ AUXILIARY_EXTNAMES = set(
     + INVERSE_VARIANCE_EXTNAMES
 )
 
+# Metadata fields that are extracted from FITS headers or settings and returned
+# in the metadata dictionary.
 METADATA_FIELDS = (
     "path",
     "filename",
@@ -224,15 +227,16 @@ def _is_compressed_fits(path):
 
 
 def discover_fits_files(paths=None, settings=None):
-    """Discover supported FITS images from files, directories, or glob patterns.
+    """
+    Discover supported FITS images from files, directories, or glob patterns.
 
     Parameters
     ----------
     paths : str, pathlib.Path, or sequence, optional
-        Input file, directory, glob expression, or collection of them.  If not
+        Input file, directory, glob expression, or collection of them. If not
         supplied, ``settings['input']['paths']`` is used.
     settings : mapping, optional
-        Resolved redphot settings.  The ``input.recursive`` value controls
+        Resolved redphot settings. The ``input.recursive`` value controls
         directory traversal.
 
     Returns
@@ -357,9 +361,7 @@ def _resolve_hdu_index(hdulist, selector, label):
     return int(index)
 
 
-def _hdu_search_order(
-    hdulist, preferred=None, configured=None, include_remaining=True
-):
+def _hdu_search_order(hdulist, preferred=None, configured=None, include_remaining=True):
     """Return unique valid HDU indices in the configured fallback order."""
 
     order = []
@@ -540,11 +542,12 @@ def _target_inside_hdu(hdulist, index, target, header_index, search_order):
 
 
 def select_science_hdu(hdulist, settings, target=None):
-    """Select the science HDU using overrides, WCS coverage, and extension names.
+    """
+    Select the science HDU using overrides, WCS coverage, and extension names.
 
-    An explicit ``input.data_hdu`` is strict.  Automatic selection inspects HDUs
-    0, 1, and 2 first, followed by all remaining HDUs.  If more than one valid
-    science array exists, an array containing the supplied target wins.  The
+    An explicit ``input.data_hdu`` is strict. Automatic selection inspects HDUs
+    0, 1, and 2 first, followed by all remaining HDUs. If more than one valid
+    science array exists, an array containing the supplied target wins. The
     configured preferred extension names and then HDU search order break ties.
 
     Returns
@@ -625,9 +628,7 @@ def select_science_hdu(hdulist, settings, target=None):
     return candidates[0][1]
 
 
-def _matching_auxiliary_hdu(
-    hdulist, data_index, selector, names, label, search_order
-):
+def _matching_auxiliary_hdu(hdulist, data_index, selector, names, label, search_order):
     """Find a shape-matched mask or uncertainty HDU."""
 
     science_shape = _numeric_2d_array(hdulist[data_index]).shape
@@ -805,13 +806,13 @@ def extract_metadata(hdulist, settings, data_index, wcs_index=None):
     """Extract normalized metadata by searching the configured header sequence.
 
     Each keyword is searched independently, so values may come from different
-    HDUs.  Explicit metadata overrides take precedence over header values, then
-    instrument fallback values are used.  Missing values remain ``None``.
+    HDUs. Explicit metadata overrides take precedence over header values, then
+    instrument fallback values are used. Missing values remain ``None``.
 
     Returns
     -------
     dict
-        Normalized scalar metadata.  The private ``_sources`` mapping records
+        Normalized scalar metadata. The private ``_sources`` mapping records
         the HDU and FITS keyword used for each extracted field.
     """
 
@@ -950,10 +951,10 @@ def read_fits_image(path, settings=None, target=None):
     path : str or pathlib.Path
         A supported ordinary, gzip-compressed, or tile-compressed FITS file.
     settings : mapping, optional
-        Fully resolved settings for this image.  General defaults are used when
+        Fully resolved settings for this image. General defaults are used when
         omitted.
     target : astropy.coordinates.SkyCoord, mapping, or pair, optional
-        Target coordinate used to choose among multiple science arrays.  Numeric
+        Target coordinate used to choose among multiple science arrays. Numeric
         pairs are interpreted as decimal degrees; string pairs use the units in
         ``target_position.coordinate_unit``.
 
@@ -1085,12 +1086,12 @@ def read_fits_image(path, settings=None, target=None):
 
 
 # ---------------------------------------------------------------------------
-# Step 5: valid processing region and cropping
+# Processing Region and Cropping
 #
 # These functions define the usable science region of an image and produce a
-# cropped working view.  They never modify the input ``CCDData``; each returns
+# cropped working view. They never modify the input ``CCDData``; each returns
 # new arrays and a fresh ``CCDData`` so any correction can be inspected and
-# reversed.  Header section keywords and empirical edge trimming build a
+# reversed. Header section keywords and empirical edge trimming build a
 # valid-pixel mask; the angular crop then limits later processing to the region
 # of interest while keeping the WCS, mask, and uncertainty consistent.
 # ---------------------------------------------------------------------------
@@ -1102,11 +1103,11 @@ def parse_fits_section(value, shape=None):
     Parameters
     ----------
     value : str
-        A FITS section such as ``'[1:1024,1:4096]'``.  The two ranges are the
-        one-based, inclusive column (``x``) and row (``y``) limits.  Reversed
+        A FITS section such as ``'[1:1024,1:4096]'``. The two ranges are the
+        one-based, inclusive column (``x``) and row (``y``) limits. Reversed
         ranges (image flips) are accepted and normalized.
     shape : tuple of int, optional
-        ``(ny, nx)`` array shape.  When given, the bounds are clipped to the
+        ``(ny, nx)`` array shape. When given, the bounds are clipped to the
         array.
 
     Returns
@@ -1156,11 +1157,12 @@ def parse_fits_section(value, shape=None):
 
 
 def header_section_region(header, shape, settings):
-    """Build a valid-pixel mask from a header science section when it applies.
+    """
+    Build a valid-pixel mask from a header science section when it applies.
 
     The configured ``TRIMSEC``/``DATASEC`` (and optionally ``CCDSEC``/``DETSEC``)
-    keywords are tried in order.  A section is only used when it references a
-    strict sub-region of the current array.  If the section extends beyond the
+    keywords are tried in order. A section is only used when it references a
+    strict sub-region of the current array. If the section extends beyond the
     array or matches its size, the frame is treated as already trimmed and no
     mask is produced.
 
@@ -1216,10 +1218,11 @@ def header_section_region(header, shape, settings):
 
 
 def detect_empirical_edges(data, base_valid, settings):
-    """Trim contiguous unusable rows and columns inward from each border.
+    """
+    Trim contiguous unusable rows and columns inward from each border.
 
     Only border rows/columns are examined, so interior sources are never
-    removed.  A line is considered bad when it is largely non-finite, dominated
+    removed. A line is considered bad when it is largely non-finite, dominated
     by a single constant value (such as zeros on a blank edge), or has a median
     that departs strongly from the robust global median (extreme border glow or
     unexposed regions).
@@ -1325,11 +1328,12 @@ def _valid_section_bounds(value, shape):
 
 
 def build_valid_region(ccd, metadata=None, settings=None):
-    """Build a full-frame valid-pixel mask (``True`` = usable).
+    """
+    Build a full-frame valid-pixel mask (``True`` = usable).
 
     Combines existing non-finite/mask pixels, the header science section,
     empirical edge trimming, a uniform ``edge_crop_pixels`` border, and an
-    explicit ``valid_section`` override.  When ``valid_section`` is supplied it
+    explicit ``valid_section`` override. When ``valid_section`` is supplied it
     is authoritative and the automatic section/edge steps are skipped.
 
     Returns
@@ -1448,16 +1452,15 @@ def _crop_center_pixel(ccd, metadata, settings, target):
     return field_center, center
 
 
-def crop_to_processing_region(
-    ccd, metadata=None, settings=None, target=None, valid=None
-):
-    """Crop a science image to the configured angular processing footprint.
+def crop_to_processing_region(ccd, metadata=None, settings=None, target=None, valid=None):
+    """
+    Crop a science image to the configured angular processing footprint.
 
     The crop is centered on the target (or the field center when
-    ``crop.center_on`` is ``'field'``) and sized by ``crop.size_arcmin``.  Data,
+    ``crop.center_on`` is ``'field'``) and sized by ``crop.size_arcmin``. Data,
     WCS, mask, uncertainty, and an optional valid-pixel mask are cropped
-    consistently.  When cropping is disabled or no size or pixel scale is
-    available, the input is returned unchanged.  The input image is not
+    consistently. When cropping is disabled or no size or pixel scale is
+    available, the input is returned unchanged. The input image is not
     modified.
 
     Returns
@@ -1653,12 +1656,13 @@ def _check_target_region(ccd, metadata, settings, target, valid=None):
 
 
 def define_processing_region(ccd, metadata=None, settings=None, target=None):
-    """Define the valid processing region and return a cropped working image.
+    """
+    Define the valid processing region and return a cropped working image.
 
     This builds the full-frame valid-pixel mask (header science section plus
     empirical edge trimming and any overrides), folds the invalid pixels into a
     copy's mask, crops to the configured angular footprint, and checks that the
-    target lies safely inside the result.  The input ``ccd`` is never modified.
+    target lies safely inside the result. The input ``ccd`` is never modified.
 
     Parameters
     ----------
@@ -1739,17 +1743,18 @@ def define_processing_region(ccd, metadata=None, settings=None, target=None):
 
 
 # ---------------------------------------------------------------------------
-# Step 6: pixel and artifact masks
+# Pixel and Artifact Masks
 #
 # Each defect type produces its own boolean component so it can be plotted and
 # reasoned about independently; ``build_masks`` combines them into one working
-# mask.  Morphological growth and connected-component labelling use
+# mask. Morphological growth and connected-component labelling use
 # ``scipy.ndimage``, which is imported lazily so this module still imports when
-# scipy is absent (those growth steps are then skipped with a warning).  The
+# scipy is absent (those growth steps are then skipped with a warning). The
 # input image is never modified.
 # ---------------------------------------------------------------------------
 
 
+# Global flag to warn once when ``scipy.ndimage`` is unavailable.
 _NDIMAGE_WARNED = False
 
 
@@ -1782,10 +1787,11 @@ def _disk_structure(radius):
 
 
 def make_saturation_mask(data, metadata=None, settings=None):
-    """Mask saturated and nonlinear pixels and grow bleed and halo regions.
+    """
+    Mask saturated and nonlinear pixels and grow bleed and halo regions.
 
     The saturation and nonlinearity levels come from the settings overrides or
-    the image metadata.  When both are present the lower (more conservative)
+    the image metadata. When both are present the lower (more conservative)
     level defines the bright cores used for halo growth, so wings, bleed
     columns, and halos around bright stars are excluded from later selection.
 
@@ -1879,11 +1885,12 @@ def _line_bad_indices(profile, sigma):
 
 
 def make_line_defect_mask(data, valid=None, settings=None):
-    """Mask hot or dead rows and columns using robust profile statistics.
+    """
+    Mask hot or dead rows and columns using robust profile statistics.
 
     Row and column medians are computed over the usable pixels; a line whose
     median departs from the robust global level by more than ``bad_line_sigma``
-    times the median absolute deviation is masked.  A high default sigma keeps
+    times the median absolute deviation is masked. A high default sigma keeps
     ordinary stars and galaxies from being mistaken for defects.
 
     Returns
@@ -1935,11 +1942,12 @@ def make_line_defect_mask(data, valid=None, settings=None):
 
 
 def make_amplifier_seam_mask(data, valid=None, settings=None):
-    """Mask amplifier seams from explicit boundaries and abrupt median jumps.
+    """
+    Mask amplifier seams from explicit boundaries and abrupt median jumps.
 
-    Explicit ``masks.amplifier_boundaries`` entries are always applied.  When
+    Explicit ``masks.amplifier_boundaries`` entries are always applied. When
     ``detect_amplifier_boundaries`` is enabled, columns or rows with an extreme
-    step between adjacent medians are also masked.  A high default sigma keeps
+    step between adjacent medians are also masked. A high default sigma keeps
     the detector's smooth structure from being flagged.
 
     Returns
@@ -2017,12 +2025,13 @@ def make_amplifier_seam_mask(data, valid=None, settings=None):
 
 
 def detect_trails(data, base_mask=None, settings=None, exclude_mask=None):
-    """Detect long, thin linear features such as asteroid or satellite trails.
+    """
+    Detect long, thin linear features such as asteroid or satellite trails.
 
     Bright pixels are thresholded against a robust background, grouped into
     connected components, and each component is accepted as a trail only when it
-    is long, narrow, and highly elongated.  Compact sources therefore remain
-    untouched.  Detection requires ``scipy``; without it the step is skipped.
+    is long, narrow, and highly elongated. Compact sources therefore remain
+    untouched. Detection requires ``scipy``; without it the step is skipped.
 
     Parameters
     ----------
@@ -2206,7 +2215,8 @@ def _polygon_mask(shape, vertices):
 
 
 def make_manual_mask(shape, wcs=None, settings=None, pixel_scale=None):
-    """Build a mask from user-specified circular, rectangular, or polygon regions.
+    """
+    Build a mask from user-specified circular, rectangular, or polygon regions.
 
     Each entry in ``masks.manual_regions`` is a dictionary with a ``type`` of
     ``circle``, ``rect``, or ``polygon``:
@@ -2290,7 +2300,9 @@ def make_manual_mask(shape, wcs=None, settings=None, pixel_scale=None):
 
 
 def check_mask_overlaps(mask, positions, radii):
-    """Return, for each position, whether a circular region hits masked pixels.
+    """
+    Check if circular regions around given positions overlap with masked pixels.
+    Return, for each position, whether a circular region hits masked pixels.
 
     Parameters
     ----------
@@ -2306,7 +2318,7 @@ def check_mask_overlaps(mask, positions, radii):
     -------
     numpy.ndarray
         Boolean array, ``True`` where the region around a position overlaps a
-        masked pixel.  Used by later stages to drop individual comparison, PSF,
+        masked pixel. Used by later stages to drop individual comparison, PSF,
         or calibration stars without rejecting the whole image.
     """
 
@@ -2352,15 +2364,16 @@ def _target_region_radius(settings):
 
 
 def build_masks(ccd, metadata=None, settings=None, target=None, valid=None):
-    """Build all pixel and artifact masks for a prepared working image.
+    """
+    Build all pixel and artifact masks for a prepared working image.
 
     Combines the incoming mask (existing data quality, non-finite pixels, and
     invalid edges from earlier stages) with saturation and nonlinearity masks
     and their halos, hot/dead rows and columns, amplifier seams, detected
-    trails, and user regions.  Every component is kept separately for
-    diagnostics, and the union becomes the working mask.  The target is tested
+    trails, and user regions. Every component is kept separately for
+    diagnostics, and the union becomes the working mask. The target is tested
     against the trail and combined masks so that a target-crossing trail raises
-    a strong flag while defects elsewhere only mask local pixels.  The input
+    a strong flag while defects elsewhere only mask local pixels. The input
     ``ccd`` is not modified.
 
     Returns
@@ -2520,17 +2533,18 @@ def build_masks(ccd, metadata=None, settings=None, target=None, valid=None):
 
 
 # ---------------------------------------------------------------------------
-# Step 7: optional cosmic-ray and fringe correction
+# Cosmic-ray and Fringe correction
 #
-# Both stages are opt-in and reversible.  Cosmic-ray handling produces a mask
+# Both stages are opt-in and reversible. Cosmic-ray handling produces a mask
 # and, in ``clean`` mode, a cleaned derivative that is kept separate from the
-# measurement data (masking is preferred over pixel replacement).  Fringe
+# measurement data (masking is preferred over pixel replacement). Fringe
 # correction subtracts a scaled additive fringe model and keeps both the model
-# and corrected derivative.  Disabling either stage returns the image
-# unchanged.  The input ``ccd`` is never modified.
+# and corrected derivative. Disabling either stage returns the image
+# unchanged. The input ``ccd`` is never modified.
 # ---------------------------------------------------------------------------
 
 
+# Flag to warn once if ``astroscrappy`` is unavailable.
 _ASTROSCRAPPY_WARNED = False
 
 
@@ -2576,10 +2590,9 @@ def _project_target_pixel(ccd, metadata, settings, target):
     return x, y
 
 
-def apply_cosmic_rays(
-    ccd, metadata=None, settings=None, target=None, psf_positions=None
-):
-    """Detect and optionally clean cosmic rays with the L.A.Cosmic algorithm.
+def apply_cosmic_rays(ccd, metadata=None, settings=None, target=None, psf_positions=None):
+    """
+    Detect and optionally clean cosmic rays with the L.A.Cosmic algorithm.
 
     Uses ``astroscrappy`` in one of four modes from
     ``masks.cosmic_rays.mode``:
@@ -2593,8 +2606,8 @@ def apply_cosmic_rays(
       separate so repaired pixels are not treated as measurements.
 
     Cosmic rays intersecting the target position or a supplied PSF-star core
-    raise ``TARGET_COSMIC_RAY``.  Gain, read noise, and saturation come from the
-    metadata unless overridden.  The input ``ccd`` is not modified.
+    raise ``TARGET_COSMIC_RAY``. Gain, read noise, and saturation come from the
+    metadata unless overridden. The input ``ccd`` is not modified.
 
     Returns
     -------
@@ -2928,19 +2941,17 @@ def _fringe_scale_control_pairs(data, fringe, settings):
     }
 
 
-def correct_fringe(
-    ccd, metadata=None, settings=None, crop_slices=None, source_mask=None,
-    target=None,
-):
-    """Subtract a scaled additive fringe model for eligible i/z images.
+def correct_fringe(ccd, metadata=None, settings=None, crop_slices=None, source_mask=None, target=None):
+    """
+    Subtract a scaled additive fringe model for eligible i/z images.
 
     The stage runs only when ``fringe.enabled`` is set and the image is eligible
     (``fringe.eligible`` or its filter is in ``fringe.filters``, and, when
-    configured, its instrument is allowed).  The fringe map is loaded and
+    configured, its instrument is allowed). The fringe map is loaded and
     validated against the working image (shape, binning, filter), scaled by
-    least squares or bright/dark control pairs, and subtracted.  A scale outside
+    least squares or bright/dark control pairs, and subtracted. A scale outside
     ``[scale_minimum, scale_maximum]`` raises ``FRINGE_CORRECTION_FAILED`` and
-    leaves the image unchanged.  The input ``ccd`` is not modified.
+    leaves the image unchanged. The input ``ccd`` is not modified.
 
     Returns
     -------
@@ -3101,19 +3112,20 @@ def metadata_table(metadata_rows):
 
 
 def read_fits_batch(paths=None, settings=None, target=None, continue_on_error=False):
-    """Discover and read a batch of FITS files in deterministic order.
+    """
+    Discover and read a batch of FITS files in deterministic order.
 
     Parameters
     ----------
     paths : str, pathlib.Path, or sequence, optional
         Files, directories, or glob patterns passed to ``discover_fits_files``.
     settings : mapping, optional
-        Settings shared by this call.  Resolve per-image overrides before calling
+        Settings shared by this call. Resolve per-image overrides before calling
         ``read_fits_image`` individually when images require different settings.
     target : astropy.coordinates.SkyCoord, mapping, or pair, optional
         Target coordinate used during science-HDU selection.
     continue_on_error : bool, optional
-        Continue reading other files after a failure.  Failure messages are
+        Continue reading other files after a failure. Failure messages are
         stored in ``metadata.meta['read_errors']``.
 
     Returns

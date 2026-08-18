@@ -1151,15 +1151,8 @@ def validate_settings(settings):
         )
 
 
-def resolve_settings(
-    instrument_name=None,
-    run_settings=None,
-    filter_name=None,
-    filter_settings=None,
-    image_name=None,
-    image_overrides=None,
-    validate=True,
-):
+def resolve_settings(instrument_name=None, run_settings=None, filter_name=None, filter_settings=None,
+                     image_name=None, image_overrides=None, validate=True):
     """
     Resolve the complete settings for one image.
 
