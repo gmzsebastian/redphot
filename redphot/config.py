@@ -381,6 +381,7 @@ DEFAULT_SETTINGS = {
         "cosmic_rays": {
             "enabled": False,
             "mode": "mask",
+            "backend": "astroscrappy",
             "sigclip": 4.5,
             "sigfrac": 0.3,
             "objlim": 5.0,
@@ -389,24 +390,36 @@ DEFAULT_SETTINGS = {
             "use_image_gain": True,
             "use_image_read_noise": True,
             "use_image_saturation": True,
+            "gain": None,
+            "read_noise": None,
+            "saturation": None,
             "grow_pixels": 1,
             "reject_if_target_overlap": True,
+            "target_radius_fwhm": 3.0,
+            "psf_core_radius_fwhm": 1.0,
         },
     },
     "fringe": {
         "enabled": False,
         "eligible": False,
         "filters": ["i", "z"],
+        "instruments": None,
         "map_path": None,
         "control_points_path": None,
-        "scale_method": "control_pairs",
+        "control_points": None,
+        "scale_method": "lstsq",
         "minimum_control_pairs": 10,
+        "source_sigma": 3.0,
         "sigma_clip": 3.0,
         "maximum_iterations": 3,
         "scale_minimum": 0.0,
         "scale_maximum": None,
         "reject_invalid_scale": True,
+        "validate_shape": True,
+        "validate_binning": True,
+        "check_filter": True,
         "save_model": True,
+        "save_corrected": True,
     },
     "background": {
         "enabled": True,
@@ -1095,6 +1108,12 @@ def validate_settings(settings):
     if cosmic_mode not in {"off", "detect_only", "mask", "clean"}:
         raise ValueError(
             "masks.cosmic_rays.mode must be off, detect_only, mask, or clean"
+        )
+
+    fringe_method = settings["fringe"].get("scale_method", "lstsq")
+    if fringe_method not in {"lstsq", "control_pairs"}:
+        raise ValueError(
+            "fringe.scale_method must be 'lstsq' or 'control_pairs'"
         )
 
     background_mode = settings["background"]["mode"]

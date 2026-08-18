@@ -2519,6 +2519,550 @@ def build_masks(ccd, metadata=None, settings=None, target=None, valid=None):
     return working, components, info
 
 
+# ---------------------------------------------------------------------------
+# Step 7: optional cosmic-ray and fringe correction
+#
+# Both stages are opt-in and reversible.  Cosmic-ray handling produces a mask
+# and, in ``clean`` mode, a cleaned derivative that is kept separate from the
+# measurement data (masking is preferred over pixel replacement).  Fringe
+# correction subtracts a scaled additive fringe model and keeps both the model
+# and corrected derivative.  Disabling either stage returns the image
+# unchanged.  The input ``ccd`` is never modified.
+# ---------------------------------------------------------------------------
+
+
+_ASTROSCRAPPY_WARNED = False
+
+
+def _try_astroscrappy():
+    """Return ``astroscrappy`` or ``None``, warning once when unavailable."""
+
+    global _ASTROSCRAPPY_WARNED
+    try:
+        import astroscrappy
+    except ImportError:
+        if not _ASTROSCRAPPY_WARNED:
+            warnings.warn(
+                "astroscrappy is not available; cosmic-ray handling is skipped.",
+                RuntimeWarning,
+            )
+            _ASTROSCRAPPY_WARNED = True
+        return None
+    return astroscrappy
+
+
+def _project_target_pixel(ccd, metadata, settings, target):
+    """Return the target pixel ``(x, y)`` or ``None`` using WCS projection."""
+
+    wcs = getattr(ccd, "wcs", None)
+    if wcs is None or not wcs.has_celestial:
+        return None
+    center = _coerce_target_coordinate(target, settings)
+    if center is None and metadata is not None:
+        ra = metadata.get("adopted_ra_deg")
+        dec = metadata.get("adopted_dec_deg")
+        if ra is not None and dec is not None:
+            center = SkyCoord(float(ra), float(dec), unit="deg", frame="icrs")
+    if center is None:
+        return None
+    try:
+        x, y = wcs.world_to_pixel(center)
+        x = float(x)
+        y = float(y)
+    except Exception:
+        return None
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    return x, y
+
+
+def apply_cosmic_rays(
+    ccd, metadata=None, settings=None, target=None, psf_positions=None
+):
+    """Detect and optionally clean cosmic rays with the L.A.Cosmic algorithm.
+
+    Uses ``astroscrappy`` in one of four modes from
+    ``masks.cosmic_rays.mode``:
+
+    - ``off``: return the image unchanged.
+    - ``detect_only``: compute a cosmic-ray mask and diagnostics without
+      changing the working mask.
+    - ``mask``: add the cosmic-ray mask to the working mask (preferred for
+      photometry).
+    - ``clean``: add the mask and also produce a cleaned derivative, kept
+      separate so repaired pixels are not treated as measurements.
+
+    Cosmic rays intersecting the target position or a supplied PSF-star core
+    raise ``TARGET_COSMIC_RAY``.  Gain, read noise, and saturation come from the
+    metadata unless overridden.  The input ``ccd`` is not modified.
+
+    Returns
+    -------
+    working : astropy.nddata.CCDData
+        Image with the cosmic-ray mask applied (``mask``/``clean``) or an
+        unchanged copy (``off``/``detect_only``).
+    products : dict
+        ``cosmic_mask`` and ``cleaned`` (an array in ``clean`` mode, else
+        ``None``).
+    info : dict
+        Mode, parameters, cosmic-ray counts, flags, and target overlap.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    cosmic_settings = settings.get("masks", {}).get("cosmic_rays", {})
+    data = np.asarray(ccd.data)
+    shape = data.shape
+
+    mode = cosmic_settings.get("mode", "mask")
+    enabled = cosmic_settings.get("enabled", False)
+    products = {"cosmic_mask": np.zeros(shape, dtype=bool), "cleaned": None}
+    info = {
+        "mode": mode,
+        "applied": False,
+        "skipped": None,
+        "cosmic_pixel_count": 0,
+        "cosmic_pixel_fraction": 0.0,
+        "target_overlap": None,
+        "flags": [],
+        "parameters": {},
+    }
+
+    if not enabled or mode == "off":
+        info["skipped"] = "disabled" if not enabled else "off"
+        return ccd, products, info
+
+    astroscrappy = _try_astroscrappy()
+    if astroscrappy is None:
+        info["skipped"] = "astroscrappy_missing"
+        return ccd, products, info
+
+    existing_mask = (
+        np.asarray(ccd.mask, dtype=bool)
+        if getattr(ccd, "mask", None) is not None
+        else None
+    )
+
+    gain = cosmic_settings.get("gain")
+    if gain is None and cosmic_settings.get("use_image_gain", True) and metadata:
+        gain = _as_float(metadata.get("gain"))
+    read_noise = cosmic_settings.get("read_noise")
+    if (
+        read_noise is None
+        and cosmic_settings.get("use_image_read_noise", True)
+        and metadata
+    ):
+        read_noise = _as_float(metadata.get("read_noise"))
+    saturation = cosmic_settings.get("saturation")
+    if (
+        saturation is None
+        and cosmic_settings.get("use_image_saturation", True)
+        and metadata
+    ):
+        saturation = _as_float(metadata.get("saturation"))
+
+    detect_kwargs = {
+        "sigclip": float(cosmic_settings.get("sigclip", 4.5)),
+        "sigfrac": float(cosmic_settings.get("sigfrac", 0.3)),
+        "objlim": float(cosmic_settings.get("objlim", 5.0)),
+        "niter": int(cosmic_settings.get("niter", 4)),
+        "cleantype": cosmic_settings.get("cleantype", "meanmask"),
+    }
+    if gain is not None:
+        detect_kwargs["gain"] = float(gain)
+    if read_noise is not None:
+        detect_kwargs["readnoise"] = float(read_noise)
+    if saturation is not None:
+        detect_kwargs["satlevel"] = float(saturation)
+    info["parameters"] = dict(detect_kwargs)
+
+    inmask = existing_mask if existing_mask is not None else None
+    try:
+        cosmic_mask, cleaned = astroscrappy.detect_cosmics(
+            np.ascontiguousarray(data, dtype=np.float32),
+            inmask=inmask,
+            **detect_kwargs,
+        )
+    except Exception as error:
+        warnings.warn(
+            "Cosmic-ray detection failed ({}); image unchanged.".format(error),
+            RuntimeWarning,
+        )
+        info["skipped"] = "detection_failed"
+        return ccd, products, info
+
+    cosmic_mask = np.asarray(cosmic_mask, dtype=bool)
+    grow = int(cosmic_settings.get("grow_pixels", 1))
+    if grow > 0 and cosmic_mask.any():
+        ndimage = _try_ndimage()
+        if ndimage is not None:
+            cosmic_mask = ndimage.binary_dilation(cosmic_mask, iterations=grow)
+
+    products["cosmic_mask"] = cosmic_mask
+    info["applied"] = True
+    info["cosmic_pixel_count"] = int(cosmic_mask.sum())
+    info["cosmic_pixel_fraction"] = (
+        float(cosmic_mask.mean()) if cosmic_mask.size else 0.0
+    )
+
+    fwhm = _fwhm_guess_pixels(settings)
+    target_xy = _project_target_pixel(ccd, metadata, settings, target)
+    if target_xy is not None:
+        radius = float(cosmic_settings.get("target_radius_fwhm", 3.0)) * fwhm
+        overlap = bool(check_mask_overlaps(cosmic_mask, [target_xy], [radius])[0])
+        info["target_overlap"] = overlap
+        if overlap:
+            info["flags"].append("TARGET_COSMIC_RAY")
+
+    if psf_positions:
+        radius = float(cosmic_settings.get("psf_core_radius_fwhm", 1.0)) * fwhm
+        psf_hits = check_mask_overlaps(
+            cosmic_mask, list(psf_positions), [radius] * len(psf_positions)
+        )
+        info["psf_overlap_indices"] = np.where(psf_hits)[0].tolist()
+        if psf_hits.any() and "TARGET_COSMIC_RAY" not in info["flags"]:
+            # A PSF-star hit is not a target hit, but record it for the caller.
+            info.setdefault("flags", [])
+
+    if mode == "detect_only":
+        return ccd, products, info
+
+    combined_mask = cosmic_mask
+    if existing_mask is not None:
+        combined_mask = existing_mask | cosmic_mask
+
+    if mode == "clean":
+        products["cleaned"] = np.asarray(cleaned, dtype=float)
+
+    working = CCDData(
+        np.array(data, copy=True),
+        unit=ccd.unit,
+        meta=ccd.meta.copy() if getattr(ccd, "meta", None) is not None else None,
+        wcs=getattr(ccd, "wcs", None),
+        mask=combined_mask,
+        uncertainty=getattr(ccd, "uncertainty", None),
+    )
+    return working, products, info
+
+
+def _load_fringe_map(path):
+    """Load the first 2D image array from a fringe-map FITS file."""
+
+    with fits.open(path, mode="readonly", memmap=False) as hdulist:
+        for hdu in hdulist:
+            array = _numeric_2d_array(hdu)
+            if array is not None:
+                return np.array(array, dtype=float), hdu.header.copy()
+    raise ValueError("No 2D image found in fringe map: {}".format(path))
+
+
+def _align_fringe_map(map_array, map_header, data_shape, metadata, settings,
+                      crop_slices):
+    """Match a fringe map to the working image and validate compatibility.
+
+    Returns ``(aligned_map, info)`` where ``aligned_map`` is ``None`` when the
+    map cannot be used.
+    """
+
+    fringe_settings = settings.get("fringe", {})
+    info = {"ok": True, "reason": None, "alignment": None}
+
+    if map_array.shape == data_shape:
+        aligned = map_array
+        info["alignment"] = "direct"
+    elif crop_slices is not None:
+        (y0, y1), (x0, x1) = crop_slices
+        sub = map_array[y0:y1, x0:x1]
+        if sub.shape == data_shape:
+            aligned = sub
+            info["alignment"] = "cropped_to_science"
+        else:
+            info["ok"] = False
+            info["reason"] = "shape_mismatch"
+            return None, info
+    else:
+        if fringe_settings.get("validate_shape", True):
+            info["ok"] = False
+            info["reason"] = "shape_mismatch"
+            return None, info
+        aligned = map_array
+        info["alignment"] = "unchecked"
+
+    if fringe_settings.get("validate_binning", True) and metadata is not None:
+        map_binning = map_header.get("CCDSUM")
+        image_binning = metadata.get("binning")
+        if (
+            map_binning is not None
+            and image_binning is not None
+            and str(map_binning).strip() != str(image_binning).strip()
+        ):
+            info["ok"] = False
+            info["reason"] = "binning_mismatch"
+            return None, info
+
+    if fringe_settings.get("check_filter", True) and metadata is not None:
+        map_filter = map_header.get("FILTER")
+        if map_filter is not None:
+            map_filter_norm = normalize_filter_name(map_filter)
+            image_filter = metadata.get("filter")
+            if image_filter is not None and map_filter_norm != image_filter:
+                info["ok"] = False
+                info["reason"] = "filter_mismatch"
+                return None, info
+
+    return aligned, info
+
+
+def _fringe_scale_lstsq(data, fringe, valid, settings):
+    """Estimate an additive fringe scale by sigma-clipped least squares."""
+
+    fringe_settings = settings.get("fringe", {})
+    sigma = float(fringe_settings.get("sigma_clip", 3.0))
+    iterations = int(fringe_settings.get("maximum_iterations", 3))
+    source_sigma = float(fringe_settings.get("source_sigma", 3.0))
+
+    data = np.asarray(data, dtype=float)
+    fringe = np.asarray(fringe, dtype=float)
+    good = np.asarray(valid, dtype=bool) & np.isfinite(data) & np.isfinite(fringe)
+    if int(good.sum()) < 50:
+        return None, {"reason": "too_few_pixels", "n_pixels": int(good.sum())}
+
+    background = float(np.median(data[good]))
+    residual_data = data - background
+
+    spread = np.median(np.abs(residual_data[good] - np.median(residual_data[good])))
+    spread *= 1.4826
+    if spread > 0:
+        good &= residual_data < source_sigma * spread
+
+    scale = 0.0
+    rms_before = float(np.std(residual_data[good])) if good.any() else 0.0
+    for _ in range(max(1, iterations)):
+        selected = good
+        denominator = float(np.sum(fringe[selected] ** 2))
+        if denominator <= 0:
+            return None, {"reason": "zero_fringe_power"}
+        scale = float(np.sum(residual_data[selected] * fringe[selected]) / denominator)
+        residual = residual_data - scale * fringe
+        median = float(np.median(residual[selected]))
+        clip = np.median(np.abs(residual[selected] - median)) * 1.4826
+        if clip <= 0:
+            break
+        good = selected & (np.abs(residual - median) < sigma * clip)
+        if int(good.sum()) < 50:
+            good = selected
+            break
+
+    residual = residual_data - scale * fringe
+    rms_after = float(np.std(residual[good])) if good.any() else 0.0
+    info = {
+        "reason": None,
+        "n_pixels": int(good.sum()),
+        "rms_before": rms_before,
+        "rms_after": rms_after,
+        "background": background,
+    }
+    return scale, info
+
+
+def _read_control_points(settings):
+    """Return an ``(N, 4)`` array of bright/dark control pairs, or ``None``."""
+
+    fringe_settings = settings.get("fringe", {})
+    points = fringe_settings.get("control_points")
+    if points is None:
+        path = fringe_settings.get("control_points_path")
+        if path is None:
+            return None
+        try:
+            points = np.loadtxt(path)
+        except (OSError, ValueError):
+            return None
+    points = np.atleast_2d(np.asarray(points, dtype=float))
+    if points.ndim != 2 or points.shape[1] < 4:
+        return None
+    return points[:, :4]
+
+
+def _fringe_scale_control_pairs(data, fringe, settings):
+    """Estimate the fringe scale from bright/dark control pairs."""
+
+    fringe_settings = settings.get("fringe", {})
+    pairs = _read_control_points(settings)
+    if pairs is None:
+        return None, {"reason": "no_control_points"}
+
+    ny, nx = data.shape
+    scales = []
+    for bx, by, dx, dy in pairs:
+        bxi, byi, dxi, dyi = int(bx), int(by), int(dx), int(dy)
+        if not (
+            0 <= byi < ny and 0 <= bxi < nx and 0 <= dyi < ny and 0 <= dxi < nx
+        ):
+            continue
+        fringe_difference = fringe[byi, bxi] - fringe[dyi, dxi]
+        if abs(fringe_difference) <= 0:
+            continue
+        data_difference = data[byi, bxi] - data[dyi, dxi]
+        scales.append(data_difference / fringe_difference)
+
+    minimum_pairs = int(fringe_settings.get("minimum_control_pairs", 10))
+    if len(scales) < minimum_pairs:
+        return None, {"reason": "too_few_pairs", "n_pairs": len(scales)}
+
+    scales = np.asarray(scales, dtype=float)
+    sigma = float(fringe_settings.get("sigma_clip", 3.0))
+    for _ in range(int(fringe_settings.get("maximum_iterations", 3))):
+        median = float(np.median(scales))
+        spread = float(np.median(np.abs(scales - median))) * 1.4826
+        if spread <= 0:
+            break
+        keep = np.abs(scales - median) < sigma * spread
+        if keep.sum() < minimum_pairs:
+            break
+        scales = scales[keep]
+
+    return float(np.median(scales)), {
+        "reason": None,
+        "n_pairs": int(scales.size),
+    }
+
+
+def correct_fringe(
+    ccd, metadata=None, settings=None, crop_slices=None, source_mask=None,
+    target=None,
+):
+    """Subtract a scaled additive fringe model for eligible i/z images.
+
+    The stage runs only when ``fringe.enabled`` is set and the image is eligible
+    (``fringe.eligible`` or its filter is in ``fringe.filters``, and, when
+    configured, its instrument is allowed).  The fringe map is loaded and
+    validated against the working image (shape, binning, filter), scaled by
+    least squares or bright/dark control pairs, and subtracted.  A scale outside
+    ``[scale_minimum, scale_maximum]`` raises ``FRINGE_CORRECTION_FAILED`` and
+    leaves the image unchanged.  The input ``ccd`` is not modified.
+
+    Returns
+    -------
+    working : astropy.nddata.CCDData
+        Fringe-corrected image, or an unchanged copy when the stage is skipped.
+    products : dict
+        ``fringe_model``, ``corrected`` (arrays) and the applied ``scale``.
+    info : dict
+        Eligibility, validation, scaling, residual metrics, and flags.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    fringe_settings = settings.get("fringe", {})
+    data = np.asarray(ccd.data)
+    shape = data.shape
+
+    products = {"fringe_model": None, "corrected": None, "scale": None}
+    info = {"applied": False, "skipped": None, "scale": None, "flags": [],
+            "validation": None, "scaling": None}
+
+    if not fringe_settings.get("enabled", False):
+        info["skipped"] = "disabled"
+        return ccd, products, info
+
+    image_filter = metadata.get("filter") if metadata else None
+    eligible = fringe_settings.get("eligible", False) or (
+        image_filter is not None
+        and image_filter in fringe_settings.get("filters", [])
+    )
+    allowed_instruments = fringe_settings.get("instruments")
+    if allowed_instruments and metadata is not None:
+        instrument = normalize_instrument_name(metadata.get("instrument"))
+        if instrument not in {
+            normalize_instrument_name(name) for name in allowed_instruments
+        }:
+            eligible = False
+    if not eligible:
+        info["skipped"] = "not_eligible"
+        return ccd, products, info
+
+    map_path = fringe_settings.get("map_path")
+    if map_path is None:
+        info["skipped"] = "no_map"
+        return ccd, products, info
+
+    try:
+        map_array, map_header = _load_fringe_map(map_path)
+    except (OSError, ValueError) as error:
+        warnings.warn(
+            "Could not read fringe map ({}); image unchanged.".format(error),
+            RuntimeWarning,
+        )
+        info["skipped"] = "map_unreadable"
+        info["flags"].append("FRINGE_CORRECTION_FAILED")
+        return ccd, products, info
+
+    aligned, validation = _align_fringe_map(
+        map_array, map_header, shape, metadata, settings, crop_slices
+    )
+    info["validation"] = validation
+    if aligned is None:
+        info["skipped"] = validation.get("reason", "validation_failed")
+        info["flags"].append("FRINGE_CORRECTION_FAILED")
+        return ccd, products, info
+
+    valid = np.isfinite(data)
+    if getattr(ccd, "mask", None) is not None:
+        valid &= ~np.asarray(ccd.mask, dtype=bool)
+    if source_mask is not None:
+        valid &= ~np.asarray(source_mask, dtype=bool)
+
+    method = fringe_settings.get("scale_method", "lstsq")
+    if method == "control_pairs":
+        scale, scaling = _fringe_scale_control_pairs(data, aligned, settings)
+        if scale is None:
+            scale, scaling = _fringe_scale_lstsq(data, aligned, valid, settings)
+            scaling["fallback"] = "lstsq"
+    else:
+        scale, scaling = _fringe_scale_lstsq(data, aligned, valid, settings)
+    info["scaling"] = scaling
+
+    if scale is None:
+        info["skipped"] = scaling.get("reason", "scaling_failed")
+        info["flags"].append("FRINGE_CORRECTION_FAILED")
+        return ccd, products, info
+
+    scale_minimum = fringe_settings.get("scale_minimum")
+    scale_maximum = fringe_settings.get("scale_maximum")
+    invalid_scale = (
+        (scale_minimum is not None and scale < scale_minimum)
+        or (scale_maximum is not None and scale > scale_maximum)
+    )
+    if invalid_scale and fringe_settings.get("reject_invalid_scale", True):
+        info["skipped"] = "scale_out_of_range"
+        info["scale"] = scale
+        info["flags"].append("FRINGE_CORRECTION_FAILED")
+        return ccd, products, info
+
+    fringe_model = scale * aligned
+    corrected = data - fringe_model
+    products["fringe_model"] = fringe_model
+    products["corrected"] = corrected
+    products["scale"] = scale
+    info["applied"] = True
+    info["scale"] = scale
+
+    working = CCDData(
+        np.array(corrected, copy=True),
+        unit=ccd.unit,
+        meta=ccd.meta.copy() if getattr(ccd, "meta", None) is not None else None,
+        wcs=getattr(ccd, "wcs", None),
+        mask=(
+            np.asarray(ccd.mask, dtype=bool)
+            if getattr(ccd, "mask", None) is not None
+            else None
+        ),
+        uncertainty=getattr(ccd, "uncertainty", None),
+    )
+    return working, products, info
+
+
 def metadata_table(metadata_rows):
     """Convert normalized metadata dictionaries into a masked Astropy table."""
 
@@ -2611,9 +3155,11 @@ def read_fits_batch(paths=None, settings=None, target=None, continue_on_error=Fa
 __all__ = [
     "FITS_ENDINGS",
     "SCIENCE_EXTNAMES",
+    "apply_cosmic_rays",
     "build_masks",
     "build_valid_region",
     "check_mask_overlaps",
+    "correct_fringe",
     "crop_to_processing_region",
     "define_processing_region",
     "detect_empirical_edges",
