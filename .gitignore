@@ -3,6 +3,7 @@
 build/
 dist/
 *.egg-info
+tests/data/*.fits
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

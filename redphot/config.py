@@ -1,0 +1,1210 @@
+"""
+Configuration defaults and conventions for redphot.
+
+Configuration order is:
+
+    general defaults
+    instrument defaults
+    run settings
+    filter settings
+    individual-image overrides
+
+All functions return independent dictionaries. Changing the resolved settings
+for one image will not modify the defaults or the settings for another image.
+"""
+
+from collections.abc import Mapping
+from copy import deepcopy
+from pathlib import Path
+
+
+MISSING_VALUE = None
+
+MISSING_VALUE_POLICY = {
+    "configuration": None,
+    "table_numeric": "masked",
+    "table_string": "masked",
+    "floating_array": "nan",
+    "boolean": None,
+    "never_use": [-999, -1],
+}
+
+
+STANDARD_UNITS = {
+    "angle": "deg",
+    "sky_separation": "arcsec",
+    "pixel_scale": "arcsec/pixel",
+    "exposure_time": "s",
+    "time": "MJD-UTC",
+    "gain": "electron/adu",
+    "read_noise": "electron",
+    "image": "adu",
+    "background": "adu/pixel",
+    "flux": "adu",
+    "flux_rate": "adu/s",
+    "magnitude": "mag",
+    "temperature": "deg_C",
+    "distance": "m",
+}
+
+
+FILTER_ALIASES = {
+    "u": "u",
+    "up": "u",
+    "us": "u",
+    "u-sloan": "u",
+    "sloan-u": "u",
+    "sdss-u": "u",
+    "g": "g",
+    "gp": "g",
+    "gs": "g",
+    "g-sloan": "g",
+    "sloan-g": "g",
+    "sdss-g": "g",
+    "g-ztf": "g",
+    "ztf-g": "g",
+    "g-skymapper": "g",
+    "r": "r",
+    "rp": "r",
+    "rs": "r",
+    "r-sloan": "r",
+    "sloan-r": "r",
+    "sdss-r": "r",
+    "r-ztf": "r",
+    "ztf-r": "r",
+    "r-skymapper": "r",
+    "i": "i",
+    "ip": "i",
+    "is": "i",
+    "i-sloan": "i",
+    "sloan-i": "i",
+    "sdss-i": "i",
+    "i-ztf": "i",
+    "ztf-i": "i",
+    "i-skymapper": "i",
+    "z": "z",
+    "zp": "z",
+    "zs": "z",
+    "z-sloan": "z",
+    "sloan-z": "z",
+    "sdss-z": "z",
+    "z-ztf": "z",
+    "ztf-z": "z",
+    "z-skymapper": "z",
+    "y": "y",
+    "yp": "y",
+    "ys": "y",
+    "y-sloan": "y",
+    "sloan-y": "y",
+    "B": "B",
+    "Johnson-B": "B",
+    "Bessell-B": "B",
+    "V": "V",
+    "Johnson-V": "V",
+    "Bessell-V": "V",
+    "R": "R",
+    "Rc": "R",
+    "R-Cousins": "R",
+    "Cousins-R": "R",
+    "Bessell-R": "R",
+    "I": "I",
+    "Ic": "I",
+    "I-Cousins": "I",
+    "Cousins-I": "I",
+    "Bessell-I": "I",
+    "J": "J",
+    "H": "H",
+    "K": "K",
+    "Ks": "Ks",
+    "clear": "clear",
+    "open": "clear",
+    "unfiltered": "clear",
+}
+
+
+QUALITY_FLAGS = {
+    "input": [
+        "FITS_UNREADABLE",
+        "FITS_CHECKSUM_FAILED",
+        "NO_IMAGE_DATA",
+        "MULTIPLE_IMAGE_HDUS",
+        "DUPLICATE_IMAGE",
+        "UNSUPPORTED_RAW_IMAGE",
+    ],
+    "metadata": [
+        "METADATA_MISSING",
+        "METADATA_CONFLICT",
+        "EXPOSURE_TIME_CONFLICT",
+        "TIME_CONFLICT",
+        "FILTER_UNKNOWN",
+        "GAIN_MISSING",
+        "READ_NOISE_MISSING",
+        "SATURATION_MISSING",
+    ],
+    "image": [
+        "TARGET_OUTSIDE_IMAGE",
+        "TARGET_NEAR_EDGE",
+        "BAD_EDGES",
+        "TOO_MANY_MASKED_PIXELS",
+        "SATURATION_HIGH",
+        "BAD_ROWS_OR_COLUMNS",
+        "TRAIL_PRESENT",
+        "TARGET_TRAIL",
+        "TARGET_COSMIC_RAY",
+        "BACKGROUND_UNRELIABLE",
+        "BACKGROUND_GRADIENT_HIGH",
+        "FRINGE_CORRECTION_FAILED",
+    ],
+    "astrometry": [
+        "WCS_MISSING",
+        "WCS_INVALID",
+        "WCS_POOR",
+        "WCS_TOO_FEW_MATCHES",
+        "WCS_REFINEMENT_FAILED",
+    ],
+    "quality": [
+        "TOO_FEW_SOURCES",
+        "SEEING_POOR",
+        "ELLIPTICITY_HIGH",
+        "TRANSPARENCY_LOW",
+        "TRANSPARENCY_NONUNIFORM",
+        "ZEROPOINT_OUTLIER",
+        "ZEROPOINT_SCATTER_HIGH",
+        "IMAGE_TOO_SHALLOW",
+    ],
+    "photometry": [
+        "TOO_FEW_PSF_STARS",
+        "PSF_MODEL_FAILED",
+        "PSF_RESIDUAL_HIGH",
+        "TARGET_MASKED",
+        "TARGET_FIT_FAILED",
+        "TARGET_CENTROID_OFFSET",
+        "APERTURE_INCOMPLETE",
+        "CALIBRATION_FAILED",
+        "NONDETECTION",
+    ],
+    "subtraction": [
+        "TEMPLATE_MISSING",
+        "TEMPLATE_COVERAGE_INCOMPLETE",
+        "TEMPLATE_FILTER_MISMATCH",
+        "TEMPLATE_ALIGNMENT_FAILED",
+        "SUBTRACTION_FAILED",
+        "SUBTRACTION_RESIDUAL_HIGH",
+        "SUBTRACTION_DIPOLE",
+    ],
+}
+
+
+INSTRUMENT_ALIASES = {
+    "lco": "lco",
+    "lcogt": "lco",
+    "las-cumbres": "lco",
+    "las-cumbres-observatory": "lco",
+    "sq37": "lco",
+    "qhy600m": "lco",
+    "keplercam": "keplercam",
+    "kepcam": "keplercam",
+    "flwo": "keplercam",
+    "flwo-1.2m": "keplercam",
+}
+
+
+DEFAULT_SETTINGS = {
+    "instrument": {
+        "name": None,
+        "profile": None,
+    },
+    "input": {
+        "paths": [],
+        "recursive": False,
+        "patterns": [
+            "*.fits",
+            "*.fit",
+            "*.fts",
+            "*.fits.fz",
+            "*.fit.fz",
+            "*.fits.gz",
+        ],
+        "data_hdu": None,
+        "header_hdu": None,
+        "mask_hdu": None,
+        "variance_hdu": None,
+        "preferred_extnames": ["SCI", "IMAGE", "IM1", "IM2"],
+        "hdu_search_order": [0, 1, 2],
+        "search_remaining_hdus": True,
+        "prefer_target_hdu": True,
+        "read_only": True,
+        "memmap": False,
+        "verify_checksum": True,
+        "allow_compressed": True,
+        "minimum_finite_fraction": 0.50,
+        "detect_duplicate_files": True,
+    },
+    "metadata": {
+        "keywords": {
+            "object": ["OBJECT", "OBJNAME", "TARGNAME"],
+            "telescope": ["TELESCOP", "TELESCOPE", "TELID"],
+            "instrument": ["INSTRUME", "INSTRUMENT", "DETECTOR"],
+            "detector": ["DETECTOR", "DETECTID", "CCDNAME"],
+            "site": ["SITE", "SITEID", "SITENAME", "OBSERVAT"],
+            "exposure_time": ["EXPTIME", "EXPOSURE"],
+            "date_obs": ["DATE-OBS", "DATEOBS"],
+            "date_end": ["DATE-END", "DATEEND", "UTEND", "UTSTOP"],
+            "mjd": ["MJD-OBS", "MJD", "OBSMJD", "JD"],
+            "filter": ["FILTER", "FILTER1", "FILTER2"],
+            "gain": ["GAIN", "EGAIN", "GAINDL"],
+            "read_noise": ["RDNOISE", "READNOIS", "READNOI", "ENOISE"],
+            "saturation": ["MAXLIN", "SATURATE", "SATLEVEL"],
+            "nonlinearity": ["MAXLIN", "LINLIMIT", "NONLIN", "NONLINEAR"],
+            "airmass": ["AIRMASS", "AIR", "SECZ"],
+            "pointing_ra": ["RA"],
+            "pointing_dec": ["DEC"],
+            "target_ra": ["CAT-RA", "OBJRA"],
+            "target_dec": ["CAT-DEC", "OBJDEC"],
+            "pixel_scale": ["PIXSCALE", "SECPIX1"],
+            "binning": ["CCDSUM", "BINNING"],
+            "reduction_level": ["RLEVEL"],
+            "pipeline_version": ["PIPEVER"],
+        },
+        "fallback_values": {
+            "telescope": None,
+            "instrument": None,
+            "detector": None,
+            "site": None,
+            "gain": None,
+            "read_noise": None,
+            "saturation": None,
+            "nonlinearity": None,
+            "pixel_scale": None,
+        },
+        "filter_override": None,
+        "object_override": None,
+        "exposure_time_override": None,
+        "airmass_override": None,
+        "gain_override": None,
+        "read_noise_override": None,
+        "saturation_override": None,
+        "nonlinearity_override": None,
+        "check_duplicate_cards": True,
+        "check_conflicts": True,
+        "warn_on_validation": True,
+        "exposure_time_tolerance_s": 1.0,
+        "time_tolerance_s": 2.0,
+        "time_reference": "start",
+        "convert_time_to_mid_exposure": True,
+        "resolve_exposure_from_times": True,
+        "derive_exposure_from_times": True,
+        "canonical_time_scale": "utc",
+        "canonical_time_format": "mjd",
+        "strip_string_values": True,
+        "normalize_filter": True,
+        "require_reduced_input": True,
+        "required_fields": ["object", "exposure_time", "mjd", "filter"],
+        "conflict_fields": [
+            "exposure_time",
+            "gain",
+            "read_noise",
+            "saturation",
+            "nonlinearity",
+            "pixel_scale",
+            "binning",
+        ],
+        "header_coordinate_unit": ["hourangle", "deg"],
+        "diagnostic_keywords": {
+            "pipeline_fwhm_arcsec": ["L1FWHM"],
+            "pipeline_ellipticity": ["L1ELLIP"],
+            "pipeline_zeropoint_mag": ["L1ZP"],
+            "pipeline_saturated_fraction": ["SATFRAC"],
+            "pipeline_wcs_error": ["WCSERR"],
+        },
+    },
+    "crop": {
+        "enabled": True,
+        "center_on": "target",
+        "size_arcmin": None,
+        "shape": "square",
+        "crop_mode": "trim",
+        "use_datasec": True,
+        "use_trimsec": True,
+        "use_ccdsec": False,
+        "use_detsec": False,
+        "section_keywords": {
+            "trimsec": ["TRIMSEC"],
+            "datasec": ["DATASEC"],
+            "ccdsec": ["CCDSEC"],
+            "detsec": ["DETSEC"],
+            "biassec": ["BIASSEC"],
+        },
+        "edge_crop_pixels": 0,
+        "edge_buffer_fwhm": 2.0,
+        "detect_empirical_edges": True,
+        "edge_scan_fraction": 0.15,
+        "edge_min_finite_fraction": 0.50,
+        "edge_max_constant_fraction": 0.50,
+        "edge_sigma": 5.0,
+        "edge_grow_pixels": 2,
+        "target_edge_distance_fwhm": 5.0,
+        "valid_section": None,
+        "require_target_inside": True,
+    },
+    "masks": {
+        "use_existing_mask": True,
+        "mask_nonfinite": True,
+        "mask_invalid_edges": True,
+        "mask_saturated": True,
+        "mask_nonlinear": True,
+        "saturation_grow_pixels": 5,
+        "saturation_halo_fwhm": 5.0,
+        "detect_bad_rows": True,
+        "detect_bad_columns": True,
+        "detect_amplifier_boundaries": True,
+        "detect_trails": True,
+        "trail_sigma": 5.0,
+        "trail_min_length_pixels": 50,
+        "trail_max_width_pixels": 20,
+        "trail_grow_pixels": 5,
+        "manual_regions": [],
+        "cosmic_rays": {
+            "enabled": False,
+            "mode": "mask",
+            "sigclip": 4.5,
+            "sigfrac": 0.3,
+            "objlim": 5.0,
+            "niter": 4,
+            "cleantype": "meanmask",
+            "use_image_gain": True,
+            "use_image_read_noise": True,
+            "use_image_saturation": True,
+            "grow_pixels": 1,
+            "reject_if_target_overlap": True,
+        },
+    },
+    "fringe": {
+        "enabled": False,
+        "eligible": False,
+        "filters": ["i", "z"],
+        "map_path": None,
+        "control_points_path": None,
+        "scale_method": "control_pairs",
+        "minimum_control_pairs": 10,
+        "sigma_clip": 3.0,
+        "maximum_iterations": 3,
+        "scale_minimum": 0.0,
+        "scale_maximum": None,
+        "reject_invalid_scale": True,
+        "save_model": True,
+    },
+    "background": {
+        "enabled": True,
+        "mode": "broad_plus_local",
+        "method": "Background2D",
+        "box_size": [128, 128],
+        "filter_size": [3, 3],
+        "sigma_clip": 3.0,
+        "maximum_iterations": 10,
+        "exclude_percentile": 20.0,
+        "estimator": "SExtractorBackground",
+        "rms_estimator": "StdBackgroundRMS",
+        "source_mask_enabled": True,
+        "source_mask_sigma": 3.0,
+        "source_mask_min_pixels": 5,
+        "source_mask_grow_fwhm": 3.0,
+        "protect_target": True,
+        "target_protection_fwhm": 5.0,
+        "protect_host": False,
+        "host_protection_region": None,
+        "measure_residual_gradient": True,
+        "save_background": True,
+        "save_background_rms": True,
+    },
+    "source_detection": {
+        "enabled": True,
+        "method": "DAOStarFinder",
+        "threshold_sigma": 5.0,
+        "fwhm_guess_pixels": 4.0,
+        "minimum_separation_fwhm": 1.0,
+        "exclude_border_fwhm": 3.0,
+        "deblend": True,
+        "minimum_pixels": 5,
+        "maximum_sources": 1000,
+        "reject_saturated": True,
+        "reject_masked": True,
+    },
+    "astrometry": {
+        "enabled": True,
+        "catalog": "gaia",
+        "verify_existing_wcs": True,
+        "refine_wcs": True,
+        "minimum_matches": 6,
+        "maximum_match_separation_arcsec": 5.0,
+        "target_rms_arcsec": 0.5,
+        "warning_rms_arcsec": 1.0,
+        "fit_translation": True,
+        "fit_rotation": True,
+        "fit_scale": True,
+        "fit_distortion": False,
+        "sigma_clip": 4.0,
+        "maximum_iterations": 3,
+        "plate_solve_fallback": False,
+        "reproject_science_image": False,
+        "save_refined_header": True,
+    },
+    "catalogs": {
+        "cache_enabled": True,
+        "cache_directory": "catalogs",
+        "force_new_query": False,
+        "search_radius_arcmin": 10.0,
+        "astrometry_catalog": "gaia",
+        "photometry_catalog": "auto",
+        "photometry_catalog_by_filter": {
+            "u": "sdss",
+            "g": "ps1",
+            "r": "ps1",
+            "i": "ps1",
+            "z": "ps1",
+            "y": "ps1",
+            "B": "apass",
+            "V": "apass",
+            "R": "apass",
+            "I": "apass",
+        },
+        "local_catalog_path": None,
+        "propagate_gaia_proper_motion": True,
+        "comparison_stars": {
+            "minimum_catalog_stars": 3,
+            "maximum_catalog_stars": 300,
+            "minimum_magnitude": 10.0,
+            "maximum_magnitude": 22.0,
+            "minimum_snr": 10.0,
+            "minimum_edge_distance_fwhm": 5.0,
+            "minimum_saturation_distance_fwhm": 8.0,
+            "minimum_neighbor_distance_fwhm": 3.0,
+            "maximum_ellipticity": 0.35,
+            "require_point_source": True,
+            "reject_known_variables": True,
+            "require_catalog_quality": True,
+            "prefer_target_color": False,
+            "maximum_color_difference": None,
+            "check_batch_stability": True,
+            "maximum_batch_rms_mag": 0.05,
+            "minimum_epoch_fraction": 0.50,
+        },
+    },
+    "image_quality": {
+        "enabled": True,
+        "minimum_finite_fraction": 0.90,
+        "maximum_masked_fraction_warn": 0.20,
+        "maximum_masked_fraction_fail": 0.50,
+        "minimum_sources_warn": 8,
+        "minimum_sources_fail": 3,
+        "fwhm_warn_arcsec": 4.0,
+        "fwhm_fail_arcsec": 8.0,
+        "ellipticity_warn": 0.30,
+        "ellipticity_fail": 0.60,
+        "wcs_rms_warn_arcsec": 1.0,
+        "wcs_rms_fail_arcsec": 3.0,
+        "zeropoint_offset_warn_mag": 0.50,
+        "zeropoint_offset_fail_mag": 1.50,
+        "zeropoint_scatter_warn_mag": 0.10,
+        "zeropoint_scatter_fail_mag": 0.30,
+        "minimum_catalog_recovery_warn": 0.40,
+        "minimum_catalog_recovery_fail": 0.15,
+        "maximum_trail_fraction_warn": 0.05,
+        "maximum_trail_fraction_fail": 0.20,
+        "minimum_useful_depth_mag": None,
+        "expected_target_magnitude": None,
+        "reject_target_artifact_overlap": True,
+        "allow_user_approval": True,
+    },
+    "target_position": {
+        "ra": None,
+        "dec": None,
+        "coordinate_unit": ["hourangle", "deg"],
+        "metadata_precedence": [
+            "user",
+            "header_target",
+            "wcs_center",
+            "telescope_pointing",
+        ],
+        "user_position_required": False,
+        "position_precedence": [
+            "user",
+            "detection_stack",
+            "catalog_header",
+            "object_header",
+        ],
+        "build_detection_stack": True,
+        "build_per_filter_stacks": True,
+        "build_multifilter_stack": True,
+        "exclude_failed_images": True,
+        "exclude_warned_images": False,
+        "fixed_position_photometry": True,
+        "diagnostic_recenter": True,
+        "maximum_diagnostic_offset_arcsec": 1.0,
+        "save_stack": True,
+    },
+    "psf": {
+        "enabled": True,
+        "model": "empirical",
+        "fallback_model": "moffat",
+        "box_size_pixels": 25,
+        "oversampling": 2,
+        "minimum_stars": 5,
+        "maximum_stars": 20,
+        "minimum_star_snr": 30.0,
+        "minimum_edge_distance_fwhm": 5.0,
+        "reject_saturated": True,
+        "reject_masked": True,
+        "reject_blended": True,
+        "sigma_clip": 3.0,
+        "maximum_iterations": 3,
+        "spatial_order": 0,
+        "maximum_residual_fraction": 0.10,
+        "fix_target_centroid": True,
+        "save_model": True,
+        "save_residuals": True,
+    },
+    "apertures": {
+        "enabled": True,
+        "small_radius_fwhm": 1.0,
+        "large_radius_fwhm": 2.5,
+        "sky_inner_radius_fwhm": 4.0,
+        "sky_outer_radius_fwhm": 7.0,
+        "minimum_sky_pixels": 50,
+        "subpixel_method": "exact",
+        "apply_aperture_correction": True,
+        "fixed_target_position": True,
+        "local_background": True,
+    },
+    "calibration": {
+        "enabled": True,
+        "catalog": "auto",
+        "minimum_stars": 3,
+        "maximum_stars": 100,
+        "minimum_star_snr": 10.0,
+        "sigma_clip": 3.0,
+        "maximum_iterations": 5,
+        "maximum_catalog_separation_arcsec": 2.0,
+        "calculate_psf_zeropoint": True,
+        "calculate_aperture_zeropoint": True,
+        "calculate_color_term": False,
+        "apply_color_term": False,
+        "apply_atmospheric_extinction": False,
+        "apply_galactic_extinction": False,
+        "zeropoint_scatter_warn_mag": 0.10,
+        "zeropoint_scatter_fail_mag": 0.30,
+        "retain_instrumental_measurements": True,
+    },
+    "subtraction": {
+        "enabled": False,
+        "method": "hotpants",
+        "fallback_method": None,
+        "template_path": None,
+        "template_source": "auto",
+        "template_survey_priority": ["ps1", "legacy", "decam"],
+        "template_margin_arcmin": 2.0,
+        "require_pretransient_template": True,
+        "require_filter_match": True,
+        "allow_approximate_filter_match": False,
+        "keep_science_grid": True,
+        "resample_template_only": True,
+        "background_match": True,
+        "photometric_scale": True,
+        "automatic_parameters": True,
+        "hotpants_executable": "hotpants",
+        "hotpants": {
+            "kernel_order": "auto",
+            "background_order": "auto",
+            "stamp_count": "auto",
+            "lower_threshold": "auto",
+            "upper_threshold": "auto",
+        },
+        "pyzogy": {
+            "enabled": False,
+            "require_variance": True,
+            "require_psf": True,
+        },
+        "maximum_alignment_rms_pixels": 0.5,
+        "maximum_residual_fraction": 0.10,
+        "save_aligned_template": True,
+        "save_difference": True,
+        "save_logs": True,
+    },
+    "upper_limits": {
+        "enabled": True,
+        "sigma_levels": [3.0, 5.0],
+        "analytic": True,
+        "empty_apertures": True,
+        "number_empty_apertures": 100,
+        "empty_aperture_radius_fwhm": 1.0,
+        "empty_aperture_local_radius_arcsec": 60.0,
+        "exclude_sources": True,
+        "exclude_masked_regions": True,
+        "injection_recovery": False,
+        "number_injected_sources": 100,
+        "minimum_recovery_fraction": 0.50,
+        "calculate_on_science": True,
+        "calculate_on_difference": True,
+    },
+    "diagnostics": {
+        "enabled": True,
+        "show_plots": False,
+        "save_stage_plots": True,
+        "make_image_pdf": True,
+        "make_batch_pdf": True,
+        "include_failed_images": True,
+        "plot_original_image": True,
+        "plot_masks": True,
+        "plot_background": True,
+        "plot_astrometry": True,
+        "plot_comparison_stars": True,
+        "plot_psf": True,
+        "plot_psf_3d": True,
+        "plot_calibration": True,
+        "plot_target": True,
+        "plot_subtraction": True,
+        "plot_upper_limits": True,
+        "image_format": "png",
+        "dpi": 150,
+    },
+    "output": {
+        "directory": "redphot_output",
+        "overwrite": False,
+        "save_intermediate_fits": True,
+        "save_masks": True,
+        "save_background": True,
+        "save_cleaned_image": False,
+        "save_fringe_corrected_image": True,
+        "save_psf": True,
+        "save_templates": True,
+        "save_difference": True,
+        "table_format": "ascii.ecsv",
+        "image_format": "fits",
+        "write_resolved_config": True,
+        "write_log": True,
+        "log_level": "INFO",
+    },
+}
+
+
+FILTER_DEFAULTS = {
+    "i": {
+        "fringe": {
+            "eligible": True,
+        },
+    },
+    "z": {
+        "fringe": {
+            "eligible": True,
+        },
+    },
+}
+
+
+INSTRUMENT_DEFAULTS = {
+    "lco": {
+        "instrument": {
+            "name": "LCO",
+            "profile": "lco",
+        },
+        "input": {
+            "preferred_extnames": ["SCI", "IMAGE"],
+            "hdu_search_order": [0, 1, 2],
+            "allow_compressed": True,
+            "verify_checksum": True,
+        },
+        "metadata": {
+            "keywords": {
+                "object": ["OBJECT", "GROUPID"],
+                "telescope": ["TELESCOP", "TELID"],
+                "instrument": ["INSTRUME"],
+                "detector": ["DETECTOR", "DETECTID"],
+                "site": ["SITE", "SITEID"],
+                "exposure_time": ["EXPTIME"],
+                "date_obs": ["DATE-OBS"],
+                "date_end": ["DATE-END", "UTSTOP"],
+                "mjd": ["MJD-OBS", "MJD", "OBSMJD", "JD"],
+                "filter": ["FILTER", "FILTER1"],
+                "gain": ["GAIN"],
+                "read_noise": ["RDNOISE"],
+                "saturation": ["MAXLIN", "SATURATE"],
+                "nonlinearity": ["MAXLIN", "LINLIMIT", "NONLIN"],
+                "airmass": ["AIRMASS", "AIR"],
+                "pointing_ra": ["RA"],
+                "pointing_dec": ["DEC"],
+                "target_ra": ["CAT-RA", "OFST-RA"],
+                "target_dec": ["CAT-DEC", "OFST-DEC"],
+                "pixel_scale": ["PIXSCALE"],
+                "binning": ["CCDSUM"],
+                "reduction_level": ["RLEVEL"],
+                "pipeline_version": ["PIPEVER"],
+            },
+            "fallback_values": {
+                "telescope": "LCO",
+                "instrument": None,
+                "detector": None,
+                "site": None,
+                "gain": None,
+                "read_noise": None,
+                "saturation": None,
+                "pixel_scale": None,
+            },
+            "time_reference": "start",
+            "convert_time_to_mid_exposure": True,
+            "require_reduced_input": True,
+        },
+        "crop": {
+            "enabled": True,
+            "center_on": "target",
+            "size_arcmin": 15.0,
+            "use_datasec": True,
+            "use_trimsec": True,
+        },
+        "background": {
+            "box_size": [128, 128],
+            "filter_size": [3, 3],
+        },
+        "source_detection": {
+            "fwhm_guess_pixels": 5.0,
+        },
+    },
+    "keplercam": {
+        "instrument": {
+            "name": "KeplerCam",
+            "profile": "keplercam",
+        },
+        "input": {
+            "preferred_extnames": ["SCI", "IM1", "IM2", "IM3", "IM4"],
+            "hdu_search_order": [0, 1, 2],
+            "allow_compressed": True,
+        },
+        "metadata": {
+            "keywords": {
+                "object": ["OBJECT"],
+                "telescope": ["TELESCOP", "SITENAME"],
+                "instrument": ["INSTRUME", "DETECTOR"],
+                "detector": ["DETECTOR"],
+                "site": ["SITENAME"],
+                "exposure_time": ["EXPTIME"],
+                "date_obs": ["DATE-OBS"],
+                "date_end": ["DATE-END", "UTEND"],
+                "mjd": ["MJD-OBS", "MJD", "OBSMJD", "JD"],
+                "filter": ["FILTER"],
+                "gain": ["GAIN", "EGAIN", "GAINDL"],
+                "read_noise": ["RDNOISE", "READNOI", "ENOISE"],
+                "saturation": ["MAXLIN", "SATURATE"],
+                "nonlinearity": ["MAXLIN", "LINLIMIT", "NONLIN"],
+                "airmass": ["AIR", "AIRMASS", "SECZ"],
+                "pointing_ra": ["RRA", "RA"],
+                "pointing_dec": ["RDEC", "DEC"],
+                "target_ra": ["RA"],
+                "target_dec": ["DEC"],
+                "pixel_scale": ["SECPIX1", "SECPIX2"],
+                "binning": ["CCDSUM"],
+                "reduction_level": ["RLEVEL"],
+                "pipeline_version": ["PIPEVER"],
+            },
+            "fallback_values": {
+                "telescope": "FLWO 1.2m",
+                "instrument": "KeplerCam",
+                "detector": "KeplerCam",
+                "site": "FLWO",
+                "gain": 4.45,
+                "read_noise": 7.18,
+                "saturation": 50000.0,
+                "nonlinearity": 50000.0,
+                "pixel_scale": 0.672,
+            },
+            "time_reference": "start",
+            "convert_time_to_mid_exposure": True,
+            "exposure_time_tolerance_s": 1.0,
+            "require_reduced_input": True,
+        },
+        "crop": {
+            "enabled": True,
+            "center_on": "target",
+            "size_arcmin": None,
+            "use_datasec": True,
+            "use_trimsec": True,
+        },
+        "background": {
+            "box_size": [64, 64],
+            "filter_size": [3, 3],
+        },
+        "source_detection": {
+            "fwhm_guess_pixels": 4.0,
+        },
+        "fringe": {
+            "filters": ["i", "z"],
+        },
+    },
+}
+
+
+REQUIRED_SECTIONS = [
+    "instrument",
+    "input",
+    "metadata",
+    "crop",
+    "masks",
+    "fringe",
+    "background",
+    "source_detection",
+    "astrometry",
+    "catalogs",
+    "image_quality",
+    "target_position",
+    "psf",
+    "apertures",
+    "calibration",
+    "subtraction",
+    "upper_limits",
+    "diagnostics",
+    "output",
+]
+
+
+def normalize_filter_name(filter_name):
+    """
+    Convert a raw filter name to a standard redphot filter name.
+
+    Unrecognized filter names are returned unchanged so that the caller can
+    decide whether to accept, override, or reject them.
+    """
+    if filter_name is None:
+        return None
+
+    value = str(filter_name).strip()
+
+    if value in FILTER_ALIASES:
+        return FILTER_ALIASES[value]
+
+    normalized = value.replace("_", "-").replace(" ", "-")
+
+    if normalized in FILTER_ALIASES:
+        return FILTER_ALIASES[normalized]
+
+    if len(normalized) > 1:
+        lower_value = normalized.lower()
+        if lower_value in FILTER_ALIASES:
+            return FILTER_ALIASES[lower_value]
+
+    return value
+
+
+def normalize_instrument_name(instrument_name):
+    """
+    Convert an instrument, telescope, or site name to a profile name.
+
+    Unknown names are returned in normalized lowercase form. This allows a
+    caller to use general defaults even when no instrument profile exists.
+    """
+    if instrument_name is None:
+        return None
+
+    value = str(instrument_name).strip().lower()
+    normalized = value.replace("_", "-").replace(" ", "-")
+
+    if normalized in INSTRUMENT_ALIASES:
+        return INSTRUMENT_ALIASES[normalized]
+
+    if "lcogt" in normalized or "las-cumbres" in normalized:
+        return "lco"
+
+    if normalized.startswith("sq") or "qhy600" in normalized:
+        return "lco"
+
+    if "kepcam" in normalized or "keplercam" in normalized:
+        return "keplercam"
+
+    if "flwo" in normalized:
+        return "keplercam"
+
+    return normalized
+
+
+def merge_settings(base_settings, override_settings):
+    """
+    Recursively merge two settings dictionaries without modifying either one.
+
+    Nested dictionaries are merged recursively. Lists, tuples, scalars, and
+    None values replace the corresponding value from the base dictionary.
+    """
+    if not isinstance(base_settings, Mapping):
+        raise TypeError("base_settings must be a mapping")
+
+    if override_settings is None:
+        return deepcopy(dict(base_settings))
+
+    if not isinstance(override_settings, Mapping):
+        raise TypeError("override_settings must be a mapping or None")
+
+    merged = deepcopy(dict(base_settings))
+
+    for key, value in override_settings.items():
+        if (
+            key in merged
+            and isinstance(merged[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            merged[key] = merge_settings(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+
+    return merged
+
+
+def get_default_settings():
+    """
+    Return an independent copy of the general redphot settings.
+    """
+    return deepcopy(DEFAULT_SETTINGS)
+
+
+def get_instrument_settings(instrument_name):
+    """
+    Return an independent instrument-settings dictionary.
+
+    An empty dictionary is returned when no matching instrument profile exists.
+    """
+    profile = normalize_instrument_name(instrument_name)
+
+    if profile not in INSTRUMENT_DEFAULTS:
+        return {}
+
+    return deepcopy(INSTRUMENT_DEFAULTS[profile])
+
+
+def get_filter_settings(filter_name, filter_settings=None):
+    """
+    Return the built-in and user-supplied settings for one filter.
+
+    User filter settings must be a mapping whose keys are raw or normalized
+    filter names and whose values are nested override dictionaries.
+    """
+    normalized_filter = normalize_filter_name(filter_name)
+    resolved = {}
+
+    if normalized_filter in FILTER_DEFAULTS:
+        resolved = merge_settings(
+            resolved,
+            FILTER_DEFAULTS[normalized_filter],
+        )
+
+    if filter_settings is None:
+        return resolved
+
+    if not isinstance(filter_settings, Mapping):
+        raise TypeError("filter_settings must be a mapping or None")
+
+    for raw_filter, overrides in filter_settings.items():
+        if normalize_filter_name(raw_filter) == normalized_filter:
+            resolved = merge_settings(resolved, overrides)
+
+    return resolved
+
+
+def get_image_settings(image_name, image_overrides=None):
+    """
+    Return overrides assigned to one image.
+
+    Overrides may be keyed by the complete filename or by basename. A basename
+    override is applied first, followed by a complete-path override when both
+    are present.
+    """
+    if image_name is None or image_overrides is None:
+        return {}
+
+    if not isinstance(image_overrides, Mapping):
+        raise TypeError("image_overrides must be a mapping or None")
+
+    image_string = str(image_name)
+    image_basename = Path(image_string).name
+    normalized_overrides = {
+        str(key): value for key, value in image_overrides.items()
+    }
+
+    resolved = {}
+
+    if image_basename in normalized_overrides:
+        resolved = merge_settings(
+            resolved,
+            normalized_overrides[image_basename],
+        )
+
+    if (
+        image_string in normalized_overrides
+        and image_string != image_basename
+    ):
+        resolved = merge_settings(
+            resolved,
+            normalized_overrides[image_string],
+        )
+
+    return resolved
+
+
+def validate_settings(settings):
+    """
+    Perform lightweight validation of a resolved settings dictionary.
+
+    This function checks only configuration structure and basic value choices.
+    Scientific validation remains the responsibility of the processing stage
+    that uses each setting.
+    """
+    if not isinstance(settings, Mapping):
+        raise TypeError("settings must be a mapping")
+
+    missing_sections = [
+        section for section in REQUIRED_SECTIONS if section not in settings
+    ]
+
+    if missing_sections:
+        raise KeyError(
+            "Missing required settings sections: "
+            + ", ".join(missing_sections)
+        )
+
+    crop_size = settings["crop"]["size_arcmin"]
+    if crop_size is not None and crop_size <= 0:
+        raise ValueError("crop.size_arcmin must be positive or None")
+
+    crop_center = settings["crop"]["center_on"]
+    if crop_center not in {"target", "field"}:
+        raise ValueError("crop.center_on must be 'target' or 'field'")
+
+    crop_mode = settings["crop"].get("crop_mode", "trim")
+    if crop_mode not in {"trim", "partial"}:
+        raise ValueError("crop.crop_mode must be 'trim' or 'partial'")
+
+    cosmic_mode = settings["masks"]["cosmic_rays"]["mode"]
+    if cosmic_mode not in {"off", "detect_only", "mask", "clean"}:
+        raise ValueError(
+            "masks.cosmic_rays.mode must be off, detect_only, mask, or clean"
+        )
+
+    background_mode = settings["background"]["mode"]
+    if background_mode not in {
+        "off",
+        "measure_only",
+        "subtract_broad",
+        "local_only",
+        "broad_plus_local",
+    }:
+        raise ValueError(
+            "background.mode must be off, measure_only, subtract_broad, "
+            "local_only, or broad_plus_local"
+        )
+
+    subtraction_method = settings["subtraction"]["method"]
+    if subtraction_method not in {"hotpants", "pyzogy"}:
+        raise ValueError(
+            "subtraction.method must be hotpants or pyzogy"
+        )
+
+    target_ra = settings["target_position"]["ra"]
+    target_dec = settings["target_position"]["dec"]
+
+    if (target_ra is None) != (target_dec is None):
+        raise ValueError(
+            "target_position.ra and target_position.dec must both be set "
+            "or both be None"
+        )
+
+    sigma_levels = settings["upper_limits"]["sigma_levels"]
+    if not sigma_levels or any(level <= 0 for level in sigma_levels):
+        raise ValueError(
+            "upper_limits.sigma_levels must contain positive values"
+        )
+
+
+def resolve_settings(
+    instrument_name=None,
+    run_settings=None,
+    filter_name=None,
+    filter_settings=None,
+    image_name=None,
+    image_overrides=None,
+    validate=True,
+):
+    """
+    Resolve the complete settings for one image.
+
+    Settings are applied in the following order:
+
+        general defaults
+        instrument defaults
+        run settings
+        filter settings
+        individual-image overrides
+
+    The returned dictionary is fully independent of all input dictionaries.
+    """
+    resolved = get_default_settings()
+    profile = normalize_instrument_name(instrument_name)
+
+    if profile in INSTRUMENT_DEFAULTS:
+        resolved = merge_settings(
+            resolved,
+            get_instrument_settings(profile),
+        )
+
+    if run_settings is not None:
+        resolved = merge_settings(resolved, run_settings)
+
+    normalized_filter = normalize_filter_name(filter_name)
+
+    if normalized_filter is None:
+        normalized_filter = normalize_filter_name(
+            resolved["metadata"].get("filter_override")
+        )
+
+    if normalized_filter is not None:
+        resolved = merge_settings(
+            resolved,
+            get_filter_settings(
+                normalized_filter,
+                filter_settings=filter_settings,
+            ),
+        )
+
+    resolved = merge_settings(
+        resolved,
+        get_image_settings(
+            image_name,
+            image_overrides=image_overrides,
+        ),
+    )
+
+    if profile in INSTRUMENT_DEFAULTS:
+        resolved["instrument"]["profile"] = profile
+
+    if instrument_name is not None:
+        resolved["instrument"]["name"] = str(instrument_name)
+
+    if validate:
+        validate_settings(resolved)
+
+    return resolved
+
+
+__all__ = [
+    "DEFAULT_SETTINGS",
+    "FILTER_ALIASES",
+    "FILTER_DEFAULTS",
+    "INSTRUMENT_ALIASES",
+    "INSTRUMENT_DEFAULTS",
+    "MISSING_VALUE",
+    "MISSING_VALUE_POLICY",
+    "QUALITY_FLAGS",
+    "STANDARD_UNITS",
+    "get_default_settings",
+    "get_filter_settings",
+    "get_image_settings",
+    "get_instrument_settings",
+    "merge_settings",
+    "normalize_filter_name",
+    "normalize_instrument_name",
+    "resolve_settings",
+    "validate_settings",
+]
