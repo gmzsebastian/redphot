@@ -114,6 +114,8 @@ METADATA_FIELDS = (
     "pipeline_version",
     "pipeline_fwhm_arcsec",
     "pipeline_ellipticity",
+    "pipeline_background",
+    "pipeline_background_rms",
     "pipeline_zeropoint_mag",
     "pipeline_saturated_fraction",
     "pipeline_wcs_error",
@@ -161,6 +163,8 @@ FLOAT_METADATA_FIELDS = {
     "adopted_dec_deg",
     "pipeline_fwhm_arcsec",
     "pipeline_ellipticity",
+    "pipeline_background",
+    "pipeline_background_rms",
     "pipeline_zeropoint_mag",
     "pipeline_saturated_fraction",
     "pipeline_wcs_error",
@@ -199,6 +203,8 @@ METADATA_UNITS = {
     "adopted_ra_deg": u.deg,
     "adopted_dec_deg": u.deg,
     "pipeline_fwhm_arcsec": u.arcsec,
+    "pipeline_background": u.adu,
+    "pipeline_background_rms": u.adu,
     "pipeline_zeropoint_mag": u.mag,
 }
 
@@ -3810,6 +3816,914 @@ def save_background_products(
     return paths
 
 
+# ---------------------------------------------------------------------------
+# Source detection and image-quality measurement
+#
+# This stage uses segmentation for detection and deblending, then reduces the
+# source catalog to robust image-level measurements.  The single-image result
+# contains only absolute and upstream-header checks.  Batch-relative checks are
+# applied later by ``assess_image_quality_batch`` so images can be processed
+# independently before the full observing sequence is available.
+# ---------------------------------------------------------------------------
+
+
+def _plain_array(values):
+    """Return a floating array from a Quantity, column, or ordinary array."""
+
+    if hasattr(values, "value"):
+        values = values.value
+    return np.asarray(values, dtype=float)
+
+
+def _robust_location_scatter(values):
+    """Return the finite median and Gaussian-scaled MAD of an array."""
+
+    values = _plain_array(values)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None, None
+    median = float(np.median(values))
+    scatter = float(1.4826 * np.median(np.abs(values - median)))
+    return median, scatter
+
+
+def _empty_source_table():
+    """Return an empty source table with the standard Step 9 columns."""
+
+    table = Table(masked=True)
+    columns = (
+        ("label", int),
+        ("x", float),
+        ("y", float),
+        ("area_pixels", float),
+        ("flux", float),
+        ("flux_error", float),
+        ("snr", float),
+        ("peak", float),
+        ("fwhm_pixels", float),
+        ("fwhm_arcsec", float),
+        ("ellipticity", float),
+        ("orientation_deg", float),
+        ("saturated", bool),
+        ("near_edge", bool),
+        ("good_for_seeing", bool),
+    )
+    for name, dtype in columns:
+        table.add_column(MaskedColumn(name=name, dtype=dtype, length=0))
+    table["x"].unit = u.pixel
+    table["y"].unit = u.pixel
+    table["area_pixels"].unit = u.pixel ** 2
+    table["fwhm_pixels"].unit = u.pixel
+    table["fwhm_arcsec"].unit = u.arcsec
+    table["orientation_deg"].unit = u.deg
+    return table
+
+
+def _quality_background(data, mask, background_products, settings):
+    """Measure global background and RMS for source detection and reporting."""
+
+    quality_settings = settings.get("image_quality", {})
+    sigma = float(settings.get("background", {}).get("sigma_clip", 3.0))
+    maxiters = int(
+        settings.get("background", {}).get("maximum_iterations", 10)
+    )
+    _, median, std = sigma_clipped_stats(
+        data, mask=mask, sigma=sigma, maxiters=maxiters
+    )
+    background = float(median) if np.isfinite(median) else None
+    background_rms = float(std) if np.isfinite(std) and std > 0 else None
+
+    rms_map = None
+    if background_products is not None:
+        supplied_background = background_products.get("background")
+        if supplied_background is not None:
+            supplied_background = np.asarray(supplied_background, dtype=float)
+            if supplied_background.shape == data.shape:
+                valid_background = supplied_background[
+                    (~mask) & np.isfinite(supplied_background)
+                ]
+                if valid_background.size:
+                    background = float(np.median(valid_background))
+        supplied_rms = background_products.get("background_rms")
+        if supplied_rms is not None:
+            supplied_rms = np.asarray(supplied_rms, dtype=float)
+            if supplied_rms.shape == data.shape:
+                rms_map = supplied_rms
+                valid_rms = supplied_rms[(~mask) & np.isfinite(supplied_rms)]
+                if valid_rms.size:
+                    background_rms = float(np.median(valid_rms))
+
+    if background_rms is None or background_rms <= 0:
+        background_rms = float(np.nanstd(data[~mask])) if np.any(~mask) else None
+    if rms_map is None and background_rms is not None:
+        rms_map = np.full(data.shape, background_rms, dtype=float)
+
+    minimum_rms = quality_settings.get("minimum_background_rms")
+    if minimum_rms is not None and background_rms is not None:
+        background_rms = max(background_rms, float(minimum_rms))
+        if rms_map is not None:
+            rms_map = np.maximum(rms_map, float(minimum_rms))
+    return background, background_rms, rms_map
+
+
+def _target_local_background(ccd, data, mask, metadata, settings, target):
+    """Measure sigma-clipped background in an annulus around the target."""
+
+    position = _project_target_pixel(ccd, metadata, settings, target)
+    if position is None:
+        return {
+            "x": None,
+            "y": None,
+            "inner_radius_pixels": None,
+            "outer_radius_pixels": None,
+            "background": None,
+            "rms": None,
+            "n_pixels": 0,
+        }
+
+    quality_settings = settings.get("image_quality", {})
+    fwhm = _fwhm_guess_pixels(settings)
+    inner = float(
+        quality_settings.get("target_background_inner_fwhm", 5.0)
+    ) * fwhm
+    outer = float(
+        quality_settings.get("target_background_outer_fwhm", 8.0)
+    ) * fwhm
+    if outer <= inner:
+        raise ValueError(
+            "image_quality.target_background_outer_fwhm must exceed "
+            "target_background_inner_fwhm"
+        )
+
+    yy, xx = np.ogrid[: data.shape[0], : data.shape[1]]
+    radius_squared = (xx - position[0]) ** 2 + (yy - position[1]) ** 2
+    annulus = (radius_squared >= inner ** 2) & (radius_squared <= outer ** 2)
+    usable = annulus & ~mask & np.isfinite(data)
+    if np.count_nonzero(usable) < 10:
+        median = std = None
+    else:
+        _, measured_median, measured_std = sigma_clipped_stats(
+            data[usable],
+            sigma=float(settings.get("background", {}).get("sigma_clip", 3.0)),
+            maxiters=int(
+                settings.get("background", {}).get("maximum_iterations", 10)
+            ),
+        )
+        median = float(measured_median) if np.isfinite(measured_median) else None
+        std = float(measured_std) if np.isfinite(measured_std) else None
+    return {
+        "x": float(position[0]),
+        "y": float(position[1]),
+        "inner_radius_pixels": inner,
+        "outer_radius_pixels": outer,
+        "background": median,
+        "rms": std,
+        "n_pixels": int(np.count_nonzero(usable)),
+    }
+
+
+def _count_saturated_sources(mask_components):
+    """Count connected saturated cores without counting their grown halos."""
+
+    if not mask_components:
+        return 0
+    saturated = mask_components.get("saturated")
+    if saturated is None or not np.any(saturated):
+        return 0
+    ndimage = _try_ndimage()
+    if ndimage is None:
+        return int(bool(np.any(saturated)))
+    _, count = ndimage.label(
+        np.asarray(saturated, dtype=bool),
+        structure=np.ones((3, 3), dtype=int),
+    )
+    return int(count)
+
+
+def _add_quality_check(
+    checks,
+    flags,
+    metric,
+    value,
+    warn_threshold,
+    fail_threshold,
+    flag,
+    direction="high",
+):
+    """Evaluate one warn/fail threshold and append a machine-readable check."""
+
+    if value is None or not np.isfinite(value):
+        return "PASS"
+
+    def violated(threshold):
+        if threshold is None:
+            return False
+        if direction == "low":
+            return value < float(threshold)
+        return value > float(threshold)
+
+    if violated(fail_threshold):
+        level = "FAIL"
+        threshold = fail_threshold
+    elif violated(warn_threshold):
+        level = "WARN"
+        threshold = warn_threshold
+    else:
+        return "PASS"
+
+    checks.append(
+        {
+            "metric": metric,
+            "value": float(value),
+            "threshold": float(threshold),
+            "direction": direction,
+            "status": level,
+            "flag": flag,
+        }
+    )
+    if flag not in flags:
+        flags.append(flag)
+    return level
+
+
+def _combine_quality_status(current, new):
+    """Return the more severe of two PASS, WARN, and FAIL states."""
+
+    rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    return new if rank[new] > rank[current] else current
+
+
+def _compare_upstream_quality(info, metadata, settings, checks, flags):
+    """Compare measured values with available upstream pipeline diagnostics."""
+
+    quality_settings = settings.get("image_quality", {})
+    comparisons = {}
+    specifications = (
+        (
+            "fwhm_arcsec",
+            "pipeline_fwhm_arcsec",
+            "fraction",
+            "upstream_fwhm_difference_warn_fraction",
+            "upstream_fwhm_difference_fail_fraction",
+        ),
+        (
+            "ellipticity",
+            "pipeline_ellipticity",
+            "difference",
+            "upstream_ellipticity_difference_warn",
+            "upstream_ellipticity_difference_fail",
+        ),
+        (
+            "background",
+            "pipeline_background",
+            "fraction",
+            "upstream_background_difference_warn_fraction",
+            "upstream_background_difference_fail_fraction",
+        ),
+        (
+            "background_rms",
+            "pipeline_background_rms",
+            "fraction",
+            "upstream_background_rms_difference_warn_fraction",
+            "upstream_background_rms_difference_fail_fraction",
+        ),
+    )
+    status = "PASS"
+    for measured_name, header_name, method, warn_name, fail_name in specifications:
+        measured = info.get(measured_name)
+        upstream = None if metadata is None else _as_float(metadata.get(header_name))
+        comparison = {
+            "measured": measured,
+            "upstream": upstream,
+            "difference": None,
+            "fractional_difference": None,
+        }
+        if measured is not None and upstream is not None:
+            difference = abs(float(measured) - upstream)
+            comparison["difference"] = difference
+            if upstream != 0:
+                comparison["fractional_difference"] = difference / abs(upstream)
+            value = (
+                comparison["fractional_difference"]
+                if method == "fraction"
+                else difference
+            )
+            result = _add_quality_check(
+                checks,
+                flags,
+                "{}_upstream_difference".format(measured_name),
+                value,
+                quality_settings.get(warn_name),
+                quality_settings.get(fail_name),
+                "UPSTREAM_QUALITY_MISMATCH",
+            )
+            status = _combine_quality_status(status, result)
+        comparisons[measured_name] = comparison
+    return comparisons, status
+
+
+def detect_sources_and_measure_quality(
+    ccd,
+    metadata=None,
+    settings=None,
+    target=None,
+    mask_components=None,
+    background_products=None,
+):
+    """Detect, deblend, and characterize sources on one prepared image.
+
+    Source detection uses Photutils segmentation on a lightly PSF-smoothed
+    image.  Shape measurements come from ``SourceCatalog`` and robust medians
+    are calculated only from unsaturated, unmasked, non-edge sources.  Absolute
+    quality limits and differences from available upstream header estimates
+    are applied immediately.  Use :func:`assess_image_quality_batch` after all
+    images have been measured to add batch-median checks.
+
+    Parameters
+    ----------
+    ccd : astropy.nddata.CCDData
+        Prepared image, normally the working derivative returned by Step 8.
+    metadata : mapping, optional
+        Normalized metadata from :func:`read_fits_image`.
+    settings : mapping, optional
+        Resolved settings for this image.
+    target : astropy.coordinates.SkyCoord, mapping, or pair, optional
+        Explicit target position used for the local target-region background.
+    mask_components : mapping, optional
+        Components returned by :func:`build_masks`.  Supplying this enables
+        separate saturated-source and trail-fraction measurements.
+    background_products : mapping, optional
+        Products returned by :func:`model_background`.  Its RMS map is used as
+        the detection error image when available.
+
+    Returns
+    -------
+    sources : astropy.table.Table
+        Per-source positions, fluxes, shapes, and selection flags.
+    segmentation : numpy.ndarray
+        Integer segmentation image; zero denotes background.
+    info : dict
+        Image-level measurements, thresholds, flags, and PASS/WARN/FAIL state.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    detection_settings = settings.get("source_detection", {})
+    quality_settings = settings.get("image_quality", {})
+    data = np.asarray(ccd.data, dtype=float)
+    mask = ~np.isfinite(data)
+    if getattr(ccd, "mask", None) is not None:
+        mask |= np.asarray(ccd.mask, dtype=bool)
+
+    background, background_rms, rms_map = _quality_background(
+        data, mask, background_products, settings
+    )
+    _, detection_median, _ = sigma_clipped_stats(
+        data,
+        mask=mask,
+        sigma=float(settings.get("background", {}).get("sigma_clip", 3.0)),
+        maxiters=int(
+            settings.get("background", {}).get("maximum_iterations", 10)
+        ),
+    )
+    source_data = data - (
+        float(detection_median) if np.isfinite(detection_median) else 0.0
+    )
+    local_target = _target_local_background(
+        ccd, data, mask, metadata, settings, target
+    )
+    segmentation_array = np.zeros(data.shape, dtype=np.int32)
+    sources = _empty_source_table()
+    detection_threshold = None
+    detection_error = None
+    deblend_applied = False
+    deblend_error = None
+
+    if (
+        detection_settings.get("enabled", True)
+        and np.count_nonzero(~mask) >= int(detection_settings.get("minimum_pixels", 5))
+        and background_rms is not None
+        and background_rms > 0
+    ):
+        from astropy.convolution import convolve
+        from photutils.segmentation import (
+            SourceCatalog,
+            deblend_sources,
+            detect_sources,
+            make_2dgaussian_kernel,
+        )
+
+        fwhm_guess = max(1.0, _fwhm_guess_pixels(settings))
+        kernel_fwhm = max(
+            1.0,
+            fwhm_guess
+            * float(detection_settings.get("kernel_fwhm_factor", 1.0)),
+        )
+        kernel_size = max(3, 2 * int(np.ceil(2.0 * kernel_fwhm)) + 1)
+        kernel = make_2dgaussian_kernel(kernel_fwhm, size=kernel_size)
+        convolved = convolve(
+            np.where(mask, 0.0, source_data),
+            kernel,
+            boundary="extend",
+            normalize_kernel=True,
+        )
+        threshold_sigma = float(detection_settings.get("threshold_sigma", 5.0))
+        if rms_map is None:
+            detection_threshold = threshold_sigma * background_rms
+        else:
+            detection_threshold = threshold_sigma * np.asarray(rms_map, dtype=float)
+        minimum_pixels = int(detection_settings.get("minimum_pixels", 5))
+        connectivity = int(detection_settings.get("connectivity", 8))
+        segment_image = detect_sources(
+            convolved,
+            detection_threshold,
+            minimum_pixels,
+            connectivity=connectivity,
+            mask=mask,
+        )
+        if segment_image is not None and detection_settings.get("deblend", True):
+            deblend_arguments = {
+                "contrast": float(
+                    detection_settings.get("deblend_contrast", 0.001)
+                ),
+                "connectivity": connectivity,
+                "progress_bar": False,
+            }
+            try:
+                try:
+                    segment_image = deblend_sources(
+                        convolved,
+                        segment_image,
+                        minimum_pixels,
+                        n_levels=int(
+                            detection_settings.get("deblend_nlevels", 32)
+                        ),
+                        **deblend_arguments,
+                    )
+                except TypeError:
+                    segment_image = deblend_sources(
+                        convolved,
+                        segment_image,
+                        minimum_pixels,
+                        nlevels=int(
+                            detection_settings.get("deblend_nlevels", 32)
+                        ),
+                        **deblend_arguments,
+                    )
+                deblend_applied = True
+            except (ImportError, ModuleNotFoundError) as error:
+                deblend_error = str(error)
+                warnings.warn(
+                    "Source deblending requires scikit-image; using the "
+                    "undeblended segmentation for this image.",
+                    RuntimeWarning,
+                )
+
+        if segment_image is not None:
+            segmentation_array = np.asarray(segment_image.data, dtype=np.int32)
+            detection_error = rms_map
+            catalog = SourceCatalog(
+                source_data,
+                segment_image,
+                convolved_data=convolved,
+                error=detection_error,
+                mask=mask,
+                wcs=getattr(ccd, "wcs", None),
+                progress_bar=False,
+            )
+            x = _plain_array(catalog.x_centroid)
+            y = _plain_array(catalog.y_centroid)
+            area = _plain_array(catalog.area)
+            flux = _plain_array(catalog.segment_flux)
+            flux_error = _plain_array(catalog.segment_flux_err)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                snr = flux / flux_error
+            peak = _plain_array(catalog.max_value)
+            fwhm_pixels = _plain_array(catalog.fwhm)
+            ellipticity = _plain_array(catalog.ellipticity)
+            orientation = _plain_array(catalog.orientation)
+            labels = np.asarray(catalog.labels, dtype=int)
+
+            pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
+            if pixel_scale is None:
+                fwhm_arcsec = np.full(fwhm_pixels.shape, np.nan)
+            else:
+                fwhm_arcsec = fwhm_pixels * pixel_scale
+            saturation_level = settings.get("masks", {}).get("saturation_level")
+            if saturation_level is None and metadata is not None:
+                saturation_level = _as_float(metadata.get("saturation"))
+            saturated = (
+                peak >= saturation_level
+                if saturation_level is not None
+                else np.zeros(peak.shape, dtype=bool)
+            )
+            border = float(
+                detection_settings.get("exclude_border_fwhm", 3.0)
+            ) * fwhm_guess
+            near_edge = (
+                (x < border)
+                | (y < border)
+                | (x > data.shape[1] - 1 - border)
+                | (y > data.shape[0] - 1 - border)
+            )
+            good = (
+                np.isfinite(fwhm_pixels)
+                & np.isfinite(ellipticity)
+                & np.isfinite(snr)
+                & (snr >= float(detection_settings.get("minimum_snr", 5.0)))
+                & (fwhm_pixels >= float(
+                    detection_settings.get("minimum_fwhm_pixels", 1.0)
+                ))
+                & (ellipticity <= float(
+                    detection_settings.get(
+                        "maximum_ellipticity_for_seeing", 0.50
+                    )
+                ))
+                & ~near_edge
+            )
+            maximum_fwhm = detection_settings.get("maximum_fwhm_pixels")
+            if maximum_fwhm is not None:
+                good &= fwhm_pixels <= float(maximum_fwhm)
+            if detection_settings.get("reject_saturated", True):
+                good &= ~saturated
+
+            order = np.argsort(np.nan_to_num(flux, nan=-np.inf))[::-1]
+            maximum_sources = int(detection_settings.get("maximum_sources", 1000))
+            if maximum_sources > 0:
+                order = order[:maximum_sources]
+            sources = Table(masked=True)
+            source_columns = {
+                "label": labels[order],
+                "x": x[order],
+                "y": y[order],
+                "area_pixels": area[order],
+                "flux": flux[order],
+                "flux_error": flux_error[order],
+                "snr": snr[order],
+                "peak": peak[order],
+                "fwhm_pixels": fwhm_pixels[order],
+                "fwhm_arcsec": fwhm_arcsec[order],
+                "ellipticity": ellipticity[order],
+                "orientation_deg": orientation[order],
+                "saturated": saturated[order],
+                "near_edge": near_edge[order],
+                "good_for_seeing": good[order],
+            }
+            for name, values in source_columns.items():
+                sources[name] = values
+            for name, unit in (
+                ("x", u.pixel),
+                ("y", u.pixel),
+                ("area_pixels", u.pixel ** 2),
+                ("fwhm_pixels", u.pixel),
+                ("fwhm_arcsec", u.arcsec),
+                ("orientation_deg", u.deg),
+            ):
+                sources[name].unit = unit
+
+    source_count = len(sources)
+    if source_count:
+        seeing_selection = np.asarray(sources["good_for_seeing"], dtype=bool)
+        shape_selection = (
+            np.isfinite(np.asarray(sources["ellipticity"], dtype=float))
+            & ~np.asarray(sources["near_edge"], dtype=bool)
+            & ~np.asarray(sources["saturated"], dtype=bool)
+        )
+        fwhm_pixels, fwhm_scatter_pixels = _robust_location_scatter(
+            np.asarray(sources["fwhm_pixels"], dtype=float)[seeing_selection]
+        )
+        fwhm_arcsec, fwhm_scatter_arcsec = _robust_location_scatter(
+            np.asarray(sources["fwhm_arcsec"], dtype=float)[seeing_selection]
+        )
+        ellipticity, ellipticity_scatter = _robust_location_scatter(
+            np.asarray(sources["ellipticity"], dtype=float)[seeing_selection]
+        )
+        shape_ellipticity = np.asarray(sources["ellipticity"], dtype=float)[
+            shape_selection
+        ]
+        shape_orientation = np.asarray(sources["orientation_deg"], dtype=float)[
+            shape_selection
+        ]
+        elongated = shape_ellipticity >= float(
+            quality_settings.get("elongated_source_ellipticity", 0.35)
+        )
+        elongated_fraction = (
+            float(np.mean(elongated)) if shape_ellipticity.size else None
+        )
+        if np.count_nonzero(elongated):
+            axial = np.exp(2j * np.deg2rad(shape_orientation[elongated]))
+            mean_axial = np.mean(axial)
+            orientation_concentration = float(abs(mean_axial))
+            mean_orientation = float(
+                (0.5 * np.rad2deg(np.angle(mean_axial))) % 180.0
+            )
+        else:
+            orientation_concentration = None
+            mean_orientation = None
+    else:
+        seeing_selection = np.zeros(0, dtype=bool)
+        fwhm_pixels = fwhm_scatter_pixels = None
+        fwhm_arcsec = fwhm_scatter_arcsec = None
+        ellipticity = ellipticity_scatter = None
+        elongated_fraction = orientation_concentration = mean_orientation = None
+
+    masked_fraction = float(mask.mean()) if mask.size else 0.0
+    finite_fraction = float(np.isfinite(data).mean()) if data.size else 0.0
+    trail_mask = None if not mask_components else mask_components.get("trails")
+    trail_fraction = (
+        float(np.mean(trail_mask)) if trail_mask is not None else 0.0
+    )
+    saturated_source_count = _count_saturated_sources(mask_components)
+    fwhm_scatter_fraction = (
+        fwhm_scatter_pixels / fwhm_pixels
+        if fwhm_pixels not in {None, 0.0} and fwhm_scatter_pixels is not None
+        else None
+    )
+    globally_elongated = bool(
+        elongated_fraction is not None
+        and elongated_fraction
+        > float(quality_settings.get("elongated_fraction_warn", 0.35))
+        and orientation_concentration is not None
+        and orientation_concentration
+        >= float(
+            quality_settings.get("orientation_concentration_minimum", 0.60)
+        )
+    )
+
+    info = {
+        "filename": None if metadata is None else metadata.get("filename"),
+        "source_count": source_count,
+        "seeing_source_count": int(np.count_nonzero(seeing_selection)),
+        "background": background,
+        "background_rms": background_rms,
+        "detection_threshold_sigma": float(
+            detection_settings.get("threshold_sigma", 5.0)
+        ),
+        "deblend_requested": bool(detection_settings.get("deblend", True)),
+        "deblend_applied": deblend_applied,
+        "deblend_error": deblend_error,
+        "fwhm_pixels": fwhm_pixels,
+        "fwhm_arcsec": fwhm_arcsec,
+        "fwhm_scatter_pixels": fwhm_scatter_pixels,
+        "fwhm_scatter_arcsec": fwhm_scatter_arcsec,
+        "fwhm_scatter_fraction": fwhm_scatter_fraction,
+        "ellipticity": ellipticity,
+        "ellipticity_scatter": ellipticity_scatter,
+        "elongated_source_ellipticity": float(
+            quality_settings.get("elongated_source_ellipticity", 0.35)
+        ),
+        "elongated_source_fraction": elongated_fraction,
+        "orientation_concentration": orientation_concentration,
+        "mean_orientation_deg": mean_orientation,
+        "globally_elongated": globally_elongated,
+        "saturated_source_count": saturated_source_count,
+        "masked_pixel_fraction": masked_fraction,
+        "finite_pixel_fraction": finite_fraction,
+        "trail_fraction": trail_fraction,
+        "local_target_background": local_target,
+        "upstream_comparisons": {},
+        "batch_reference": None,
+        "checks": [],
+        "quality_flags": [],
+        "quality_status": "PASS",
+    }
+
+    checks = info["checks"]
+    flags = info["quality_flags"]
+    status = "PASS"
+    limits = (
+        (
+            "finite_pixel_fraction",
+            finite_fraction,
+            quality_settings.get("minimum_finite_fraction"),
+            quality_settings.get("minimum_finite_fraction"),
+            "TOO_MANY_MASKED_PIXELS",
+            "low",
+        ),
+        (
+            "masked_pixel_fraction",
+            masked_fraction,
+            quality_settings.get("maximum_masked_fraction_warn"),
+            quality_settings.get("maximum_masked_fraction_fail"),
+            "TOO_MANY_MASKED_PIXELS",
+            "high",
+        ),
+        (
+            "source_count",
+            source_count,
+            quality_settings.get("minimum_sources_warn"),
+            quality_settings.get("minimum_sources_fail"),
+            "TOO_FEW_SOURCES",
+            "low",
+        ),
+        (
+            "fwhm_arcsec",
+            fwhm_arcsec,
+            quality_settings.get("fwhm_warn_arcsec"),
+            quality_settings.get("fwhm_fail_arcsec"),
+            "SEEING_POOR",
+            "high",
+        ),
+        (
+            "fwhm_scatter_fraction",
+            fwhm_scatter_fraction,
+            quality_settings.get("fwhm_scatter_warn_fraction"),
+            quality_settings.get("fwhm_scatter_fail_fraction"),
+            "SEEING_SCATTER_HIGH",
+            "high",
+        ),
+        (
+            "ellipticity",
+            ellipticity,
+            quality_settings.get("ellipticity_warn"),
+            quality_settings.get("ellipticity_fail"),
+            "ELLIPTICITY_HIGH",
+            "high",
+        ),
+        (
+            "ellipticity_scatter",
+            ellipticity_scatter,
+            quality_settings.get("ellipticity_scatter_warn"),
+            quality_settings.get("ellipticity_scatter_fail"),
+            "ELLIPTICITY_SCATTER_HIGH",
+            "high",
+        ),
+        (
+            "saturated_source_count",
+            saturated_source_count,
+            quality_settings.get("maximum_saturated_sources_warn"),
+            quality_settings.get("maximum_saturated_sources_fail"),
+            "SATURATION_HIGH",
+            "high",
+        ),
+        (
+            "trail_fraction",
+            trail_fraction,
+            quality_settings.get("maximum_trail_fraction_warn"),
+            quality_settings.get("maximum_trail_fraction_fail"),
+            "TRAIL_PRESENT",
+            "high",
+        ),
+        (
+            "background",
+            background,
+            quality_settings.get("maximum_background_warn"),
+            quality_settings.get("maximum_background_fail"),
+            "BACKGROUND_HIGH",
+            "high",
+        ),
+        (
+            "background_rms",
+            background_rms,
+            quality_settings.get("maximum_background_rms_warn"),
+            quality_settings.get("maximum_background_rms_fail"),
+            "BACKGROUND_RMS_HIGH",
+            "high",
+        ),
+    )
+    for specification in limits:
+        result = _add_quality_check(checks, flags, *specification)
+        status = _combine_quality_status(status, result)
+
+    tracking_value = elongated_fraction if globally_elongated else None
+    result = _add_quality_check(
+        checks,
+        flags,
+        "aligned_elongated_source_fraction",
+        tracking_value,
+        quality_settings.get("elongated_fraction_warn"),
+        quality_settings.get("elongated_fraction_fail"),
+        "TRACKING_POOR",
+    )
+    status = _combine_quality_status(status, result)
+    comparisons, upstream_status = _compare_upstream_quality(
+        info, metadata, settings, checks, flags
+    )
+    info["upstream_comparisons"] = comparisons
+    info["quality_status"] = _combine_quality_status(status, upstream_status)
+    return sources, segmentation_array, info
+
+
+def _batch_metric_reference(results, metric):
+    """Return the robust batch reference for one image-quality metric."""
+
+    values = [result.get(metric) for result in results]
+    return _robust_location_scatter(
+        [value for value in values if value is not None and np.isfinite(value)]
+    )
+
+
+def assess_image_quality_batch(results, settings=None):
+    """Apply deviations from batch medians to Step 9 quality results.
+
+    The input dictionaries are not modified.  Relative checks are skipped
+    until ``image_quality.batch_minimum_images`` valid measurements exist for
+    the relevant metric.  This keeps individual-image processing useful while
+    still allowing a poor-seeing or unusually noisy exposure to be identified
+    in a homogeneous observing sequence.
+
+    Parameters
+    ----------
+    results : sequence of mapping
+        ``info`` dictionaries returned by
+        :func:`detect_sources_and_measure_quality`.
+    settings : mapping, optional
+        Resolved run settings containing batch thresholds.
+
+    Returns
+    -------
+    assessed : list of dict
+        Independent copies containing added batch references and checks.
+    """
+
+    from copy import deepcopy
+
+    if settings is None:
+        settings = get_default_settings()
+    quality_settings = settings.get("image_quality", {})
+    assessed = deepcopy(list(results))
+    minimum_images = int(quality_settings.get("batch_minimum_images", 3))
+    metric_settings = (
+        (
+            "fwhm_arcsec",
+            "ratio",
+            "batch_fwhm_ratio_warn",
+            "batch_fwhm_ratio_fail",
+            "SEEING_POOR",
+        ),
+        (
+            "ellipticity",
+            "offset",
+            "batch_ellipticity_offset_warn",
+            "batch_ellipticity_offset_fail",
+            "ELLIPTICITY_HIGH",
+        ),
+        (
+            "background",
+            "ratio",
+            "batch_background_ratio_warn",
+            "batch_background_ratio_fail",
+            "BACKGROUND_HIGH",
+        ),
+        (
+            "background_rms",
+            "ratio",
+            "batch_background_rms_ratio_warn",
+            "batch_background_rms_ratio_fail",
+            "BACKGROUND_RMS_HIGH",
+        ),
+    )
+    references = {}
+    for metric, _, _, _, _ in metric_settings:
+        median, scatter = _batch_metric_reference(assessed, metric)
+        count = sum(
+            result.get(metric) is not None
+            and np.isfinite(result.get(metric))
+            for result in assessed
+        )
+        references[metric] = {
+            "median": median,
+            "scatter": scatter,
+            "count": int(count),
+        }
+
+    for result in assessed:
+        result["batch_reference"] = deepcopy(references)
+        checks = result.setdefault("checks", [])
+        flags = result.setdefault("quality_flags", [])
+        status = result.get("quality_status", "PASS")
+        for metric, method, warn_name, fail_name, flag in metric_settings:
+            reference = references[metric]
+            value = result.get(metric)
+            median = reference["median"]
+            if (
+                reference["count"] < minimum_images
+                or value is None
+                or median is None
+            ):
+                continue
+            if method == "ratio":
+                if median <= 0:
+                    continue
+                deviation = float(value) / median
+            else:
+                deviation = float(value) - median
+            check_status = _add_quality_check(
+                checks,
+                flags,
+                "{}_batch_{}".format(metric, method),
+                deviation,
+                quality_settings.get(warn_name),
+                quality_settings.get(fail_name),
+                flag,
+            )
+            if check_status != "PASS" and "QUALITY_BATCH_OUTLIER" not in flags:
+                flags.append("QUALITY_BATCH_OUTLIER")
+            status = _combine_quality_status(status, check_status)
+        result["quality_status"] = status
+    return assessed
+
+
 def metadata_table(metadata_rows):
     """Convert normalized metadata dictionaries into a masked Astropy table."""
 
@@ -3904,6 +4818,7 @@ __all__ = [
     "FITS_ENDINGS",
     "SCIENCE_EXTNAMES",
     "apply_cosmic_rays",
+    "assess_image_quality_batch",
     "build_masks",
     "build_valid_region",
     "check_mask_overlaps",
@@ -3911,6 +4826,7 @@ __all__ = [
     "crop_to_processing_region",
     "define_processing_region",
     "detect_empirical_edges",
+    "detect_sources_and_measure_quality",
     "detect_trails",
     "discover_fits_files",
     "extract_metadata",

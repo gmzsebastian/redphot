@@ -165,7 +165,14 @@ QUALITY_FLAGS = {
     "quality": [
         "TOO_FEW_SOURCES",
         "SEEING_POOR",
+        "SEEING_SCATTER_HIGH",
         "ELLIPTICITY_HIGH",
+        "ELLIPTICITY_SCATTER_HIGH",
+        "TRACKING_POOR",
+        "BACKGROUND_HIGH",
+        "BACKGROUND_RMS_HIGH",
+        "QUALITY_BATCH_OUTLIER",
+        "UPSTREAM_QUALITY_MISMATCH",
         "TRANSPARENCY_LOW",
         "TRANSPARENCY_NONUNIFORM",
         "ZEROPOINT_OUTLIER",
@@ -313,6 +320,13 @@ DEFAULT_SETTINGS = {
         "diagnostic_keywords": {
             "pipeline_fwhm_arcsec": ["L1FWHM"],
             "pipeline_ellipticity": ["L1ELLIP"],
+            "pipeline_background": [
+                "L1SKYBKG",
+                "L1MEDIAN",
+                "SKYBKG",
+                "BACKGRND",
+            ],
+            "pipeline_background_rms": ["L1SKYRMS", "SKYRMS", "BKGRMS"],
             "pipeline_zeropoint_mag": ["L1ZP"],
             "pipeline_saturated_fraction": ["SATFRAC"],
             "pipeline_wcs_error": ["WCSERR"],
@@ -457,13 +471,21 @@ DEFAULT_SETTINGS = {
     },
     "source_detection": {
         "enabled": True,
-        "method": "DAOStarFinder",
+        "method": "segmentation",
         "threshold_sigma": 5.0,
         "fwhm_guess_pixels": 4.0,
+        "kernel_fwhm_factor": 1.0,
         "minimum_separation_fwhm": 1.0,
         "exclude_border_fwhm": 3.0,
         "deblend": True,
         "minimum_pixels": 5,
+        "connectivity": 8,
+        "deblend_nlevels": 32,
+        "deblend_contrast": 0.001,
+        "minimum_snr": 5.0,
+        "minimum_fwhm_pixels": 1.0,
+        "maximum_fwhm_pixels": None,
+        "maximum_ellipticity_for_seeing": 0.50,
         "maximum_sources": 1000,
         "reject_saturated": True,
         "reject_masked": True,
@@ -539,6 +561,39 @@ DEFAULT_SETTINGS = {
         "fwhm_fail_arcsec": 8.0,
         "ellipticity_warn": 0.30,
         "ellipticity_fail": 0.60,
+        "fwhm_scatter_warn_fraction": 0.35,
+        "fwhm_scatter_fail_fraction": 0.70,
+        "ellipticity_scatter_warn": 0.15,
+        "ellipticity_scatter_fail": 0.30,
+        "elongated_source_ellipticity": 0.35,
+        "elongated_fraction_warn": 0.35,
+        "elongated_fraction_fail": 0.65,
+        "orientation_concentration_minimum": 0.60,
+        "maximum_saturated_sources_warn": None,
+        "maximum_saturated_sources_fail": None,
+        "maximum_background_warn": None,
+        "maximum_background_fail": None,
+        "maximum_background_rms_warn": None,
+        "maximum_background_rms_fail": None,
+        "target_background_inner_fwhm": 5.0,
+        "target_background_outer_fwhm": 8.0,
+        "upstream_fwhm_difference_warn_fraction": 0.50,
+        "upstream_fwhm_difference_fail_fraction": 1.00,
+        "upstream_ellipticity_difference_warn": 0.15,
+        "upstream_ellipticity_difference_fail": 0.30,
+        "upstream_background_difference_warn_fraction": 0.50,
+        "upstream_background_difference_fail_fraction": 1.00,
+        "upstream_background_rms_difference_warn_fraction": 0.50,
+        "upstream_background_rms_difference_fail_fraction": 1.00,
+        "batch_minimum_images": 3,
+        "batch_fwhm_ratio_warn": 1.50,
+        "batch_fwhm_ratio_fail": 2.50,
+        "batch_ellipticity_offset_warn": 0.15,
+        "batch_ellipticity_offset_fail": 0.30,
+        "batch_background_ratio_warn": 2.00,
+        "batch_background_ratio_fail": 5.00,
+        "batch_background_rms_ratio_warn": 2.00,
+        "batch_background_rms_ratio_fail": 5.00,
         "wcs_rms_warn_arcsec": 1.0,
         "wcs_rms_fail_arcsec": 3.0,
         "zeropoint_offset_warn_mag": 0.50,
@@ -1161,6 +1216,55 @@ def validate_settings(settings):
     exclude_percentile = settings["background"].get("exclude_percentile", 20.0)
     if not 0 <= float(exclude_percentile) <= 100:
         raise ValueError("background.exclude_percentile must be between 0 and 100")
+
+    source_settings = settings["source_detection"]
+    if float(source_settings.get("threshold_sigma", 5.0)) <= 0:
+        raise ValueError("source_detection.threshold_sigma must be positive")
+    if int(source_settings.get("minimum_pixels", 5)) <= 0:
+        raise ValueError("source_detection.minimum_pixels must be positive")
+    if int(source_settings.get("connectivity", 8)) not in {4, 8}:
+        raise ValueError("source_detection.connectivity must be 4 or 8")
+    contrast = float(source_settings.get("deblend_contrast", 0.001))
+    if not 0 <= contrast <= 1:
+        raise ValueError(
+            "source_detection.deblend_contrast must be between 0 and 1"
+        )
+
+    quality_settings = settings["image_quality"]
+    threshold_pairs = (
+        ("maximum_masked_fraction_warn", "maximum_masked_fraction_fail"),
+        ("fwhm_warn_arcsec", "fwhm_fail_arcsec"),
+        ("ellipticity_warn", "ellipticity_fail"),
+        ("fwhm_scatter_warn_fraction", "fwhm_scatter_fail_fraction"),
+        ("ellipticity_scatter_warn", "ellipticity_scatter_fail"),
+        ("elongated_fraction_warn", "elongated_fraction_fail"),
+        ("batch_fwhm_ratio_warn", "batch_fwhm_ratio_fail"),
+        ("batch_ellipticity_offset_warn", "batch_ellipticity_offset_fail"),
+        ("batch_background_ratio_warn", "batch_background_ratio_fail"),
+        ("batch_background_rms_ratio_warn", "batch_background_rms_ratio_fail"),
+    )
+    for warn_name, fail_name in threshold_pairs:
+        warn_value = quality_settings.get(warn_name)
+        fail_value = quality_settings.get(fail_name)
+        if warn_value is not None and fail_value is not None:
+            if float(warn_value) > float(fail_value):
+                raise ValueError(
+                    "image_quality.{} cannot exceed image_quality.{}".format(
+                        warn_name, fail_name
+                    )
+                )
+
+    inner_target = float(
+        quality_settings.get("target_background_inner_fwhm", 5.0)
+    )
+    outer_target = float(
+        quality_settings.get("target_background_outer_fwhm", 8.0)
+    )
+    if inner_target < 0 or outer_target <= inner_target:
+        raise ValueError(
+            "image_quality target-background radii must be non-negative and "
+            "outer must exceed inner"
+        )
 
     subtraction_method = settings["subtraction"]["method"]
     if subtraction_method not in {"hotpants", "pyzogy"}:

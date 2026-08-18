@@ -18,6 +18,7 @@ setup(
         'astropy',
         'photutils',
         'scipy',
+        'scikit-image',
         'emcee'
     ]
 )

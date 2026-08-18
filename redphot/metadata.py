@@ -40,6 +40,8 @@ NUMERIC_FIELDS = {
     "pixel_scale",
     "pipeline_fwhm_arcsec",
     "pipeline_ellipticity",
+    "pipeline_background",
+    "pipeline_background_rms",
     "pipeline_zeropoint_mag",
     "pipeline_saturated_fraction",
     "pipeline_wcs_error",
