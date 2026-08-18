@@ -1738,6 +1738,787 @@ def define_processing_region(ccd, metadata=None, settings=None, target=None):
     return working, region, diagnostics
 
 
+# ---------------------------------------------------------------------------
+# Step 6: pixel and artifact masks
+#
+# Each defect type produces its own boolean component so it can be plotted and
+# reasoned about independently; ``build_masks`` combines them into one working
+# mask.  Morphological growth and connected-component labelling use
+# ``scipy.ndimage``, which is imported lazily so this module still imports when
+# scipy is absent (those growth steps are then skipped with a warning).  The
+# input image is never modified.
+# ---------------------------------------------------------------------------
+
+
+_NDIMAGE_WARNED = False
+
+
+def _try_ndimage():
+    """Return ``scipy.ndimage`` or ``None``, warning once when unavailable."""
+
+    global _NDIMAGE_WARNED
+    try:
+        from scipy import ndimage
+    except ImportError:
+        if not _NDIMAGE_WARNED:
+            warnings.warn(
+                "scipy is not available; morphological mask steps (saturation "
+                "halo growth and trail detection) are skipped.",
+                RuntimeWarning,
+            )
+            _NDIMAGE_WARNED = True
+        return None
+    return ndimage
+
+
+def _disk_structure(radius):
+    """Return a circular boolean structuring element of the given radius."""
+
+    radius = int(radius)
+    if radius < 1:
+        return None
+    grid_y, grid_x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+    return (grid_x ** 2 + grid_y ** 2) <= radius ** 2
+
+
+def make_saturation_mask(data, metadata=None, settings=None):
+    """Mask saturated and nonlinear pixels and grow bleed and halo regions.
+
+    The saturation and nonlinearity levels come from the settings overrides or
+    the image metadata.  When both are present the lower (more conservative)
+    level defines the bright cores used for halo growth, so wings, bleed
+    columns, and halos around bright stars are excluded from later selection.
+
+    Returns
+    -------
+    components : dict of numpy.ndarray
+        ``saturated``, ``nonlinear``, and the grown ``saturation`` mask.
+    info : dict
+        Levels used and the saturated-pixel fraction.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    masks_settings = settings.get("masks", {})
+    shape = np.asarray(data).shape
+
+    saturated = np.zeros(shape, dtype=bool)
+    nonlinear = np.zeros(shape, dtype=bool)
+
+    sat_level = masks_settings.get("saturation_level")
+    if sat_level is None and metadata is not None:
+        sat_level = _as_float(metadata.get("saturation"))
+    nonlinear_level = masks_settings.get("nonlinearity_level")
+    if nonlinear_level is None and metadata is not None:
+        nonlinear_level = _as_float(metadata.get("nonlinearity"))
+
+    finite = np.isfinite(data)
+    if masks_settings.get("mask_saturated", True) and sat_level is not None:
+        saturated = finite & (data >= float(sat_level))
+    if masks_settings.get("mask_nonlinear", True) and nonlinear_level is not None:
+        nonlinear = finite & (data >= float(nonlinear_level))
+
+    levels = [level for level in (sat_level, nonlinear_level) if level is not None]
+    effective = None
+    if levels:
+        if masks_settings.get("prefer_nonlinearity_limit", True):
+            effective = min(levels)
+        else:
+            effective = sat_level if sat_level is not None else nonlinear_level
+    core = finite & (data >= float(effective)) if effective is not None else (
+        np.zeros(shape, dtype=bool)
+    )
+
+    saturation_mask = core.copy()
+    grow = int(masks_settings.get("saturation_grow_pixels", 5))
+    halo_radius = int(
+        round(
+            masks_settings.get("saturation_halo_fwhm", 5.0)
+            * _fwhm_guess_pixels(settings)
+        )
+    )
+    if core.any() and (grow > 0 or halo_radius > 0):
+        ndimage = _try_ndimage()
+        if ndimage is not None:
+            if grow > 0:
+                saturation_mask |= ndimage.binary_dilation(core, iterations=grow)
+            disk = _disk_structure(halo_radius)
+            if disk is not None:
+                saturation_mask |= ndimage.binary_dilation(core, structure=disk)
+
+    info = {
+        "saturation_level": None if sat_level is None else float(sat_level),
+        "nonlinearity_level": (
+            None if nonlinear_level is None else float(nonlinear_level)
+        ),
+        "effective_level": None if effective is None else float(effective),
+        "saturated_fraction": float(saturated.mean()) if saturated.size else 0.0,
+    }
+    components = {
+        "saturated": saturated,
+        "nonlinear": nonlinear,
+        "saturation": saturation_mask,
+    }
+    return components, info
+
+
+def _line_bad_indices(profile, sigma):
+    """Return indices of a 1D profile that deviate strongly from the median."""
+
+    finite = np.isfinite(profile)
+    if int(finite.sum()) < 10:
+        return np.array([], dtype=int)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        median = np.nanmedian(profile)
+        scale = np.nanmedian(np.abs(profile - median)) * 1.4826
+    if not np.isfinite(scale) or scale <= 0:
+        return np.array([], dtype=int)
+    deviation = np.abs(profile - median)
+    return np.where(finite & (deviation > sigma * scale))[0]
+
+
+def make_line_defect_mask(data, valid=None, settings=None):
+    """Mask hot or dead rows and columns using robust profile statistics.
+
+    Row and column medians are computed over the usable pixels; a line whose
+    median departs from the robust global level by more than ``bad_line_sigma``
+    times the median absolute deviation is masked.  A high default sigma keeps
+    ordinary stars and galaxies from being mistaken for defects.
+
+    Returns
+    -------
+    mask : numpy.ndarray
+        Boolean mask of bad rows and columns.
+    info : dict
+        Lists of the flagged row and column indices.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    masks_settings = settings.get("masks", {})
+    shape = np.asarray(data).shape
+    ny, nx = shape
+    mask = np.zeros(shape, dtype=bool)
+    info = {"bad_rows": [], "bad_columns": []}
+
+    detect_rows = masks_settings.get("detect_bad_rows", True)
+    detect_columns = masks_settings.get("detect_bad_columns", True)
+    if not (detect_rows or detect_columns):
+        return mask, info
+
+    work = np.array(data, dtype=float)
+    if valid is not None:
+        work[~np.asarray(valid, dtype=bool)] = np.nan
+    work[~np.isfinite(work)] = np.nan
+
+    sigma = float(masks_settings.get("bad_line_sigma", 6.0))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        if detect_columns:
+            columns = _line_bad_indices(np.nanmedian(work, axis=0), sigma)
+            info["bad_columns"] = columns.tolist()
+            for column in columns:
+                mask[:, column] = True
+        if detect_rows:
+            rows = _line_bad_indices(np.nanmedian(work, axis=1), sigma)
+            info["bad_rows"] = rows.tolist()
+            for row in rows:
+                mask[row, :] = True
+
+    grow = int(masks_settings.get("bad_line_grow_pixels", 0))
+    if grow > 0 and mask.any():
+        ndimage = _try_ndimage()
+        if ndimage is not None:
+            mask = ndimage.binary_dilation(mask, iterations=grow)
+    return mask, info
+
+
+def make_amplifier_seam_mask(data, valid=None, settings=None):
+    """Mask amplifier seams from explicit boundaries and abrupt median jumps.
+
+    Explicit ``masks.amplifier_boundaries`` entries are always applied.  When
+    ``detect_amplifier_boundaries`` is enabled, columns or rows with an extreme
+    step between adjacent medians are also masked.  A high default sigma keeps
+    the detector's smooth structure from being flagged.
+
+    Returns
+    -------
+    mask : numpy.ndarray
+        Boolean seam mask.
+    info : dict
+        Seam column and row indices that were masked.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    masks_settings = settings.get("masks", {})
+    shape = np.asarray(data).shape
+    ny, nx = shape
+    mask = np.zeros(shape, dtype=bool)
+    info = {"seam_columns": [], "seam_rows": []}
+
+    grow = int(masks_settings.get("amplifier_seam_grow_pixels", 1))
+
+    for boundary in masks_settings.get("amplifier_boundaries", []) or []:
+        axis = str(boundary.get("axis", "x")).lower()
+        try:
+            index = int(boundary.get("index"))
+        except (TypeError, ValueError):
+            continue
+        width = int(boundary.get("width", 1)) + grow
+        if axis in ("x", "column", "col"):
+            mask[:, max(0, index - width):index + width + 1] = True
+            info["seam_columns"].append(index)
+        else:
+            mask[max(0, index - width):index + width + 1, :] = True
+            info["seam_rows"].append(index)
+
+    if masks_settings.get("detect_amplifier_boundaries", True):
+        work = np.array(data, dtype=float)
+        if valid is not None:
+            work[~np.asarray(valid, dtype=bool)] = np.nan
+        work[~np.isfinite(work)] = np.nan
+        sigma = float(masks_settings.get("amplifier_seam_sigma", 8.0))
+        edge_margin = int(masks_settings.get("amplifier_seam_edge_margin", 20))
+
+        def seam_indices(profile):
+            steps = np.abs(np.diff(profile))
+            finite = np.isfinite(steps)
+            if int(finite.sum()) < 10:
+                return np.array([], dtype=int)
+            median = np.nanmedian(steps)
+            scale = np.nanmedian(np.abs(steps - median)) * 1.4826
+            if not np.isfinite(scale) or scale <= 0:
+                return np.array([], dtype=int)
+            candidates = np.where(finite & (steps > median + sigma * scale))[0]
+            if edge_margin > 0:
+                length = steps.size
+                candidates = candidates[
+                    (candidates >= edge_margin)
+                    & (candidates < length - edge_margin)
+                ]
+            return candidates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for index in seam_indices(np.nanmedian(work, axis=0)):
+                lo = max(0, index - grow)
+                hi = index + 1 + grow + 1
+                mask[:, lo:hi] = True
+                info["seam_columns"].append(int(index))
+            for index in seam_indices(np.nanmedian(work, axis=1)):
+                lo = max(0, index - grow)
+                hi = index + 1 + grow + 1
+                mask[lo:hi, :] = True
+                info["seam_rows"].append(int(index))
+
+    return mask, info
+
+
+def detect_trails(data, base_mask=None, settings=None, exclude_mask=None):
+    """Detect long, thin linear features such as asteroid or satellite trails.
+
+    Bright pixels are thresholded against a robust background, grouped into
+    connected components, and each component is accepted as a trail only when it
+    is long, narrow, and highly elongated.  Compact sources therefore remain
+    untouched.  Detection requires ``scipy``; without it the step is skipped.
+
+    Parameters
+    ----------
+    base_mask : numpy.ndarray, optional
+        Pixels to ignore during detection (edges, existing mask).
+    exclude_mask : numpy.ndarray, optional
+        Additional pixels to exclude, typically the saturation mask so that
+        bleed and diffraction spikes are not mistaken for trails.
+
+    Returns
+    -------
+    trail_mask : numpy.ndarray
+        Boolean mask of accepted, grown trails.
+    trails : list of dict
+        Per-trail geometry (length, width, elongation, centroid, angle).
+    info : dict
+        Detection summary.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    masks_settings = settings.get("masks", {})
+    shape = np.asarray(data).shape
+    trail_mask = np.zeros(shape, dtype=bool)
+    trails = []
+    info = {"n_trails": 0, "detected": False, "skipped": None}
+
+    if not masks_settings.get("detect_trails", True):
+        info["skipped"] = "disabled"
+        return trail_mask, trails, info
+
+    ndimage = _try_ndimage()
+    if ndimage is None:
+        info["skipped"] = "scipy_missing"
+        return trail_mask, trails, info
+
+    valid = np.isfinite(data)
+    if base_mask is not None:
+        valid &= ~np.asarray(base_mask, dtype=bool)
+    if exclude_mask is not None:
+        valid &= ~np.asarray(exclude_mask, dtype=bool)
+
+    sample = data[valid]
+    if sample.size < 100:
+        info["skipped"] = "too_few_pixels"
+        return trail_mask, trails, info
+
+    median = float(np.median(sample))
+    mad = float(np.median(np.abs(sample - median))) * 1.4826
+    scale = mad if mad > 0 else float(np.std(sample))
+    if scale <= 0:
+        return trail_mask, trails, info
+
+    sigma = float(masks_settings.get("trail_sigma", 5.0))
+    binary = (data - median > sigma * scale) & valid
+    if not binary.any():
+        return trail_mask, trails, info
+
+    min_length = float(masks_settings.get("trail_min_length_pixels", 50))
+    max_width = float(masks_settings.get("trail_max_width_pixels", 20))
+    min_elongation = float(masks_settings.get("trail_min_elongation", 4.0))
+    min_pixels = int(masks_settings.get("trail_min_pixels", 20))
+
+    # Use 8-connectivity so thin diagonal trails form a single component.
+    labels, count = ndimage.label(binary, structure=np.ones((3, 3), dtype=int))
+    for label in range(1, count + 1):
+        component = labels == label
+        pixels = int(component.sum())
+        if pixels < min_pixels:
+            continue
+        ys, xs = np.where(component)
+        coords = np.column_stack([xs, ys]).astype(float)
+        centered = coords - coords.mean(axis=0)
+        covariance = np.cov(centered, rowvar=False)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        major = eigenvectors[:, int(np.argmax(eigenvalues))]
+        minor = eigenvectors[:, int(np.argmin(eigenvalues))]
+        projection_major = centered @ major
+        projection_minor = centered @ minor
+        length = float(projection_major.max() - projection_major.min())
+        width = float(projection_minor.max() - projection_minor.min())
+        elongation = length / max(width, 1.0)
+        if length >= min_length and width <= max_width and elongation >= min_elongation:
+            trail_mask |= component
+            trails.append(
+                {
+                    "label": int(label),
+                    "pixels": pixels,
+                    "length_pixels": length,
+                    "width_pixels": width,
+                    "elongation": elongation,
+                    "centroid_x": float(xs.mean()),
+                    "centroid_y": float(ys.mean()),
+                    "angle_deg": float(
+                        np.degrees(np.arctan2(major[1], major[0]))
+                    ),
+                }
+            )
+
+    grow = int(masks_settings.get("trail_grow_pixels", 5))
+    if trail_mask.any() and grow > 0:
+        trail_mask = ndimage.binary_dilation(trail_mask, iterations=grow)
+
+    info["n_trails"] = len(trails)
+    info["detected"] = bool(trails)
+    return trail_mask, trails, info
+
+
+def _region_center_pixels(region, wcs):
+    """Resolve a manual-region center to pixel coordinates."""
+
+    if "x" in region and "y" in region:
+        try:
+            return float(region["x"]), float(region["y"])
+        except (TypeError, ValueError):
+            return None, None
+    if "ra" in region and "dec" in region and wcs is not None and wcs.has_celestial:
+        try:
+            coordinate = SkyCoord(
+                float(region["ra"]), float(region["dec"]),
+                unit="deg", frame="icrs",
+            )
+            x, y = wcs.world_to_pixel(coordinate)
+            return float(x), float(y)
+        except Exception:
+            return None, None
+    return None, None
+
+
+def _polygon_vertices_pixels(region, wcs):
+    """Return manual-polygon vertices as an ``(N, 2)`` array of pixel columns."""
+
+    vertices = region.get("vertices")
+    if not vertices:
+        return None
+    if region.get("sky") and wcs is not None and wcs.has_celestial:
+        try:
+            values = np.asarray(vertices, dtype=float)
+            coordinate = SkyCoord(
+                values[:, 0], values[:, 1], unit="deg", frame="icrs"
+            )
+            x, y = wcs.world_to_pixel(coordinate)
+            return np.column_stack([np.asarray(x, float), np.asarray(y, float)])
+        except Exception:
+            return None
+    try:
+        return np.asarray(vertices, dtype=float)
+    except (TypeError, ValueError):
+        return None
+
+
+def _polygon_mask(shape, vertices):
+    """Rasterize a polygon into a boolean mask using ray casting over its bbox."""
+
+    ny, nx = shape
+    mask = np.zeros(shape, dtype=bool)
+    if vertices is None or len(vertices) < 3:
+        return mask
+
+    x_min = max(0, int(np.floor(vertices[:, 0].min())))
+    x_max = min(nx, int(np.ceil(vertices[:, 0].max())) + 1)
+    y_min = max(0, int(np.floor(vertices[:, 1].min())))
+    y_max = min(ny, int(np.ceil(vertices[:, 1].max())) + 1)
+    if x_max <= x_min or y_max <= y_min:
+        return mask
+
+    grid_y, grid_x = np.mgrid[y_min:y_max, x_min:x_max]
+    inside = np.zeros(grid_x.shape, dtype=bool)
+    n = len(vertices)
+    j = n - 1
+    for i in range(n):
+        xi, yi = vertices[i]
+        xj, yj = vertices[j]
+        crosses = ((yi > grid_y) != (yj > grid_y)) & (
+            grid_x < (xj - xi) * (grid_y - yi) / (yj - yi + 1e-12) + xi
+        )
+        inside ^= crosses
+        j = i
+    mask[y_min:y_max, x_min:x_max] = inside
+    return mask
+
+
+def make_manual_mask(shape, wcs=None, settings=None, pixel_scale=None):
+    """Build a mask from user-specified circular, rectangular, or polygon regions.
+
+    Each entry in ``masks.manual_regions`` is a dictionary with a ``type`` of
+    ``circle``, ``rect``, or ``polygon``:
+
+    - ``circle``: ``x``/``y`` (pixels) or ``ra``/``dec`` (degrees) center with a
+      ``radius`` in pixels or ``radius_arcsec``.
+    - ``rect``: ``x1``, ``x2``, ``y1``, ``y2`` one-based inclusive pixel bounds,
+      or a FITS ``section`` string.
+    - ``polygon``: ``vertices`` as ``[[x, y], ...]`` in pixels, or ``[[ra, dec],
+      ...]`` in degrees when ``sky`` is true.
+
+    Returns
+    -------
+    mask : numpy.ndarray
+        Combined boolean mask of all regions.
+    info : dict
+        Summary of the regions that were applied.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    regions = settings.get("masks", {}).get("manual_regions", []) or []
+    ny, nx = shape
+    mask = np.zeros(shape, dtype=bool)
+    applied = []
+
+    for region in regions:
+        region_type = str(region.get("type", "circle")).lower()
+
+        if region_type in ("circle", "disk"):
+            center_x, center_y = _region_center_pixels(region, wcs)
+            radius = region.get("radius")
+            if (
+                radius is None
+                and region.get("radius_arcsec") is not None
+                and pixel_scale
+            ):
+                radius = float(region["radius_arcsec"]) / float(pixel_scale)
+            if center_x is None or radius is None:
+                continue
+            radius = float(radius)
+            x0 = max(0, int(np.floor(center_x - radius)))
+            x1 = min(nx, int(np.ceil(center_x + radius)) + 1)
+            y0 = max(0, int(np.floor(center_y - radius)))
+            y1 = min(ny, int(np.ceil(center_y + radius)) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
+            disk = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2 <= radius ** 2
+            mask[y0:y1, x0:x1] |= disk
+            applied.append({"type": "circle", "x": center_x, "y": center_y,
+                            "radius": radius})
+
+        elif region_type in ("rect", "rectangle", "box"):
+            if region.get("section") is not None:
+                bounds = parse_fits_section(region["section"], shape=shape)
+            elif all(key in region for key in ("x1", "x2", "y1", "y2")):
+                bounds = parse_fits_section(
+                    "[{}:{},{}:{}]".format(
+                        int(region["x1"]), int(region["x2"]),
+                        int(region["y1"]), int(region["y2"]),
+                    ),
+                    shape=shape,
+                )
+            else:
+                bounds = None
+            if bounds is None:
+                continue
+            x_start, x_stop, y_start, y_stop = bounds
+            mask[y_start:y_stop, x_start:x_stop] = True
+            applied.append({"type": "rect", "bounds": bounds})
+
+        elif region_type == "polygon":
+            vertices = _polygon_vertices_pixels(region, wcs)
+            polygon_mask = _polygon_mask(shape, vertices)
+            if polygon_mask.any():
+                mask |= polygon_mask
+                applied.append({"type": "polygon", "vertices": int(len(vertices))})
+
+    return mask, {"applied": applied, "count": len(applied)}
+
+
+def check_mask_overlaps(mask, positions, radii):
+    """Return, for each position, whether a circular region hits masked pixels.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Boolean mask to test against (for example the combined mask or the
+        trail mask).
+    positions : sequence of (x, y)
+        Pixel positions to test.
+    radii : float or sequence of float
+        Test radius in pixels, shared or per position.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array, ``True`` where the region around a position overlaps a
+        masked pixel.  Used by later stages to drop individual comparison, PSF,
+        or calibration stars without rejecting the whole image.
+    """
+
+    mask = np.asarray(mask, dtype=bool)
+    ny, nx = mask.shape
+    positions = list(positions)
+    if np.isscalar(radii):
+        radii = [float(radii)] * len(positions)
+
+    results = []
+    for (x, y), radius in zip(positions, radii):
+        x = float(x)
+        y = float(y)
+        radius = float(radius)
+        x0 = max(0, int(np.floor(x - radius)))
+        x1 = min(nx, int(np.ceil(x + radius)) + 1)
+        y0 = max(0, int(np.floor(y - radius)))
+        y1 = min(ny, int(np.ceil(y + radius)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            results.append(False)
+            continue
+        sub = mask[y0:y1, x0:x1]
+        if not sub.any():
+            results.append(False)
+            continue
+        grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
+        within = (grid_x - x) ** 2 + (grid_y - y) ** 2 <= radius ** 2
+        results.append(bool((sub & within).any()))
+
+    return np.array(results, dtype=bool)
+
+
+def _target_region_radius(settings):
+    """Return the target test radius in pixels for mask-overlap checks."""
+
+    masks_settings = settings.get("masks", {})
+    radius_fwhm = masks_settings.get("target_overlap_radius_fwhm")
+    if radius_fwhm is None:
+        radius_fwhm = settings.get("apertures", {}).get(
+            "sky_outer_radius_fwhm", 7.0
+        )
+    return float(radius_fwhm) * _fwhm_guess_pixels(settings)
+
+
+def build_masks(ccd, metadata=None, settings=None, target=None, valid=None):
+    """Build all pixel and artifact masks for a prepared working image.
+
+    Combines the incoming mask (existing data quality, non-finite pixels, and
+    invalid edges from earlier stages) with saturation and nonlinearity masks
+    and their halos, hot/dead rows and columns, amplifier seams, detected
+    trails, and user regions.  Every component is kept separately for
+    diagnostics, and the union becomes the working mask.  The target is tested
+    against the trail and combined masks so that a target-crossing trail raises
+    a strong flag while defects elsewhere only mask local pixels.  The input
+    ``ccd`` is not modified.
+
+    Returns
+    -------
+    working : astropy.nddata.CCDData
+        Copy of the image with the combined mask applied.
+    components : dict of numpy.ndarray
+        Individual boolean mask components and the ``combined`` mask.
+    info : dict
+        Flags, per-defect summaries, per-component fractions, and target
+        overlap results.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    masks_settings = settings.get("masks", {})
+
+    data = np.asarray(ccd.data)
+    shape = data.shape
+    wcs = getattr(ccd, "wcs", None)
+
+    base = (
+        np.asarray(ccd.mask, dtype=bool)
+        if getattr(ccd, "mask", None) is not None
+        else np.zeros(shape, dtype=bool)
+    )
+    nonfinite = ~np.isfinite(data)
+
+    saturation_components, saturation_info = make_saturation_mask(
+        data, metadata, settings
+    )
+    saturation_full = saturation_components["saturation"]
+
+    line_valid = ~(base | nonfinite | saturation_full)
+    line_mask, line_info = make_line_defect_mask(data, line_valid, settings)
+    # Exclude already-flagged bad lines so a hot column is not also reported as
+    # an amplifier seam.
+    amplifier_mask, amplifier_info = make_amplifier_seam_mask(
+        data, line_valid & ~line_mask, settings
+    )
+
+    trail_exclude = base | nonfinite | saturation_full | line_mask | amplifier_mask
+    trail_mask, trails, trail_info = detect_trails(
+        data, base_mask=trail_exclude, settings=settings,
+        exclude_mask=saturation_full,
+    )
+
+    pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
+    manual_mask, manual_info = make_manual_mask(
+        shape, wcs, settings, pixel_scale
+    )
+
+    combined = (
+        base
+        | nonfinite
+        | saturation_full
+        | saturation_components["nonlinear"]
+        | line_mask
+        | amplifier_mask
+        | trail_mask
+        | manual_mask
+    )
+
+    components = {
+        "input": base,
+        "nonfinite": nonfinite,
+        "saturated": saturation_components["saturated"],
+        "nonlinear": saturation_components["nonlinear"],
+        "saturation": saturation_full,
+        "bad_lines": line_mask,
+        "amplifier": amplifier_mask,
+        "trails": trail_mask,
+        "manual": manual_mask,
+        "combined": combined,
+    }
+
+    flags = []
+    if saturation_info["saturated_fraction"] > masks_settings.get(
+        "saturation_high_fraction", 0.02
+    ):
+        flags.append("SATURATION_HIGH")
+    if line_info["bad_rows"] or line_info["bad_columns"]:
+        flags.append("BAD_ROWS_OR_COLUMNS")
+    if amplifier_info["seam_columns"] or amplifier_info["seam_rows"]:
+        flags.append("BAD_ROWS_OR_COLUMNS")
+    if trails:
+        flags.append("TRAIL_PRESENT")
+
+    target_info = {
+        "target_x": None,
+        "target_y": None,
+        "target_masked": None,
+        "target_trail": None,
+    }
+    center = _coerce_target_coordinate(target, settings)
+    if center is None and metadata is not None:
+        ra = metadata.get("adopted_ra_deg")
+        dec = metadata.get("adopted_dec_deg")
+        if ra is not None and dec is not None:
+            center = SkyCoord(float(ra), float(dec), unit="deg", frame="icrs")
+
+    if center is not None and wcs is not None and wcs.has_celestial:
+        try:
+            x, y = wcs.world_to_pixel(center)
+            x = float(x)
+            y = float(y)
+        except Exception:
+            x = y = None
+        if x is not None and np.isfinite(x) and np.isfinite(y):
+            target_info["target_x"] = x
+            target_info["target_y"] = y
+            radius = _target_region_radius(settings)
+            trail_hit = bool(
+                check_mask_overlaps(trail_mask, [(x, y)], [radius])[0]
+            )
+            masked_hit = bool(
+                check_mask_overlaps(combined, [(x, y)], [radius])[0]
+            )
+            target_info["target_trail"] = trail_hit
+            target_info["target_masked"] = masked_hit
+            if trail_hit:
+                flags.append("TARGET_TRAIL")
+            if masked_hit:
+                flags.append("TARGET_MASKED")
+
+    deduplicated = []
+    for flag in flags:
+        if flag not in deduplicated:
+            deduplicated.append(flag)
+    flags = deduplicated
+
+    working = CCDData(
+        np.array(data, copy=True),
+        unit=ccd.unit,
+        meta=ccd.meta.copy() if getattr(ccd, "meta", None) is not None else None,
+        wcs=wcs,
+        mask=combined,
+        uncertainty=getattr(ccd, "uncertainty", None),
+    )
+
+    info = {
+        "flags": flags,
+        "saturation": saturation_info,
+        "bad_lines": line_info,
+        "amplifier": amplifier_info,
+        "trails": trail_info,
+        "trail_list": trails,
+        "manual": manual_info,
+        "target": target_info,
+        "masked_fraction": float(combined.mean()) if combined.size else 0.0,
+        "component_fractions": {
+            name: float(component.mean()) if component.size else 0.0
+            for name, component in components.items()
+        },
+    }
+    return working, components, info
+
+
 def metadata_table(metadata_rows):
     """Convert normalized metadata dictionaries into a masked Astropy table."""
 
@@ -1830,14 +2611,21 @@ def read_fits_batch(paths=None, settings=None, target=None, continue_on_error=Fa
 __all__ = [
     "FITS_ENDINGS",
     "SCIENCE_EXTNAMES",
+    "build_masks",
     "build_valid_region",
+    "check_mask_overlaps",
     "crop_to_processing_region",
     "define_processing_region",
     "detect_empirical_edges",
+    "detect_trails",
     "discover_fits_files",
     "extract_metadata",
     "header_section_region",
     "is_fits_path",
+    "make_amplifier_seam_mask",
+    "make_line_defect_mask",
+    "make_manual_mask",
+    "make_saturation_mask",
     "metadata_table",
     "parse_fits_section",
     "read_fits_batch",
