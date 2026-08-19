@@ -1188,9 +1188,168 @@ def plot_image_usability_diagnostics(
     return fig
 
 
+def plot_alignment_target_diagnostics(
+    stacks,
+    target_solution,
+    target_candidates,
+    projection_table,
+    output_path=None,
+    show=False,
+):
+    """Plot detection stacks, centroid offsets, and fixed-position checks."""
+
+    import matplotlib.pyplot as plt
+    from astropy import units as u
+    from astropy.coordinates import SkyCoord
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11), constrained_layout=True)
+    stack_items = list(stacks.items())
+    stack_items.sort(key=lambda item: (item[0] != "multifilter", item[0]))
+    final_coordinate = SkyCoord(
+        target_solution["ra_deg"], target_solution["dec_deg"], unit="deg"
+    )
+    for panel, axis in enumerate(axes[0]):
+        if panel >= len(stack_items):
+            axis.set_axis_off()
+            continue
+        name, product = stack_items[panel]
+        data = np.asarray(product["data"], dtype=float)
+        low, high = _image_limits(data, lower=1.0, upper=99.7)
+        axis.imshow(
+            data,
+            origin="lower",
+            cmap="gray",
+            vmin=low,
+            vmax=high,
+            interpolation="nearest",
+        )
+        x, y = product["wcs"].world_to_pixel(final_coordinate)
+        axis.scatter([x], [y], marker="+", color="lime", s=100, linewidths=1.5)
+        axis.set_xlim(max(0, x - 40), min(data.shape[1] - 1, x + 40))
+        axis.set_ylim(max(0, y - 40), min(data.shape[0] - 1, y + 40))
+        axis.set_title("{} detection stack".format(name))
+        axis.set_xlabel("x [pixel]")
+        axis.set_ylabel("y [pixel]")
+
+    offset_axis = axes[1, 0]
+    offset_axis.set_title("Diagnostic centroid offsets")
+    if target_candidates is not None and len(target_candidates):
+        finite = (
+            ~np.ma.getmaskarray(target_candidates["ra_deg"])
+            & ~np.ma.getmaskarray(target_candidates["dec_deg"])
+        )
+        rows = target_candidates[finite]
+        if len(rows):
+            coordinates = SkyCoord(
+                np.asarray(rows["ra_deg"], dtype=float) * u.deg,
+                np.asarray(rows["dec_deg"], dtype=float) * u.deg,
+            )
+            longitude, latitude = final_coordinate.spherical_offsets_to(coordinates)
+            accepted = np.asarray(rows["accepted"], dtype=bool)
+            used = np.asarray(rows["used_in_solution"], dtype=bool)
+            if np.any(~accepted):
+                offset_axis.scatter(
+                    longitude.arcsec[~accepted], latitude.arcsec[~accepted],
+                    marker="x", color="tab:red", s=45, label="rejected",
+                )
+            if np.any(accepted & ~used):
+                offset_axis.scatter(
+                    longitude.arcsec[accepted & ~used],
+                    latitude.arcsec[accepted & ~used],
+                    facecolors="none", edgecolors="tab:blue", s=55,
+                    label="accepted diagnostic",
+                )
+            if np.any(used):
+                offset_axis.scatter(
+                    longitude.arcsec[used], latitude.arcsec[used],
+                    marker="*", color="tab:green", s=100, label="used",
+                )
+            for row, x_value, y_value in zip(
+                rows, longitude.arcsec, latitude.arcsec
+            ):
+                offset_axis.annotate(
+                    str(row["source"]),
+                    (x_value, y_value),
+                    xytext=(3, 3),
+                    textcoords="offset points",
+                    fontsize=6,
+                )
+            offset_axis.legend(fontsize=8)
+    offset_axis.axhline(0, color="0.5", linewidth=0.7)
+    offset_axis.axvline(0, color="0.5", linewidth=0.7)
+    offset_axis.set_xlabel("RA offset from frozen position [arcsec]")
+    offset_axis.set_ylabel("Dec offset from frozen position [arcsec]")
+    offset_axis.grid(alpha=0.2)
+    offset_axis.set_aspect("equal", adjustable="datalim")
+
+    projection_axis = axes[1, 1]
+    projection_axis.set_title("Relative alignment at fixed position")
+    if projection_table is not None and len(projection_table):
+        image_ids = [str(value) for value in projection_table["image_id"]]
+        values = np.ma.asarray(
+            projection_table["relative_alignment_rms_arcsec"], dtype=float
+        )
+        numeric = np.asarray(values.filled(np.nan), dtype=float)
+        colors = [
+            {"PASS": "tab:green", "WARN": "darkorange", "FAIL": "tab:red"}.get(
+                str(value), "0.5"
+            )
+            for value in projection_table["status"]
+        ]
+        positions = np.arange(len(image_ids))
+        projection_axis.bar(positions, np.nan_to_num(numeric), color=colors)
+        projection_axis.set_xticks(positions)
+        projection_axis.set_xticklabels(image_ids, rotation=45, ha="right", fontsize=7)
+    else:
+        projection_axis.text(
+            0.5, 0.5, "No projection checks", ha="center", va="center"
+        )
+    projection_axis.set_ylabel("common-star RMS [arcsec]")
+    projection_axis.grid(axis="y", alpha=0.2)
+
+    summary_axis = axes[1, 2]
+    summary_axis.set_axis_off()
+    summary_lines = [
+        "Version: {}".format(target_solution.get("version")),
+        "Frozen: {}".format(target_solution.get("frozen")),
+        "RA: {:.8f} deg".format(target_solution["ra_deg"]),
+        "Dec: {:+.8f} deg".format(target_solution["dec_deg"]),
+        "Uncertainty: {:.3f} arcsec".format(
+            target_solution["uncertainty_arcsec"]
+        ),
+        "Status: {}".format(target_solution.get("status")),
+        "Candidates used: {}/{}".format(
+            target_solution.get("used_candidate_count"),
+            target_solution.get("candidate_count"),
+        ),
+        "Free centroids: diagnostic only",
+        "",
+        "Provenance:",
+    ]
+    summary_lines.extend(
+        "  {}".format(value) for value in target_solution.get("provenance", [])
+    )
+    summary_lines.extend(
+        ["", "Flags: {}".format(", ".join(target_solution.get("flags", [])) or "none")]
+    )
+    summary_axis.text(
+        0.02, 0.98, "\n".join(summary_lines), va="top", ha="left",
+        family="monospace", fontsize=10,
+    )
+    fig.suptitle("Relative alignment and frozen target coordinate", fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_astrometry_diagnostics",
+    "plot_alignment_target_diagnostics",
     "plot_image_quality_diagnostics",
     "plot_image_usability_diagnostics",
     "plot_star_selection_diagnostics",

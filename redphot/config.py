@@ -161,6 +161,8 @@ QUALITY_FLAGS = {
         "WCS_POOR",
         "WCS_TOO_FEW_MATCHES",
         "WCS_REFINEMENT_FAILED",
+        "RELATIVE_ALIGNMENT_FAILED",
+        "RELATIVE_ALIGNMENT_POOR",
     ],
     "quality": [
         "TOO_FEW_SOURCES",
@@ -189,6 +191,9 @@ QUALITY_FLAGS = {
         "TARGET_MASKED",
         "TARGET_FIT_FAILED",
         "TARGET_CENTROID_OFFSET",
+        "TARGET_POSITION_UNCERTAIN",
+        "TARGET_FILTER_SHIFT",
+        "TARGET_CENTROID_HOST_DOMINATED",
         "APERTURE_INCOMPLETE",
         "CALIBRATION_FAILED",
         "NONDETECTION",
@@ -731,6 +736,49 @@ DEFAULT_SETTINGS = {
         "diagnostic_recenter": True,
         "maximum_diagnostic_offset_arcsec": 1.0,
         "save_stack": True,
+        "relative_alignment_enabled": True,
+        "relative_alignment_minimum_common_stars": 6,
+        "relative_alignment_sigma_clip": 4.0,
+        "relative_alignment_maximum_iterations": 3,
+        "relative_alignment_target_rms_arcsec": 0.20,
+        "relative_alignment_warn_rms_arcsec": 0.50,
+        "relative_alignment_fail_rms_arcsec": 1.50,
+        "relative_alignment_maximum_translation_pixels": 20.0,
+        "relative_alignment_maximum_rotation_degrees": 2.0,
+        "relative_alignment_maximum_scale_change_fraction": 0.02,
+        "coordinate_allowed_statuses": ["PASS", "WARN"],
+        "stack_allowed_statuses": ["PASS", "WARN"],
+        "require_usability_approval": True,
+        "stack_minimum_images_per_filter": 1,
+        "stack_maximum_images_per_filter": None,
+        "stack_combine": "weighted_mean",
+        "stack_sigma_clip": 4.0,
+        "stack_reprojection_order": 1,
+        "stack_reprojection_tile_rows": 256,
+        "stack_normalization": "zeropoint",
+        "stack_use_inverse_variance_weights": True,
+        "multifilter_normalization": "background_rms",
+        "resample_science_images": False,
+        "user_position_mode": "prior",
+        "prior_uncertainty_arcsec": 1.0,
+        "centroid_search_radius_arcsec": 3.0,
+        "centroid_aperture_radius_fwhm": 1.5,
+        "centroid_background_inner_fwhm": 3.0,
+        "centroid_background_outer_fwhm": 6.0,
+        "centroid_minimum_snr": 3.0,
+        "centroid_maximum_offset_arcsec": 2.0,
+        "centroid_maximum_width_fwhm": 1.8,
+        "centroid_maximum_ellipticity": 0.50,
+        "maximum_individual_centroids": 5,
+        "maximum_filter_shift_arcsec": 0.50,
+        "maximum_coordinate_uncertainty_arcsec": 1.0,
+        "minimum_coordinate_uncertainty_arcsec": 0.02,
+        "target_coordinate_version": 1,
+        "allow_difference_stack_candidates": True,
+        "save_alignment_headers": True,
+        "save_alignment_table": True,
+        "save_target_candidates": True,
+        "save_target_position": True,
     },
     "psf": {
         "enabled": True,
@@ -1501,6 +1549,110 @@ def validate_settings(settings):
 
     target_ra = settings["target_position"]["ra"]
     target_dec = settings["target_position"]["dec"]
+    target_settings = settings["target_position"]
+    if target_settings.get("resample_science_images", False):
+        raise ValueError(
+            "target_position.resample_science_images must remain False; only "
+            "derived detection-stack inputs may be reprojected"
+        )
+    if target_settings.get("user_position_mode", "prior") not in {"prior", "fixed"}:
+        raise ValueError(
+            "target_position.user_position_mode must be 'prior' or 'fixed'"
+        )
+    if target_settings.get("stack_combine", "weighted_mean") not in {
+        "weighted_mean", "median"
+    }:
+        raise ValueError(
+            "target_position.stack_combine must be weighted_mean or median"
+        )
+    if target_settings.get("stack_normalization", "zeropoint") not in {
+        "none", "exposure", "zeropoint"
+    }:
+        raise ValueError(
+            "target_position.stack_normalization must be none, exposure, or zeropoint"
+        )
+    if target_settings.get("multifilter_normalization", "background_rms") not in {
+        "none", "background_rms"
+    }:
+        raise ValueError(
+            "target_position.multifilter_normalization must be none or background_rms"
+        )
+    if int(target_settings.get("relative_alignment_minimum_common_stars", 6)) < 3:
+        raise ValueError(
+            "target_position.relative_alignment_minimum_common_stars must be at least 3"
+        )
+    if int(target_settings.get("stack_reprojection_order", 1)) not in {0, 1, 2, 3}:
+        raise ValueError(
+            "target_position.stack_reprojection_order must be between 0 and 3"
+        )
+    if int(target_settings.get("stack_reprojection_tile_rows", 256)) <= 0:
+        raise ValueError(
+            "target_position.stack_reprojection_tile_rows must be positive"
+        )
+    allowed_statuses = {"PASS", "WARN", "FAIL"}
+    for name in ("coordinate_allowed_statuses", "stack_allowed_statuses"):
+        values = target_settings.get(name, ["PASS", "WARN"])
+        if not values or not set(values).issubset(allowed_statuses):
+            raise ValueError(
+                "target_position.{} must contain PASS, WARN, or FAIL".format(name)
+            )
+    positive_names = (
+        "relative_alignment_target_rms_arcsec",
+        "relative_alignment_warn_rms_arcsec",
+        "relative_alignment_fail_rms_arcsec",
+        "prior_uncertainty_arcsec",
+        "centroid_search_radius_arcsec",
+        "centroid_minimum_snr",
+        "maximum_filter_shift_arcsec",
+        "maximum_coordinate_uncertainty_arcsec",
+        "minimum_coordinate_uncertainty_arcsec",
+    )
+    for name in positive_names:
+        if float(target_settings.get(name, 1.0)) <= 0:
+            raise ValueError("target_position.{} must be positive".format(name))
+    relative_target = float(
+        target_settings.get("relative_alignment_target_rms_arcsec", 0.20)
+    )
+    relative_warn = float(
+        target_settings.get("relative_alignment_warn_rms_arcsec", 0.50)
+    )
+    relative_fail = float(
+        target_settings.get("relative_alignment_fail_rms_arcsec", 1.50)
+    )
+    if not relative_target <= relative_warn <= relative_fail:
+        raise ValueError(
+            "target_position relative-alignment RMS limits must satisfy "
+            "target <= warn <= fail"
+        )
+    centroid_inner = float(
+        target_settings.get("centroid_background_inner_fwhm", 3.0)
+    )
+    centroid_outer = float(
+        target_settings.get("centroid_background_outer_fwhm", 6.0)
+    )
+    if centroid_inner < 0 or centroid_outer <= centroid_inner:
+        raise ValueError(
+            "target_position centroid background radii must satisfy "
+            "0 <= inner < outer"
+        )
+    if float(target_settings.get("centroid_aperture_radius_fwhm", 1.5)) <= 0:
+        raise ValueError(
+            "target_position.centroid_aperture_radius_fwhm must be positive"
+        )
+    if int(target_settings.get("stack_minimum_images_per_filter", 1)) <= 0:
+        raise ValueError(
+            "target_position.stack_minimum_images_per_filter must be positive"
+        )
+    if float(
+        target_settings.get("minimum_coordinate_uncertainty_arcsec", 0.02)
+    ) > float(target_settings.get("maximum_coordinate_uncertainty_arcsec", 1.0)):
+        raise ValueError(
+            "target_position minimum coordinate uncertainty cannot exceed maximum"
+        )
+    if int(target_settings.get("target_coordinate_version", 1)) <= 0:
+        raise ValueError(
+            "target_position.target_coordinate_version must be positive"
+        )
 
     if (target_ra is None) != (target_dec is None):
         raise ValueError(
