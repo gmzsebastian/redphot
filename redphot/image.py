@@ -8,6 +8,7 @@ dictionary.
 """
 
 from collections.abc import Mapping
+from copy import deepcopy
 from glob import glob
 from pathlib import Path
 import warnings
@@ -4725,6 +4726,901 @@ def assess_image_quality_batch(results, settings=None):
     return assessed
 
 
+# ---------------------------------------------------------------------------
+# Image usability and limiting-depth review
+#
+# These functions deliberately use quick catalog-star and background
+# measurements.  They decide whether an exposure should continue through the
+# more expensive PSF, target-photometry, and subtraction work without trying
+# to replace the final calibrated photometry or injection-based upper limits.
+# ---------------------------------------------------------------------------
+
+
+def _usability_image_id(record, index):
+    """Return the stable image identifier used by review products."""
+
+    metadata = record.get("metadata") or {}
+    value = record.get("image_id") or metadata.get("filename")
+    return str(value) if value is not None else "image_{:04d}".format(index)
+
+
+def _merge_settings(base, overrides):
+    """Return a recursively merged settings copy for one review decision."""
+
+    merged = deepcopy(base)
+    if not overrides:
+        return merged
+    for key, value in overrides.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _merge_settings(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _usable_float(value):
+    """Return a finite float or ``None`` for a missing scalar."""
+
+    if value is None or np.ma.is_masked(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _image_measurements(measurements, image_id):
+    """Return measurement rows belonging to one image identifier."""
+
+    if measurements is None or "image_id" not in measurements.colnames:
+        return Table(masked=True)
+    return measurements[
+        np.asarray(measurements["image_id"], dtype=str) == str(image_id)
+    ]
+
+
+def _catalog_recovery(record, rows, settings):
+    """Measure the fraction of usable in-frame catalog stars recovered."""
+
+    catalog = record.get("catalog")
+    if catalog is None:
+        return None, 0, len(rows)
+    selected = np.ones(len(catalog), dtype=bool)
+    if "in_image" in catalog.colnames:
+        selected &= np.asarray(catalog["in_image"], dtype=bool)
+    star_settings = settings.get("catalogs", {}).get("comparison_stars", {})
+    if "point_source" in catalog.colnames:
+        point_source = np.ma.asarray(catalog["point_source"], dtype=bool)
+        selected &= np.asarray(point_source.filled(False), dtype=bool)
+    if "catalog_quality" in catalog.colnames:
+        catalog_quality = np.ma.asarray(catalog["catalog_quality"], dtype=bool)
+        selected &= np.asarray(catalog_quality.filled(True), dtype=bool)
+    filter_name = (record.get("metadata") or {}).get("filter")
+    magnitude_name = "mag_{}".format(filter_name) if filter_name else None
+    magnitude_values = None
+    if magnitude_name in catalog.colnames:
+        magnitude = np.ma.asarray(catalog[magnitude_name], dtype=float)
+        magnitude_values = np.asarray(magnitude.filled(np.nan), dtype=float)
+        selected &= ~np.ma.getmaskarray(magnitude)
+        selected &= magnitude_values >= float(
+            star_settings.get("minimum_magnitude", 10.0)
+        )
+        selected &= magnitude_values <= float(
+            star_settings.get("maximum_magnitude", 22.0)
+        )
+        error_name = magnitude_name.replace("mag_", "magerr_", 1)
+        if error_name in catalog.colnames:
+            magnitude_error = np.ma.asarray(catalog[error_name], dtype=float)
+            finite_error = ~np.ma.getmaskarray(magnitude_error)
+            if star_settings.get("allow_missing_magnitude_error", True):
+                selected &= ~finite_error | (
+                    magnitude_error.filled(np.inf)
+                    <= float(star_settings.get("maximum_magnitude_error", 0.10))
+                )
+            else:
+                selected &= finite_error & (
+                    magnitude_error.filled(np.inf)
+                    <= float(star_settings.get("maximum_magnitude_error", 0.10))
+                )
+    expected_array = np.flatnonzero(selected)
+    maximum = int(star_settings.get("maximum_catalog_stars", 300))
+    if maximum > 0 and expected_array.size > maximum:
+        if magnitude_values is None:
+            expected_array = expected_array[:maximum]
+        else:
+            order = np.argsort(magnitude_values[expected_array])
+            expected_array = expected_array[order[:maximum]]
+    expected_indices = set(expected_array.tolist())
+    recovered_indices = {
+        int(value)
+        for value in rows["catalog_index"]
+        if int(value) in expected_indices
+    } if "catalog_index" in rows.colnames else set()
+    expected = len(expected_indices)
+    recovered = len(recovered_indices)
+    fraction = None if expected == 0 else recovered / expected
+    return fraction, expected, recovered
+
+
+def _quick_zeropoint(rows, metadata, settings):
+    """Estimate a rate-based zeropoint from selected calibration stars."""
+
+    usability = settings.get("image_quality", {}).get("usability", {})
+    exposure = _usable_float((metadata or {}).get("exposure_time"))
+    if exposure is None or exposure <= 0 or len(rows) == 0:
+        return None, None, np.zeros(len(rows), dtype=bool), "unavailable"
+
+    role = (
+        np.asarray(rows["role_calibration"], dtype=bool)
+        if "role_calibration" in rows.colnames
+        else np.ones(len(rows), dtype=bool)
+    )
+    flux = np.ma.asarray(rows["flux"], dtype=float)
+    magnitude = np.ma.asarray(rows["magnitude"], dtype=float)
+    valid = (
+        role
+        & ~np.ma.getmaskarray(flux)
+        & ~np.ma.getmaskarray(magnitude)
+        & np.isfinite(flux.filled(np.nan))
+        & np.isfinite(magnitude.filled(np.nan))
+        & (flux.filled(0.0) > 0)
+    )
+    zeropoints = np.full(len(rows), np.nan, dtype=float)
+    zeropoints[valid] = magnitude.filled(np.nan)[valid] + 2.5 * np.log10(
+        flux.filled(np.nan)[valid] / exposure
+    )
+    inlier = np.zeros(len(rows), dtype=bool)
+    if np.count_nonzero(valid) == 0:
+        return zeropoints, None, inlier, "unavailable"
+    clipper = SigmaClip(
+        sigma=float(usability.get("zeropoint_sigma_clip", 3.0)),
+        maxiters=int(usability.get("zeropoint_maximum_iterations", 5)),
+    )
+    clipped = clipper(zeropoints[valid], masked=True)
+    valid_indices = np.flatnonzero(valid)
+    inlier[valid_indices[~np.ma.getmaskarray(clipped)]] = True
+    values = zeropoints[inlier]
+    if values.size == 0:
+        return zeropoints, None, inlier, "unavailable"
+    median = float(np.median(values))
+    mad = float(1.4826 * np.median(np.abs(values - median)))
+    if values.size > 1 and (not np.isfinite(mad) or mad == 0):
+        mad = float(np.std(values, ddof=1))
+    scatter = mad if np.isfinite(mad) else None
+    result = {
+        "zeropoint_mag": median,
+        "zeropoint_scatter_mag": scatter,
+        "star_count": int(values.size),
+        "rejected_star_count": int(np.count_nonzero(valid & ~inlier)),
+    }
+    return zeropoints, result, inlier, "catalog_segment_flux"
+
+
+def _spatial_cloud_amplitude(rows, zeropoints, inlier, shape, settings):
+    """Estimate spatially varying attenuation from stellar zeropoints."""
+
+    usability = settings.get("image_quality", {}).get("usability", {})
+    minimum = int(usability.get("cloud_minimum_stars", 8))
+    if np.count_nonzero(inlier) < minimum or shape is None:
+        return None, None, None
+    y_size, x_size = int(shape[0]), int(shape[1])
+    x = np.asarray(rows["x"], dtype=float)[inlier] / max(1, x_size - 1)
+    y = np.asarray(rows["y"], dtype=float)[inlier] / max(1, y_size - 1)
+    values = zeropoints[inlier]
+    median = float(np.median(values))
+    residuals = values - median
+
+    design = np.column_stack((np.ones(values.size), x - 0.5, y - 0.5))
+    try:
+        coefficients, _, _, _ = np.linalg.lstsq(design, residuals, rcond=None)
+        corners = np.array(
+            [[1.0, -0.5, -0.5], [1.0, 0.5, -0.5],
+             [1.0, -0.5, 0.5], [1.0, 0.5, 0.5]]
+        )
+        plane_values = corners @ coefficients
+        plane_amplitude = float(np.ptp(plane_values))
+    except np.linalg.LinAlgError:
+        coefficients = None
+        plane_amplitude = None
+
+    grid_y, grid_x = [int(value) for value in usability.get(
+        "cloud_spatial_grid", [3, 3]
+    )]
+    cell_values = []
+    for iy in range(grid_y):
+        for ix in range(grid_x):
+            inside = (
+                (x >= ix / grid_x)
+                & (x <= (ix + 1) / grid_x if ix == grid_x - 1 else x < (ix + 1) / grid_x)
+                & (y >= iy / grid_y)
+                & (y <= (iy + 1) / grid_y if iy == grid_y - 1 else y < (iy + 1) / grid_y)
+            )
+            if np.count_nonzero(inside):
+                cell_values.append(float(np.median(residuals[inside])))
+    grid_amplitude = (
+        float(np.ptp(cell_values)) if len(cell_values) >= 2 else None
+    )
+    amplitudes = [
+        value for value in (plane_amplitude, grid_amplitude) if value is not None
+    ]
+    amplitude = max(amplitudes) if amplitudes else None
+    model = {
+        "plane_coefficients": None if coefficients is None else coefficients.tolist(),
+        "plane_amplitude_mag": plane_amplitude,
+        "grid_amplitude_mag": grid_amplitude,
+        "grid_cell_count": len(cell_values),
+    }
+    return amplitude, residuals, model
+
+
+def _target_artifacts(record, settings):
+    """Check target overlap separately for each available artifact mask."""
+
+    ccd = record.get("ccd")
+    metadata = record.get("metadata") or {}
+    if ccd is None:
+        return {"position": None, "overlaps": {}, "any": None}
+    position = _project_target_pixel(
+        ccd, metadata, settings, record.get("target")
+    )
+    if position is None:
+        return {"position": None, "overlaps": {}, "any": None}
+    quality = record.get("quality") or {}
+    fwhm = _usable_float(quality.get("fwhm_pixels"))
+    if fwhm is None:
+        fwhm = _fwhm_guess_pixels(settings)
+    radius = float(
+        settings.get("image_quality", {}).get("usability", {}).get(
+            "target_artifact_radius_fwhm", 1.0
+        )
+    ) * fwhm
+    masks = dict(record.get("masks") or {})
+    cosmic = record.get("cosmic_ray_products") or {}
+    if cosmic.get("cosmic_mask") is not None:
+        masks["cosmic_rays"] = cosmic["cosmic_mask"]
+    cosmic_mask = masks.get("cosmic_rays")
+    overlaps = {}
+    for name in (
+        "input", "nonfinite", "saturated", "nonlinear", "bad_lines",
+        "amplifier", "trails", "manual", "cosmic_rays", "combined",
+    ):
+        mask = masks.get(name)
+        if mask is None:
+            continue
+        if name in {"input", "combined"} and cosmic_mask is not None:
+            mask = np.asarray(mask, dtype=bool) & ~np.asarray(
+                cosmic_mask, dtype=bool
+            )
+        overlaps[name] = bool(
+            check_mask_overlaps(mask, [position], [radius])[0]
+        )
+    return {
+        "position": [float(position[0]), float(position[1])],
+        "radius_pixels": float(radius),
+        "overlaps": overlaps,
+        "any": any(overlaps.values()) if overlaps else False,
+    }
+
+
+def _quick_depths(record, zeropoint, settings):
+    """Estimate global and target-local background-limited magnitude depths."""
+
+    usability = settings.get("image_quality", {}).get("usability", {})
+    metadata = record.get("metadata") or {}
+    quality = record.get("quality") or {}
+    exposure = _usable_float(metadata.get("exposure_time"))
+    fwhm = _usable_float(quality.get("fwhm_pixels"))
+    global_rms = _usable_float(quality.get("background_rms"))
+    local_info = quality.get("local_target_background") or {}
+    local_rms = _usable_float(local_info.get("rms"))
+    if local_rms is None:
+        products = record.get("background_products") or {}
+        rms_map = products.get("background_rms")
+        ccd = record.get("ccd")
+        position = None if ccd is None else _project_target_pixel(
+            ccd, metadata, settings, record.get("target")
+        )
+        if rms_map is not None and position is not None:
+            iy = int(np.clip(round(position[1]), 0, rms_map.shape[0] - 1))
+            ix = int(np.clip(round(position[0]), 0, rms_map.shape[1] - 1))
+            local_rms = _usable_float(np.asarray(rms_map)[iy, ix])
+    result = {
+        "global_rms": global_rms,
+        "local_rms": local_rms,
+        "effective_noise_pixels": None,
+        "global": {},
+        "local": {},
+    }
+    if zeropoint is None or exposure is None or exposure <= 0 or fwhm is None:
+        return result
+    radius = float(usability.get("limiting_aperture_radius_fwhm", 1.0)) * fwhm
+    noise_pixels = np.pi * radius ** 2
+    correlation = float(usability.get("noise_correlation_factor", 1.0))
+    result["effective_noise_pixels"] = float(noise_pixels * correlation ** 2)
+    for sigma in usability.get("limiting_sigma_levels", [3.0, 5.0]):
+        label = "{}sigma".format(int(sigma) if float(sigma).is_integer() else sigma)
+        for region, rms in (("global", global_rms), ("local", local_rms)):
+            if rms is None or rms <= 0:
+                result[region][label] = None
+                continue
+            flux_rate = float(sigma) * rms * np.sqrt(noise_pixels) * correlation / exposure
+            result[region][label] = float(
+                zeropoint - 2.5 * np.log10(flux_rate)
+            ) if flux_rate > 0 else None
+    return result
+
+
+def _usability_reason(flag, status):
+    """Return a concise human-readable reason for a usability flag."""
+
+    descriptions = {
+        "CATALOG_RECOVERY_LOW": "too few expected catalog stars were recovered",
+        "QC_STAR_NOT_RECOVERED": "the bright quality-control anchor was not recovered",
+        "TOO_FEW_CALIBRATION_STARS": "too few calibration stars survived screening",
+        "CALIBRATION_FAILED": "a quick catalog zeropoint could not be measured",
+        "ZEROPOINT_SCATTER_HIGH": "comparison-star zeropoints have high scatter",
+        "TRANSPARENCY_LOW": "uniform transparency is below the batch reference",
+        "TRANSPARENCY_NONUNIFORM": "comparison-star residuals vary across the detector",
+        "IMAGE_TOO_SHALLOW": "the estimated limiting depth is insufficient",
+        "TARGET_MASKED": "the target aperture overlaps a mask or detector artifact",
+        "TARGET_TRAIL": "a detected trail overlaps the target aperture",
+        "TARGET_COSMIC_RAY": "a cosmic-ray mask overlaps the target aperture",
+    }
+    return "{}: {}".format(status, descriptions.get(flag, flag.lower().replace("_", " ")))
+
+
+def _append_usability_result(decision, status, flag, metric=None, value=None,
+                             threshold=None, direction=None):
+    """Append one explicit result and raise the automatic severity."""
+
+    if status == "PASS":
+        return
+    if flag not in decision["quality_flags"]:
+        decision["quality_flags"].append(flag)
+    reason = _usability_reason(flag, status)
+    if reason not in decision["reasons"]:
+        decision["reasons"].append(reason)
+    decision["checks"].append(
+        {
+            "metric": metric,
+            "value": value,
+            "threshold": threshold,
+            "direction": direction,
+            "status": status,
+            "flag": flag,
+        }
+    )
+    decision["automatic_status"] = _combine_quality_status(
+        decision["automatic_status"], status
+    )
+
+
+def _threshold_status(value, warn, fail, direction="high"):
+    """Return PASS, WARN, or FAIL for one optional scalar threshold."""
+
+    if value is None or not np.isfinite(value):
+        return "PASS", None
+    if direction == "low":
+        if fail is not None and value < float(fail):
+            return "FAIL", fail
+        if warn is not None and value < float(warn):
+            return "WARN", warn
+    else:
+        if fail is not None and value > float(fail):
+            return "FAIL", fail
+        if warn is not None and value > float(warn):
+            return "WARN", warn
+    return "PASS", None
+
+
+def _apply_manual_review(decision, manual, settings):
+    """Apply an optional manual approval or rejection to one decision."""
+
+    usability = settings.get("image_quality", {}).get("usability", {})
+    requested = manual.get("decision") if isinstance(manual, Mapping) else manual
+    note = manual.get("note") if isinstance(manual, Mapping) else None
+    aliases = {
+        None: None,
+        "auto": None,
+        "pending": None,
+        "approve": "PASS",
+        "approved": "PASS",
+        "pass": "PASS",
+        "warn": "WARN",
+        "reject": "FAIL",
+        "rejected": "FAIL",
+        "fail": "FAIL",
+    }
+    key = requested.lower() if isinstance(requested, str) else requested
+    if key not in aliases:
+        raise ValueError(
+            "Manual image decision must be auto, approve, warn, or reject"
+        )
+    manual_status = aliases[key]
+    decision["manual_status"] = manual_status
+    decision["review_note"] = None if note is None else str(note)
+    decision["review_state"] = "REVIEWED" if manual_status is not None else "PENDING"
+    decision["decision_source"] = "manual" if manual_status is not None else "automatic"
+    decision["status"] = manual_status or decision["automatic_status"]
+    if usability.get("require_manual_review", False) and manual_status is None:
+        decision["use_image"] = False
+        decision["review_required"] = True
+    else:
+        decision["use_image"] = decision["status"] != "FAIL"
+        decision["review_required"] = bool(
+            decision["automatic_status"] != "PASS" and manual_status is None
+        )
+    return decision
+
+
+def assess_image_usability(image_records, measurements, settings=None,
+                           manual_decisions=None):
+    """Assess image usability, quick depth, transparency, and cloud structure.
+
+    Parameters
+    ----------
+    image_records : sequence of mapping
+        One record per image. Expected keys are ``ccd``, ``metadata``,
+        ``quality``, ``catalog``, and ``masks``. Optional keys include
+        ``background_products``, ``cosmic_ray_products``, ``target``, and an
+        independently resolved ``settings`` mapping for that image.
+    measurements : astropy.table.Table
+        Selected per-image comparison-star table returned by
+        :func:`redphot.catalogs.select_comparison_and_psf_stars`.
+    settings : mapping, optional
+        Resolved run settings. Per-image review parameter overrides can be
+        supplied inside ``manual_decisions`` without modifying this mapping.
+    manual_decisions : mapping, optional
+        Mapping from image ID to a decision string or a dictionary containing
+        ``decision``, ``note``, and optional ``parameter_overrides``.
+
+    Returns
+    -------
+    decisions : list of dict
+        Complete automatic and effective PASS/WARN/FAIL decisions.
+    star_residuals : astropy.table.Table
+        Per-star quick zeropoints and spatial residuals for diagnostics and
+        later calibration checks.
+
+    Notes
+    -----
+    The quick limits are background-limited estimates. Final calibrated upper
+    limits, empty-aperture measurements, and injection recovery remain later
+    photometry products. Input images are never changed or deleted.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    manual_decisions = manual_decisions or settings.get("image_quality", {}).get(
+        "usability", {}
+    ).get("manual_decisions", {})
+    decisions = []
+    residual_rows = []
+    qc_anchor_id = None
+    if (
+        measurements is not None
+        and len(measurements)
+        and "role_qc_anchor" in measurements.colnames
+    ):
+        qc_rows = measurements[
+            np.asarray(measurements["role_qc_anchor"], dtype=bool)
+        ]
+        if len(qc_rows):
+            candidates = []
+            for persistent_id in set(
+                str(value) for value in qc_rows["persistent_id"]
+            ):
+                same = np.asarray(qc_rows["persistent_id"], dtype=str) == persistent_id
+                magnitudes = np.ma.asarray(qc_rows["magnitude"][same], dtype=float)
+                finite = np.asarray(
+                    magnitudes.compressed(), dtype=float
+                )
+                median_magnitude = (
+                    float(np.median(finite)) if finite.size else np.inf
+                )
+                candidates.append(
+                    (-int(np.count_nonzero(same)), median_magnitude, persistent_id)
+                )
+            qc_anchor_id = min(candidates)[2]
+
+    for index, record in enumerate(image_records):
+        image_id = _usability_image_id(record, index)
+        manual = manual_decisions.get(image_id, {})
+        overrides = manual.get("parameter_overrides", {}) if isinstance(manual, Mapping) else {}
+        image_settings = _merge_settings(record.get("settings", settings), overrides)
+        usability = image_settings.get("image_quality", {}).get("usability", {})
+        metadata = record.get("metadata") or {}
+        quality = deepcopy(record.get("quality") or {})
+        rows = _image_measurements(measurements, image_id)
+        recovery, expected_count, recovered_count = _catalog_recovery(
+            record, rows, image_settings
+        )
+        zeropoints, calibration, inlier, calibration_method = _quick_zeropoint(
+            rows, metadata, image_settings
+        )
+        zeropoint = None if calibration is None else calibration["zeropoint_mag"]
+        shape = record.get("shape")
+        if shape is None and record.get("ccd") is not None:
+            shape = record["ccd"].shape
+        spatial_amplitude, spatial_residuals, cloud_model = _spatial_cloud_amplitude(
+            rows, zeropoints, inlier, shape, image_settings
+        ) if zeropoints is not None else (None, None, None)
+        artifacts = _target_artifacts(record, image_settings)
+        depths = _quick_depths(record, zeropoint, image_settings)
+        initial_status = quality.get("quality_status", "PASS")
+        if initial_status not in {"PASS", "WARN", "FAIL"}:
+            initial_status = "WARN"
+        decision = {
+            "image_id": image_id,
+            "filename": metadata.get("filename", image_id),
+            "object": metadata.get("object"),
+            "filter": metadata.get("filter"),
+            "instrument": metadata.get("instrument"),
+            "mjd_mid": metadata.get("mjd_mid", metadata.get("mjd")),
+            "automatic_status": initial_status,
+            "status": initial_status,
+            "quality_flags": list(dict.fromkeys(quality.get("quality_flags", []))),
+            "reasons": [],
+            "checks": deepcopy(quality.get("checks", [])),
+            "catalog_expected_count": expected_count,
+            "catalog_recovered_count": recovered_count,
+            "catalog_recovery_fraction": recovery,
+            "qc_anchor_id": qc_anchor_id,
+            "qc_fallback_available": bool(
+                len(rows)
+                and "role_qc_anchor" in rows.colnames
+                and np.any(np.asarray(rows["role_qc_anchor"], dtype=bool))
+            ),
+            "qc_star_recovered": bool(
+                qc_anchor_id is not None
+                and len(rows)
+                and np.any(
+                    np.asarray(rows["persistent_id"], dtype=str) == qc_anchor_id
+                )
+            ),
+            "calibration_method": calibration_method,
+            "calibration_star_count": 0 if calibration is None else calibration["star_count"],
+            "calibration_rejected_star_count": 0 if calibration is None else calibration["rejected_star_count"],
+            "zeropoint_mag": zeropoint,
+            "zeropoint_scatter_mag": None if calibration is None else calibration["zeropoint_scatter_mag"],
+            "pipeline_zeropoint_mag": _usable_float(metadata.get("pipeline_zeropoint_mag")),
+            "transparency_reference_mag": None,
+            "transparency_attenuation_mag": None,
+            "spatial_cloud_amplitude_mag": spatial_amplitude,
+            "cloud_model": cloud_model,
+            "fwhm_arcsec": _usable_float(quality.get("fwhm_arcsec")),
+            "ellipticity": _usable_float(quality.get("ellipticity")),
+            "background": _usable_float(quality.get("background")),
+            "background_rms": _usable_float(quality.get("background_rms")),
+            "masked_pixel_fraction": _usable_float(quality.get("masked_pixel_fraction")),
+            "trail_fraction": _usable_float(quality.get("trail_fraction")),
+            "target_artifacts": artifacts,
+            "global_depths_mag": depths["global"],
+            "local_depths_mag": depths["local"],
+            "effective_noise_pixels": depths["effective_noise_pixels"],
+            "expected_target_magnitude": usability.get("expected_target_magnitude"),
+            "target_depth_margin_mag": None,
+            "manual_status": None,
+            "review_state": "PENDING",
+            "review_note": None,
+            "review_required": False,
+            "decision_source": "automatic",
+            "use_image": initial_status != "FAIL",
+            "parameter_overrides": deepcopy(overrides),
+        }
+
+        for check in decision["checks"]:
+            status = check.get("status")
+            flag = check.get("flag")
+            if status in {"WARN", "FAIL"} and flag:
+                reason = _usability_reason(flag, status)
+                if reason not in decision["reasons"]:
+                    decision["reasons"].append(reason)
+
+        status, threshold = _threshold_status(
+            recovery,
+            usability.get("minimum_catalog_recovery_warn", 0.40),
+            usability.get("minimum_catalog_recovery_fail", 0.15),
+            direction="low",
+        )
+        _append_usability_result(
+            decision, status, "CATALOG_RECOVERY_LOW",
+            "catalog_recovery_fraction", recovery, threshold, "low"
+        )
+        calibration_count = decision["calibration_star_count"]
+        status, threshold = _threshold_status(
+            calibration_count,
+            usability.get("minimum_calibration_stars_warn", 5),
+            usability.get("minimum_calibration_stars_fail", 2),
+            direction="low",
+        )
+        _append_usability_result(
+            decision, status, "TOO_FEW_CALIBRATION_STARS",
+            "calibration_star_count", calibration_count, threshold, "low"
+        )
+        if calibration is None:
+            _append_usability_result(
+                decision, "FAIL", "CALIBRATION_FAILED", "zeropoint_mag"
+            )
+        else:
+            status, threshold = _threshold_status(
+                calibration.get("zeropoint_scatter_mag"),
+                usability.get("zeropoint_scatter_warn_mag", 0.10),
+                usability.get("zeropoint_scatter_fail_mag", 0.30),
+            )
+            _append_usability_result(
+                decision, status, "ZEROPOINT_SCATTER_HIGH",
+                "zeropoint_scatter_mag", calibration.get("zeropoint_scatter_mag"),
+                threshold, "high"
+            )
+        if usability.get("require_qc_anchor", True) and not decision["qc_star_recovered"]:
+            _append_usability_result(
+                decision, usability.get("missing_qc_anchor_status", "WARN"),
+                "QC_STAR_NOT_RECOVERED", "qc_star_recovered", 0.0, 1.0, "low"
+            )
+        status, threshold = _threshold_status(
+            spatial_amplitude,
+            usability.get("cloud_spatial_amplitude_warn_mag", 0.15),
+            usability.get("cloud_spatial_amplitude_fail_mag", 0.35),
+        )
+        _append_usability_result(
+            decision, status, "TRANSPARENCY_NONUNIFORM",
+            "spatial_cloud_amplitude_mag", spatial_amplitude, threshold, "high"
+        )
+
+        overlap = artifacts.get("overlaps", {})
+        if overlap.get("trails"):
+            _append_usability_result(
+                decision, usability.get("target_trail_status", "FAIL"),
+                "TARGET_TRAIL", "target_trail_overlap", 1.0, 0.0, "high"
+            )
+        if overlap.get("cosmic_rays"):
+            _append_usability_result(
+                decision, usability.get("target_cosmic_ray_status", "WARN"),
+                "TARGET_COSMIC_RAY", "target_cosmic_ray_overlap", 1.0, 0.0, "high"
+            )
+        non_trail_mask = any(
+            value for name, value in overlap.items()
+            if name not in {"trails", "cosmic_rays", "combined"}
+        )
+        if non_trail_mask or (overlap.get("combined") and not overlap.get("trails")):
+            _append_usability_result(
+                decision, usability.get("target_mask_status", "FAIL"),
+                "TARGET_MASKED", "target_mask_overlap", 1.0, 0.0, "high"
+            )
+
+        local_five = depths["local"].get("5sigma")
+        global_five = depths["global"].get("5sigma")
+        minimum_limit = usability.get("minimum_limit_mag")
+        status, threshold = _threshold_status(
+            local_five, minimum_limit, minimum_limit, direction="low"
+        )
+        _append_usability_result(
+            decision, status, "IMAGE_TOO_SHALLOW", "local_5sigma_depth_mag",
+            local_five, threshold, "low"
+        )
+        if local_five is not None and global_five is not None:
+            depth_loss = global_five - local_five
+            status, threshold = _threshold_status(
+                depth_loss,
+                usability.get("local_depth_loss_warn_mag", 0.50),
+                usability.get("local_depth_loss_fail_mag", 1.50),
+            )
+            _append_usability_result(
+                decision, status, "IMAGE_TOO_SHALLOW", "local_depth_loss_mag",
+                depth_loss, threshold, "high"
+            )
+        expected_magnitude = _usable_float(
+            usability.get("expected_target_magnitude")
+        )
+        if expected_magnitude is not None and local_five is not None:
+            margin = local_five - expected_magnitude
+            decision["expected_target_magnitude"] = expected_magnitude
+            decision["target_depth_margin_mag"] = margin
+            status, threshold = _threshold_status(
+                margin,
+                usability.get("target_depth_margin_warn_mag", 0.50),
+                usability.get("target_depth_margin_fail_mag", 0.0),
+                direction="low",
+            )
+            _append_usability_result(
+                decision, status, "IMAGE_TOO_SHALLOW", "target_depth_margin_mag",
+                margin, threshold, "low"
+            )
+
+        if zeropoints is not None:
+            residual_lookup = {}
+            if spatial_residuals is not None:
+                for row_index, residual in zip(np.flatnonzero(inlier), spatial_residuals):
+                    residual_lookup[int(row_index)] = float(residual)
+            for row_index, row in enumerate(rows):
+                zp = _usable_float(zeropoints[row_index])
+                if zp is None:
+                    continue
+                residual_rows.append(
+                    {
+                        "image_id": image_id,
+                        "persistent_id": str(row["persistent_id"]),
+                        "x": float(row["x"]),
+                        "y": float(row["y"]),
+                        "catalog_magnitude": _usable_float(row["magnitude"]),
+                        "quick_zeropoint_mag": zp,
+                        "spatial_residual_mag": residual_lookup.get(row_index),
+                        "inlier": bool(inlier[row_index]),
+                        "calibration_role": bool(row["role_calibration"]),
+                        "qc_role": bool(row["role_qc_anchor"]),
+                    }
+                )
+        decisions.append(decision)
+
+    groups = {}
+    for decision in decisions:
+        key = (decision.get("instrument"), decision.get("filter"))
+        if decision.get("zeropoint_mag") is not None:
+            groups.setdefault(key, []).append(decision["zeropoint_mag"])
+    for index, decision in enumerate(decisions):
+        record = image_records[index]
+        manual = manual_decisions.get(decision["image_id"], {})
+        overrides = manual.get("parameter_overrides", {}) if isinstance(manual, Mapping) else {}
+        image_settings = _merge_settings(record.get("settings", settings), overrides)
+        usability = image_settings.get("image_quality", {}).get("usability", {})
+        key = (decision.get("instrument"), decision.get("filter"))
+        group_values = groups.get(key, [])
+        reference = None
+        if len(group_values) >= int(usability.get("transparency_minimum_images", 2)):
+            reference = float(np.median(group_values))
+        elif decision.get("pipeline_zeropoint_mag") is not None:
+            reference = decision["pipeline_zeropoint_mag"]
+        decision["transparency_reference_mag"] = reference
+        if reference is not None and decision.get("zeropoint_mag") is not None:
+            attenuation = reference - decision["zeropoint_mag"]
+            decision["transparency_attenuation_mag"] = float(attenuation)
+            status, threshold = _threshold_status(
+                attenuation,
+                usability.get("transparency_attenuation_warn_mag", 0.50),
+                usability.get("transparency_attenuation_fail_mag", 1.50),
+            )
+            _append_usability_result(
+                decision, status, "TRANSPARENCY_LOW",
+                "transparency_attenuation_mag", attenuation, threshold, "high"
+            )
+        _apply_manual_review(decision, manual, image_settings)
+
+    residual_table = Table(rows=residual_rows, masked=True)
+    for name, unit in (
+        ("x", u.pixel), ("y", u.pixel),
+        ("catalog_magnitude", u.mag), ("quick_zeropoint_mag", u.mag),
+        ("spatial_residual_mag", u.mag),
+    ):
+        if name in residual_table.colnames:
+            values = np.asarray(
+                [
+                    np.nan
+                    if _usable_float(row.get(name)) is None
+                    else _usable_float(row.get(name))
+                    for row in residual_rows
+                ],
+                dtype=float,
+            )
+            residual_table.replace_column(
+                name,
+                MaskedColumn(
+                    np.where(np.isfinite(values), values, 0.0),
+                    mask=~np.isfinite(values),
+                    name=name,
+                    unit=unit,
+                ),
+            )
+    return decisions, residual_table
+
+
+def usability_table(decisions):
+    """Convert detailed usability decisions into a masked Astropy table."""
+
+    scalar_fields = (
+        "image_id", "filename", "object", "filter", "instrument", "mjd_mid",
+        "automatic_status", "manual_status", "status", "review_state",
+        "review_note", "review_required", "decision_source", "use_image",
+        "catalog_expected_count", "catalog_recovered_count",
+        "catalog_recovery_fraction", "qc_anchor_id", "qc_star_recovered",
+        "qc_fallback_available",
+        "calibration_method", "calibration_star_count",
+        "calibration_rejected_star_count", "zeropoint_mag",
+        "zeropoint_scatter_mag", "pipeline_zeropoint_mag",
+        "transparency_reference_mag", "transparency_attenuation_mag",
+        "spatial_cloud_amplitude_mag", "fwhm_arcsec", "ellipticity",
+        "background", "background_rms", "masked_pixel_fraction",
+        "trail_fraction", "expected_target_magnitude",
+        "target_depth_margin_mag", "effective_noise_pixels",
+    )
+    rows = []
+    for decision in decisions:
+        row = {name: decision.get(name) for name in scalar_fields}
+        row["quality_flags"] = ";".join(decision.get("quality_flags", []))
+        row["reasons"] = " | ".join(decision.get("reasons", []))
+        overlaps = decision.get("target_artifacts", {}).get("overlaps", {})
+        row["target_artifact_types"] = ";".join(
+            name for name, value in overlaps.items() if value and name != "combined"
+        )
+        for region in ("global", "local"):
+            for label, value in decision.get("{}_depths_mag".format(region), {}).items():
+                row["{}_depth_{}_mag".format(region, label)] = value
+        rows.append(row)
+    table = Table(rows=rows, masked=True)
+    magnitude_columns = {
+        "zeropoint_mag", "zeropoint_scatter_mag", "pipeline_zeropoint_mag",
+        "transparency_reference_mag", "transparency_attenuation_mag",
+        "spatial_cloud_amplitude_mag", "expected_target_magnitude",
+        "target_depth_margin_mag",
+    }
+    magnitude_columns.update(
+        name for name in table.colnames if "_depth_" in name and name.endswith("_mag")
+    )
+    for name in magnitude_columns:
+        if name in table.colnames:
+            table[name].unit = u.mag
+    if "fwhm_arcsec" in table.colnames:
+        table["fwhm_arcsec"].unit = u.arcsec
+    return table
+
+
+def review_image_decisions(decisions, updates, settings=None):
+    """Return decision copies with manual approvals or rejections applied."""
+
+    if settings is None:
+        settings = get_default_settings()
+    reviewed = deepcopy(list(decisions))
+    known = {decision["image_id"] for decision in reviewed}
+    unknown = set(updates) - known
+    if unknown:
+        raise KeyError("Unknown image decision IDs: {}".format(sorted(unknown)))
+    for decision in reviewed:
+        if decision["image_id"] in updates:
+            _apply_manual_review(
+                decision, updates[decision["image_id"]], settings
+            )
+    return reviewed
+
+
+def save_usability_products(decisions, star_residuals, output_directory,
+                            object_name="field", overwrite=False, settings=None):
+    """Save the persistent review gate and optional stellar residual table."""
+
+    if settings is None:
+        settings = get_default_settings()
+    usability = settings.get("image_quality", {}).get("usability", {})
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    stem = "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in str(object_name)
+    ).strip("_") or "field"
+    decision_path = output_directory / "{}_image_decisions.ecsv".format(stem)
+    residual_path = output_directory / "{}_usability_star_residuals.ecsv".format(stem)
+    paths = {}
+    if usability.get("save_decision_table", True):
+        usability_table(decisions).write(
+            decision_path, format="ascii.ecsv", overwrite=bool(overwrite)
+        )
+        paths["decisions"] = str(decision_path)
+    if (
+        star_residuals is not None
+        and usability.get("save_star_residuals", True)
+    ):
+        star_residuals.write(
+            residual_path, format="ascii.ecsv", overwrite=bool(overwrite)
+        )
+        paths["star_residuals"] = str(residual_path)
+    return paths
+
+
+def load_usability_table(path):
+    """Load a saved ECSV review gate for later pipeline stages."""
+
+    return Table.read(Path(path), format="ascii.ecsv")
+
+
 def metadata_table(metadata_rows):
     """Convert normalized metadata dictionaries into a masked Astropy table."""
 
@@ -4820,6 +5716,7 @@ __all__ = [
     "SCIENCE_EXTNAMES",
     "apply_cosmic_rays",
     "assess_image_quality_batch",
+    "assess_image_usability",
     "build_masks",
     "build_valid_region",
     "check_mask_overlaps",
@@ -4833,6 +5730,7 @@ __all__ = [
     "extract_metadata",
     "header_section_region",
     "is_fits_path",
+    "load_usability_table",
     "make_amplifier_seam_mask",
     "make_background_source_mask",
     "make_line_defect_mask",
@@ -4843,6 +5741,9 @@ __all__ = [
     "parse_fits_section",
     "read_fits_batch",
     "read_fits_image",
+    "review_image_decisions",
     "save_background_products",
+    "save_usability_products",
     "select_science_hdu",
+    "usability_table",
 ]

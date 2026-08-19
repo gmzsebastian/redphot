@@ -943,9 +943,255 @@ def plot_star_selection_diagnostics(
     return fig
 
 
+def plot_image_usability_diagnostics(
+    ccd,
+    decision,
+    star_residuals=None,
+    metadata=None,
+    output_path=None,
+    show=False,
+):
+    """Plot the complete image-usability review gate for one exposure.
+
+    The figure combines the target and artifact context, catalog recovery,
+    quick stellar zeropoints, limiting depth, global image-quality metrics,
+    and the effective automatic or manual decision.
+    """
+
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(getattr(ccd, "data", ccd), dtype=float)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11), constrained_layout=True)
+    low, high = _image_limits(data, lower=1.0, upper=99.5)
+
+    image_axis = axes[0, 0]
+    image_axis.imshow(
+        data,
+        origin="lower",
+        cmap="gray",
+        vmin=low,
+        vmax=high,
+        interpolation="nearest",
+    )
+    image_axis.set_title("Target and artifact check")
+    artifacts = decision.get("target_artifacts", {})
+    position = artifacts.get("position")
+    if position is not None:
+        from matplotlib.patches import Circle
+
+        radius = artifacts.get("radius_pixels", 5.0)
+        overlap = bool(artifacts.get("any"))
+        image_axis.add_patch(
+            Circle(
+                position,
+                radius,
+                fill=False,
+                color="red" if overlap else "lime",
+                linewidth=1.5,
+            )
+        )
+        image_axis.scatter(
+            [position[0]], [position[1]], marker="+", s=80,
+            color="red" if overlap else "lime",
+        )
+    image_axis.set_xlabel("x [pixel]")
+    image_axis.set_ylabel("y [pixel]")
+
+    recovery_axis = axes[0, 1]
+    recovery_axis.set_title("Catalog and calibration recovery")
+    expected = decision.get("catalog_expected_count") or 0
+    recovered = decision.get("catalog_recovered_count") or 0
+    calibrated = decision.get("calibration_star_count") or 0
+    recovery_axis.bar(
+        ["expected", "recovered", "calibration"],
+        [expected, recovered, calibrated],
+        color=["0.65", "tab:blue", "tab:green"],
+    )
+    recovery_axis.set_ylabel("star count")
+    fraction = decision.get("catalog_recovery_fraction")
+    recovery_axis.text(
+        0.98,
+        0.96,
+        "Recovery: {}\nPersistent QC anchor: {}\nFallback available: {}".format(
+            "--" if fraction is None else "{:.1%}".format(fraction),
+            "yes" if decision.get("qc_star_recovered") else "no",
+            "yes" if decision.get("qc_fallback_available") else "no",
+        ),
+        transform=recovery_axis.transAxes,
+        ha="right",
+        va="top",
+    )
+    recovery_axis.grid(axis="y", alpha=0.2)
+
+    residual_axis = axes[0, 2]
+    residual_axis.set_title("Comparison-star transparency residuals")
+    rows = star_residuals
+    if rows is not None and len(rows) and "image_id" in rows.colnames:
+        rows = rows[
+            np.asarray(rows["image_id"], dtype=str) == str(decision["image_id"])
+        ]
+    if rows is not None and len(rows):
+        inlier = np.asarray(rows["inlier"], dtype=bool)
+        residual = np.ma.asarray(rows["spatial_residual_mag"], dtype=float)
+        valid = inlier & ~np.ma.getmaskarray(residual)
+        if np.any(valid):
+            points = residual_axis.scatter(
+                np.asarray(rows["x"], dtype=float)[valid],
+                np.asarray(rows["y"], dtype=float)[valid],
+                c=np.asarray(residual.filled(np.nan), dtype=float)[valid],
+                cmap="coolwarm_r",
+                s=48,
+                edgecolors="black",
+                linewidths=0.3,
+            )
+            fig.colorbar(points, ax=residual_axis, label="zeropoint residual [mag]")
+        rejected = ~inlier
+        if np.any(rejected):
+            residual_axis.scatter(
+                np.asarray(rows["x"], dtype=float)[rejected],
+                np.asarray(rows["y"], dtype=float)[rejected],
+                marker="x",
+                color="0.4",
+                s=25,
+                label="clipped/rejected",
+            )
+            residual_axis.legend(fontsize=8)
+        residual_axis.set_xlim(0, data.shape[1] - 1)
+        residual_axis.set_ylim(0, data.shape[0] - 1)
+    else:
+        residual_axis.text(
+            0.5, 0.5, "No stellar residuals", ha="center", va="center"
+        )
+    residual_axis.set_xlabel("x [pixel]")
+    residual_axis.set_ylabel("y [pixel]")
+
+    depth_axis = axes[1, 0]
+    depth_axis.set_title("Quick limiting depth")
+    labels = []
+    values = []
+    colors = []
+    for region, color in (("global", "tab:blue"), ("local", "tab:orange")):
+        for sigma_label, value in decision.get(
+            "{}_depths_mag".format(region), {}
+        ).items():
+            if value is not None:
+                labels.append("{}\n{}".format(region, sigma_label))
+                values.append(value)
+                colors.append(color)
+    if values:
+        depth_axis.bar(labels, values, color=colors, alpha=0.85)
+        lower = min(values) - 1.0
+        upper = max(values) + 1.0
+        expected_magnitude = decision.get("expected_target_magnitude")
+        if expected_magnitude is not None:
+            depth_axis.axhline(
+                expected_magnitude,
+                color="red",
+                linestyle="--",
+                label="expected target",
+            )
+            lower = min(lower, expected_magnitude - 0.5)
+            upper = max(upper, expected_magnitude + 0.5)
+            depth_axis.legend(fontsize=8)
+        depth_axis.set_ylim(lower, upper)
+        depth_axis.invert_yaxis()
+    else:
+        depth_axis.text(
+            0.5, 0.5, "Depth unavailable", ha="center", va="center"
+        )
+    depth_axis.set_ylabel("limiting magnitude")
+    depth_axis.grid(axis="y", alpha=0.2)
+
+    metric_axis = axes[1, 1]
+    metric_axis.set_axis_off()
+    metric_lines = [
+        "Quick zeropoint: {}".format(
+            "--" if decision.get("zeropoint_mag") is None
+            else "{:.3f} mag".format(decision["zeropoint_mag"])
+        ),
+        "Zeropoint scatter: {}".format(
+            "--" if decision.get("zeropoint_scatter_mag") is None
+            else "{:.3f} mag".format(decision["zeropoint_scatter_mag"])
+        ),
+        "Transparency loss: {}".format(
+            "--" if decision.get("transparency_attenuation_mag") is None
+            else "{:.3f} mag".format(decision["transparency_attenuation_mag"])
+        ),
+        "Spatial cloud amplitude: {}".format(
+            "--" if decision.get("spatial_cloud_amplitude_mag") is None
+            else "{:.3f} mag".format(decision["spatial_cloud_amplitude_mag"])
+        ),
+        "Seeing: {}".format(
+            "--" if decision.get("fwhm_arcsec") is None
+            else "{:.2f} arcsec".format(decision["fwhm_arcsec"])
+        ),
+        "Ellipticity: {}".format(
+            "--" if decision.get("ellipticity") is None
+            else "{:.3f}".format(decision["ellipticity"])
+        ),
+        "Background / RMS: {} / {}".format(
+            "--" if decision.get("background") is None
+            else "{:.4g}".format(decision["background"]),
+            "--" if decision.get("background_rms") is None
+            else "{:.4g}".format(decision["background_rms"]),
+        ),
+        "Masked / trail fraction: {} / {}".format(
+            "--" if decision.get("masked_pixel_fraction") is None
+            else "{:.1%}".format(decision["masked_pixel_fraction"]),
+            "--" if decision.get("trail_fraction") is None
+            else "{:.1%}".format(decision["trail_fraction"]),
+        ),
+    ]
+    metric_axis.text(
+        0.02, 0.98, "\n".join(metric_lines), va="top", ha="left",
+        family="monospace", fontsize=10,
+    )
+
+    decision_axis = axes[1, 2]
+    decision_axis.set_axis_off()
+    status = decision.get("status", "WARN")
+    status_color = {"PASS": "tab:green", "WARN": "darkorange", "FAIL": "tab:red"}.get(
+        status, "0.4"
+    )
+    decision_axis.text(
+        0.02, 0.98, status, va="top", ha="left", fontsize=24,
+        fontweight="bold", color=status_color,
+    )
+    lines = [
+        "Automatic: {}".format(decision.get("automatic_status")),
+        "Review: {}".format(decision.get("review_state")),
+        "Use image: {}".format(decision.get("use_image")),
+        "Source: {}".format(decision.get("decision_source")),
+    ]
+    if decision.get("review_note"):
+        lines.append("Note: {}".format(decision["review_note"]))
+    lines.append("")
+    lines.extend(decision.get("reasons", []) or ["No warnings or failures"])
+    decision_axis.text(
+        0.02, 0.84, "\n".join(lines), va="top", ha="left",
+        fontsize=9, wrap=True,
+    )
+
+    filename = None if metadata is None else metadata.get("filename")
+    if filename is None:
+        filename = decision.get("filename")
+    title = "Image usability and limiting-depth review"
+    if filename:
+        title += " — {}".format(filename)
+    fig.suptitle(title, fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_astrometry_diagnostics",
     "plot_image_quality_diagnostics",
+    "plot_image_usability_diagnostics",
     "plot_star_selection_diagnostics",
 ]

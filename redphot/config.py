@@ -173,6 +173,8 @@ QUALITY_FLAGS = {
         "BACKGROUND_RMS_HIGH",
         "QUALITY_BATCH_OUTLIER",
         "UPSTREAM_QUALITY_MISMATCH",
+        "CATALOG_RECOVERY_LOW",
+        "QC_STAR_NOT_RECOVERED",
         "TRANSPARENCY_LOW",
         "TRANSPARENCY_NONUNIFORM",
         "ZEROPOINT_OUTLIER",
@@ -665,6 +667,43 @@ DEFAULT_SETTINGS = {
         "expected_target_magnitude": None,
         "reject_target_artifact_overlap": True,
         "allow_user_approval": True,
+        "usability": {
+            "enabled": True,
+            "minimum_calibration_stars_warn": 5,
+            "minimum_calibration_stars_fail": 2,
+            "minimum_catalog_recovery_warn": 0.40,
+            "minimum_catalog_recovery_fail": 0.15,
+            "require_qc_anchor": True,
+            "missing_qc_anchor_status": "WARN",
+            "zeropoint_sigma_clip": 3.0,
+            "zeropoint_maximum_iterations": 5,
+            "zeropoint_scatter_warn_mag": 0.10,
+            "zeropoint_scatter_fail_mag": 0.30,
+            "transparency_minimum_images": 2,
+            "transparency_attenuation_warn_mag": 0.50,
+            "transparency_attenuation_fail_mag": 1.50,
+            "cloud_minimum_stars": 8,
+            "cloud_spatial_grid": [3, 3],
+            "cloud_spatial_amplitude_warn_mag": 0.15,
+            "cloud_spatial_amplitude_fail_mag": 0.35,
+            "limiting_sigma_levels": [3.0, 5.0],
+            "limiting_aperture_radius_fwhm": 1.0,
+            "noise_correlation_factor": 1.0,
+            "minimum_limit_mag": None,
+            "expected_target_magnitude": None,
+            "target_depth_margin_warn_mag": 0.50,
+            "target_depth_margin_fail_mag": 0.0,
+            "local_depth_loss_warn_mag": 0.50,
+            "local_depth_loss_fail_mag": 1.50,
+            "target_artifact_radius_fwhm": 1.0,
+            "target_mask_status": "FAIL",
+            "target_trail_status": "FAIL",
+            "target_cosmic_ray_status": "WARN",
+            "require_manual_review": False,
+            "manual_decisions": {},
+            "save_star_residuals": True,
+            "save_decision_table": True,
+        },
     },
     "target_position": {
         "ra": None,
@@ -1370,6 +1409,89 @@ def validate_settings(settings):
             "image_quality target-background radii must be non-negative and "
             "outer must exceed inner"
         )
+
+    usability_settings = quality_settings.get("usability", {})
+    recovery_warn = float(
+        usability_settings.get("minimum_catalog_recovery_warn", 0.40)
+    )
+    recovery_fail = float(
+        usability_settings.get("minimum_catalog_recovery_fail", 0.15)
+    )
+    if not 0 <= recovery_fail <= recovery_warn <= 1:
+        raise ValueError(
+            "image_quality.usability catalog-recovery limits must satisfy "
+            "0 <= fail <= warn <= 1"
+        )
+    calibration_warn = int(
+        usability_settings.get("minimum_calibration_stars_warn", 5)
+    )
+    calibration_fail = int(
+        usability_settings.get("minimum_calibration_stars_fail", 2)
+    )
+    if calibration_fail < 0 or calibration_warn < calibration_fail:
+        raise ValueError(
+            "image_quality.usability calibration-star limits must satisfy "
+            "0 <= fail <= warn"
+        )
+    for name in (
+        "zeropoint_scatter",
+        "transparency_attenuation",
+        "cloud_spatial_amplitude",
+        "local_depth_loss",
+    ):
+        warn_value = usability_settings.get("{}_warn_mag".format(name))
+        fail_value = usability_settings.get("{}_fail_mag".format(name))
+        if (
+            warn_value is not None
+            and fail_value is not None
+            and float(warn_value) > float(fail_value)
+        ):
+            raise ValueError(
+                "image_quality.usability.{}_warn_mag cannot exceed the "
+                "corresponding fail value".format(name)
+            )
+    target_margin_warn = usability_settings.get(
+        "target_depth_margin_warn_mag"
+    )
+    target_margin_fail = usability_settings.get(
+        "target_depth_margin_fail_mag"
+    )
+    if (
+        target_margin_warn is not None
+        and target_margin_fail is not None
+        and float(target_margin_fail) > float(target_margin_warn)
+    ):
+        raise ValueError(
+            "image_quality.usability target-depth fail margin cannot exceed "
+            "the warn margin"
+        )
+    sigma_levels = usability_settings.get("limiting_sigma_levels", [3.0, 5.0])
+    if not sigma_levels or any(float(value) <= 0 for value in sigma_levels):
+        raise ValueError(
+            "image_quality.usability.limiting_sigma_levels must be positive"
+        )
+    cloud_grid = usability_settings.get("cloud_spatial_grid", [3, 3])
+    if len(cloud_grid) != 2 or any(int(value) <= 0 for value in cloud_grid):
+        raise ValueError(
+            "image_quality.usability.cloud_spatial_grid must contain two "
+            "positive integers"
+        )
+    if float(usability_settings.get("noise_correlation_factor", 1.0)) <= 0:
+        raise ValueError(
+            "image_quality.usability.noise_correlation_factor must be positive"
+        )
+    for name in (
+        "missing_qc_anchor_status",
+        "target_mask_status",
+        "target_trail_status",
+        "target_cosmic_ray_status",
+    ):
+        if usability_settings.get(name, "WARN") not in {"PASS", "WARN", "FAIL"}:
+            raise ValueError(
+                "image_quality.usability.{} must be PASS, WARN, or FAIL".format(
+                    name
+                )
+            )
 
     subtraction_method = settings["subtraction"]["method"]
     if subtraction_method not in {"hotpants", "pyzogy"}:
