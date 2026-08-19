@@ -16,6 +16,7 @@ setup(
         'numpy',
         'matplotlib',
         'astropy',
+        'astroquery',
         'photutils',
         'scipy',
         'scikit-image',

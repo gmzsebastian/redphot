@@ -501,7 +501,267 @@ def plot_image_quality_diagnostics(
     return fig
 
 
+def plot_astrometry_diagnostics(
+    ccd,
+    catalog,
+    matches,
+    info,
+    metadata=None,
+    output_path=None,
+    show=False,
+):
+    """Plot catalog overlays and WCS residual diagnostics for Step 10.
+
+    Panels show the projected catalog, matched-source residual vectors,
+    original and final RA/Dec residuals, radial residual distributions,
+    residuals across the detector, and a compact refinement summary.
+    """
+
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(getattr(ccd, "data", ccd), dtype=float)
+    fig, axes = plt.subplots(2, 3, figsize=(17, 10), constrained_layout=True)
+
+    overlay = axes[0, 0]
+    low, high = _image_limits(data, lower=1.0, upper=99.5)
+    overlay.imshow(
+        data,
+        origin="lower",
+        cmap="gray",
+        vmin=low,
+        vmax=high,
+        interpolation="nearest",
+    )
+    overlay.set_title("Catalog overlay")
+    if len(catalog) and "in_image" in catalog.colnames:
+        inside = np.asarray(catalog["in_image"], dtype=bool)
+        overlay.scatter(
+            np.asarray(catalog["x"], dtype=float)[inside],
+            np.asarray(catalog["y"], dtype=float)[inside],
+            s=25,
+            facecolors="none",
+            edgecolors="cyan",
+            linewidths=0.7,
+            label="catalog",
+        )
+    if len(matches):
+        overlay.scatter(
+            np.asarray(matches["x"], dtype=float),
+            np.asarray(matches["y"], dtype=float),
+            marker="+",
+            s=28,
+            color="lime",
+            linewidths=0.8,
+            label="matched detections",
+        )
+    if len(catalog) or len(matches):
+        overlay.legend(loc="upper right", fontsize=8)
+    overlay.set_xlabel("x [pixel]")
+    overlay.set_ylabel("y [pixel]")
+
+    vector_axis = axes[0, 1]
+    vector_axis.imshow(
+        data,
+        origin="lower",
+        cmap="gray",
+        vmin=low,
+        vmax=high,
+        interpolation="nearest",
+    )
+    vector_axis.set_title("Original WCS residual vectors (×20)")
+    if len(matches):
+        x = np.asarray(matches["x"], dtype=float)
+        y = np.asarray(matches["y"], dtype=float)
+        dx = np.asarray(matches["catalog_x_original"], dtype=float) - x
+        dy = np.asarray(matches["catalog_y_original"], dtype=float) - y
+        vector_axis.quiver(
+            x,
+            y,
+            dx,
+            dy,
+            color="yellow",
+            angles="xy",
+            scale_units="xy",
+            scale=0.05,
+            width=0.0025,
+        )
+    vector_axis.set_xlabel("x [pixel]")
+    vector_axis.set_ylabel("y [pixel]")
+
+    residual_axis = axes[0, 2]
+    residual_axis.set_title("Sky residuals")
+    if len(matches):
+        original_ra = np.asarray(
+            matches["residual_ra_original_arcsec"], dtype=float
+        )
+        original_dec = np.asarray(
+            matches["residual_dec_original_arcsec"], dtype=float
+        )
+        residual_axis.scatter(
+            original_ra,
+            original_dec,
+            s=22,
+            color="0.6",
+            alpha=0.7,
+            label="original",
+        )
+        if "residual_ra_final_arcsec" in matches.colnames:
+            final_ra = np.asarray(matches["residual_ra_final_arcsec"], dtype=float)
+            final_dec = np.asarray(matches["residual_dec_final_arcsec"], dtype=float)
+            inlier = np.asarray(matches["inlier"], dtype=bool)
+            residual_axis.scatter(
+                final_ra[inlier],
+                final_dec[inlier],
+                s=24,
+                color="tab:blue",
+                alpha=0.8,
+                label="final inliers",
+            )
+            if np.any(~inlier):
+                residual_axis.scatter(
+                    final_ra[~inlier],
+                    final_dec[~inlier],
+                    marker="x",
+                    s=30,
+                    color="red",
+                    label="rejected",
+                )
+        residual_axis.legend(loc="best", fontsize=8)
+    residual_axis.axhline(0, color="0.3", linewidth=0.7)
+    residual_axis.axvline(0, color="0.3", linewidth=0.7)
+    residual_axis.set_xlabel("RA residual [arcsec]")
+    residual_axis.set_ylabel("Dec residual [arcsec]")
+    residual_axis.grid(alpha=0.2)
+
+    histogram_axis = axes[1, 0]
+    histogram_axis.set_title("Radial residual distribution")
+    if len(matches):
+        original = np.asarray(
+            matches["separation_original_arcsec"], dtype=float
+        )
+        histogram_axis.hist(
+            original[np.isfinite(original)],
+            bins="auto",
+            histtype="step",
+            linewidth=1.5,
+            color="0.4",
+            label="original",
+        )
+        if "separation_final_arcsec" in matches.colnames:
+            final = np.asarray(matches["separation_final_arcsec"], dtype=float)
+            inlier = np.asarray(matches["inlier"], dtype=bool)
+            histogram_axis.hist(
+                final[inlier & np.isfinite(final)],
+                bins="auto",
+                alpha=0.65,
+                color="tab:blue",
+                label="final inliers",
+            )
+        histogram_axis.legend(loc="best", fontsize=8)
+    histogram_axis.set_xlabel("radial residual [arcsec]")
+    histogram_axis.set_ylabel("match count")
+    histogram_axis.grid(alpha=0.2)
+
+    field_axis = axes[1, 1]
+    field_axis.set_title("Final residual across detector")
+    if len(matches) and "separation_final_arcsec" in matches.colnames:
+        x = np.asarray(matches["x"], dtype=float)
+        radial = np.asarray(matches["separation_final_arcsec"], dtype=float)
+        inlier = np.asarray(matches["inlier"], dtype=bool)
+        field_axis.scatter(
+            x[inlier],
+            radial[inlier],
+            s=22,
+            color="tab:blue",
+            alpha=0.8,
+            label="inlier",
+        )
+        if np.any(~inlier):
+            field_axis.scatter(
+                x[~inlier],
+                radial[~inlier],
+                marker="x",
+                s=30,
+                color="red",
+                label="rejected",
+            )
+        field_axis.legend(loc="best", fontsize=8)
+    field_axis.set_xlabel("x [pixel]")
+    field_axis.set_ylabel("radial residual [arcsec]")
+    field_axis.grid(alpha=0.2)
+
+    summary_axis = axes[1, 2]
+    summary_axis.set_axis_off()
+
+    def formatted(value, format_string):
+        return "--" if value is None else format_string.format(value)
+
+    target_original = info.get("target_original") or {}
+    target_refined = info.get("target_refined") or {}
+    summary = [
+        "Status: {}".format(info.get("quality_status", "--")),
+        "Catalog: {}".format(info.get("catalog_name", "--")),
+        "Catalog rows: {} (image: {})".format(
+            info.get("catalog_row_count", "--"),
+            info.get("catalog_in_image_count", "--"),
+        ),
+        "Matches: {} (inliers: {}, rejected: {})".format(
+            info.get("match_count", 0),
+            info.get("inlier_count", 0),
+            info.get("rejected_match_count", 0),
+        ),
+        "Original RMS: {} arcsec".format(
+            formatted(info.get("original_rms_arcsec"), "{:.3f}")
+        ),
+        "Final RMS: {} arcsec".format(
+            formatted(info.get("refined_rms_arcsec"), "{:.3f}")
+        ),
+        "Refinement adopted: {}".format(info.get("refinement_adopted", False)),
+        "Reason: {}".format(info.get("refinement_reason", "--")),
+        "Translation: {} pixel".format(
+            formatted(info.get("translation_pixels"), "{:.3f}")
+        ),
+        "Rotation: {} deg".format(
+            formatted(info.get("rotation_degrees"), "{:.4f}")
+        ),
+        "Scale change: {}".format(
+            formatted(info.get("scale_change_fraction"), "{:.3%}")
+        ),
+        "Target round trip (original): {} arcsec".format(
+            formatted(target_original.get("round_trip_error_arcsec"), "{:.3g}")
+        ),
+        "Target round trip (final): {} arcsec".format(
+            formatted(target_refined.get("round_trip_error_arcsec"), "{:.3g}")
+        ),
+        "Flags: {}".format(", ".join(info.get("flags", [])) or "none"),
+    ]
+    summary_axis.text(
+        0.02,
+        0.98,
+        "\n".join(summary),
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=10,
+    )
+
+    filename = None if metadata is None else metadata.get("filename")
+    title = "Catalog matching and WCS refinement"
+    if filename:
+        title += " — {}".format(filename)
+    fig.suptitle(title, fontsize=15)
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
+    "plot_astrometry_diagnostics",
     "plot_image_quality_diagnostics",
 ]

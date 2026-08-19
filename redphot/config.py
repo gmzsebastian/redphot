@@ -497,6 +497,7 @@ DEFAULT_SETTINGS = {
         "refine_wcs": True,
         "minimum_matches": 6,
         "maximum_match_separation_arcsec": 5.0,
+        "require_unique_matches": True,
         "target_rms_arcsec": 0.5,
         "warning_rms_arcsec": 1.0,
         "fit_translation": True,
@@ -505,16 +506,39 @@ DEFAULT_SETTINGS = {
         "fit_distortion": False,
         "sigma_clip": 4.0,
         "maximum_iterations": 3,
+        "minimum_improvement_fraction": 0.05,
+        "maximum_translation_pixels": 50.0,
+        "maximum_rotation_degrees": 10.0,
+        "maximum_scale_change_fraction": 0.10,
+        "reject_unsafe_solution": True,
         "plate_solve_fallback": False,
+        "plate_solver_command": "solve-field",
+        "plate_solver_timeout_seconds": 300,
+        "plate_solver_search_radius_degrees": 2.0,
+        "plate_solver_scale_tolerance_fraction": 0.20,
         "reproject_science_image": False,
         "save_refined_header": True,
+        "save_match_table": True,
     },
     "catalogs": {
         "cache_enabled": True,
         "cache_directory": "catalogs",
         "force_new_query": False,
+        "save_catalog": True,
+        "cache_format": "ecsv",
+        "query_service": "vizier",
+        "query_timeout_seconds": 120,
+        "row_limit": -1,
+        "use_object_name": True,
         "search_radius_arcmin": 10.0,
         "astrometry_catalog": "gaia",
+        "catalog_ids": {
+            "gaia": "I/355/gaiadr3",
+            "ps1": "II/349/ps1",
+            "sdss": "V/154/sdss16",
+            "apass": "II/336/apass9",
+            "skymapper": "II/379/smssdr4",
+        },
         "photometry_catalog": "auto",
         "photometry_catalog_by_filter": {
             "u": "sdss",
@@ -529,6 +553,7 @@ DEFAULT_SETTINGS = {
             "I": "apass",
         },
         "local_catalog_path": None,
+        "user_column_map": {},
         "propagate_gaia_proper_motion": True,
         "comparison_stars": {
             "minimum_catalog_stars": 3,
@@ -1229,6 +1254,36 @@ def validate_settings(settings):
         raise ValueError(
             "source_detection.deblend_contrast must be between 0 and 1"
         )
+
+    astrometry_settings = settings["astrometry"]
+    if int(astrometry_settings.get("minimum_matches", 6)) < 3:
+        raise ValueError("astrometry.minimum_matches must be at least 3")
+    if float(
+        astrometry_settings.get("maximum_match_separation_arcsec", 5.0)
+    ) <= 0:
+        raise ValueError(
+            "astrometry.maximum_match_separation_arcsec must be positive"
+        )
+    if astrometry_settings.get("fit_distortion", False):
+        raise ValueError(
+            "astrometry.fit_distortion is not supported; Step 10 intentionally "
+            "fits only translation, rotation, and scale"
+        )
+    if float(astrometry_settings.get("plate_solver_timeout_seconds", 300)) <= 0:
+        raise ValueError("astrometry.plate_solver_timeout_seconds must be positive")
+    plate_scale_tolerance = float(
+        astrometry_settings.get("plate_solver_scale_tolerance_fraction", 0.20)
+    )
+    if not 0 <= plate_scale_tolerance < 1:
+        raise ValueError(
+            "astrometry.plate_solver_scale_tolerance_fraction must be in [0, 1)"
+        )
+
+    catalog_settings = settings["catalogs"]
+    if float(catalog_settings.get("search_radius_arcmin", 10.0)) <= 0:
+        raise ValueError("catalogs.search_radius_arcmin must be positive")
+    if catalog_settings.get("cache_format", "ecsv") not in {"ecsv", "fits"}:
+        raise ValueError("catalogs.cache_format must be 'ecsv' or 'fits'")
 
     quality_settings = settings["image_quality"]
     threshold_pairs = (
