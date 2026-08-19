@@ -181,6 +181,7 @@ QUALITY_FLAGS = {
     ],
     "photometry": [
         "TOO_FEW_PSF_STARS",
+        "TOO_FEW_CALIBRATION_STARS",
         "PSF_MODEL_FAILED",
         "PSF_RESIDUAL_HIGH",
         "TARGET_MASKED",
@@ -560,19 +561,50 @@ DEFAULT_SETTINGS = {
             "maximum_catalog_stars": 300,
             "minimum_magnitude": 10.0,
             "maximum_magnitude": 22.0,
+            "maximum_magnitude_error": 0.10,
+            "allow_missing_magnitude_error": True,
             "minimum_snr": 10.0,
             "minimum_edge_distance_fwhm": 5.0,
             "minimum_saturation_distance_fwhm": 8.0,
+            "minimum_mask_distance_fwhm": 2.0,
+            "minimum_trail_distance_fwhm": 5.0,
             "minimum_neighbor_distance_fwhm": 3.0,
+            "minimum_catalog_separation_arcsec": 2.0,
             "maximum_ellipticity": 0.35,
+            "maximum_fwhm_deviation_fraction": 0.50,
+            "maximum_proper_motion_mas_per_year": 200.0,
+            "maximum_ruwe": 1.4,
             "require_point_source": True,
+            "allow_unknown_morphology": True,
             "reject_known_variables": True,
             "require_catalog_quality": True,
+            "allow_unknown_catalog_quality": True,
+            "color_bands": ["g", "r"],
+            "minimum_color": -0.5,
+            "maximum_color": 2.5,
+            "require_color": False,
             "prefer_target_color": False,
             "maximum_color_difference": None,
+            "persistent_match_arcsec": 0.5,
             "check_batch_stability": True,
             "maximum_batch_rms_mag": 0.05,
             "minimum_epoch_fraction": 0.50,
+            "psf_minimum_snr": 30.0,
+            "psf_maximum_ellipticity": 0.25,
+            "calibration_minimum_snr": 10.0,
+            "ensemble_minimum_snr": 15.0,
+            "qc_minimum_snr": 50.0,
+            "maximum_calibration_stars": 100,
+            "maximum_ensemble_stars": 50,
+            "maximum_qc_anchors": 1,
+            "spatial_grid": [3, 3],
+            "excluded_detector_regions": [],
+            "global_include": [],
+            "global_exclude": [],
+            "global_role_add": {},
+            "global_role_remove": {},
+            "image_overrides": {},
+            "user_include_overrides_safety": False,
         },
     },
     "image_quality": {
@@ -1266,7 +1298,7 @@ def validate_settings(settings):
         )
     if astrometry_settings.get("fit_distortion", False):
         raise ValueError(
-            "astrometry.fit_distortion is not supported; Step 10 intentionally "
+            "astrometry.fit_distortion is not supported; WCS refinement intentionally "
             "fits only translation, rotation, and scale"
         )
     if float(astrometry_settings.get("plate_solver_timeout_seconds", 300)) <= 0:
@@ -1284,6 +1316,24 @@ def validate_settings(settings):
         raise ValueError("catalogs.search_radius_arcmin must be positive")
     if catalog_settings.get("cache_format", "ecsv") not in {"ecsv", "fits"}:
         raise ValueError("catalogs.cache_format must be 'ecsv' or 'fits'")
+    star_settings = catalog_settings.get("comparison_stars", {})
+    minimum_magnitude = float(star_settings.get("minimum_magnitude", 10.0))
+    maximum_magnitude = float(star_settings.get("maximum_magnitude", 22.0))
+    if minimum_magnitude >= maximum_magnitude:
+        raise ValueError(
+            "catalogs.comparison_stars.minimum_magnitude must be below "
+            "maximum_magnitude"
+        )
+    spatial_grid = star_settings.get("spatial_grid", [3, 3])
+    if len(spatial_grid) != 2 or any(int(value) <= 0 for value in spatial_grid):
+        raise ValueError(
+            "catalogs.comparison_stars.spatial_grid must contain two positive integers"
+        )
+    color_bands = star_settings.get("color_bands", ["g", "r"])
+    if len(color_bands) != 2:
+        raise ValueError(
+            "catalogs.comparison_stars.color_bands must contain two filter names"
+        )
 
     quality_settings = settings["image_quality"]
     threshold_pairs = (

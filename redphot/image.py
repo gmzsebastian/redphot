@@ -3848,7 +3848,7 @@ def _robust_location_scatter(values):
 
 
 def _empty_source_table():
-    """Return an empty source table with the standard Step 9 columns."""
+    """Return an empty source table with the standard detection columns."""
 
     table = Table(masked=True)
     columns = (
@@ -4142,7 +4142,8 @@ def detect_sources_and_measure_quality(
     Parameters
     ----------
     ccd : astropy.nddata.CCDData
-        Prepared image, normally the working derivative returned by Step 8.
+        Prepared image, normally the working derivative returned by the
+        background-modeling stage.
     metadata : mapping, optional
         Normalized metadata from :func:`read_fits_image`.
     settings : mapping, optional
@@ -4614,7 +4615,7 @@ def _batch_metric_reference(results, metric):
 
 
 def assess_image_quality_batch(results, settings=None):
-    """Apply deviations from batch medians to Step 9 quality results.
+    """Apply deviations from batch medians to image-quality results.
 
     The input dictionaries are not modified.  Relative checks are skipped
     until ``image_quality.batch_minimum_images`` valid measurements exist for

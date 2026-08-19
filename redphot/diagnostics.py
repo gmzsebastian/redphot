@@ -230,7 +230,7 @@ def plot_image_quality_diagnostics(
     output_path=None,
     show=False,
 ):
-    """Plot source detections and Step 9 image-quality measurements.
+    """Plot source detections and image-quality measurements.
 
     The six panels show the source overlay, deblended segmentation image,
     FWHM--ellipticity relation, FWHM distribution, source orientations, and a
@@ -510,7 +510,7 @@ def plot_astrometry_diagnostics(
     output_path=None,
     show=False,
 ):
-    """Plot catalog overlays and WCS residual diagnostics for Step 10.
+    """Plot catalog overlays and WCS residual diagnostics.
 
     Panels show the projected catalog, matched-source residual vectors,
     original and final RA/Dec residuals, radial residual distributions,
@@ -760,8 +760,192 @@ def plot_astrometry_diagnostics(
     return fig
 
 
+def plot_star_selection_diagnostics(
+    ccd,
+    measurements,
+    image_id,
+    summary=None,
+    metadata=None,
+    output_path=None,
+    show=False,
+):
+    """Plot accepted, rejected, and role-assigned stars for one image.
+
+    Rejected candidates remain visible with their reason categories, while
+    independent plotting symbols show astrometry, PSF, calibration, ensemble,
+    and bright quality-control roles.
+    """
+
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(getattr(ccd, "data", ccd), dtype=float)
+    rows = measurements[np.asarray(measurements["image_id"] == str(image_id))]
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12), constrained_layout=True)
+    low, high = _image_limits(data, lower=1.0, upper=99.5)
+
+    overlay = axes[0, 0]
+    overlay.imshow(
+        data,
+        origin="lower",
+        cmap="gray",
+        vmin=low,
+        vmax=high,
+        interpolation="nearest",
+    )
+    overlay.set_title("Accepted and rejected candidates")
+    if len(rows):
+        x = np.asarray(rows["x"], dtype=float)
+        y = np.asarray(rows["y"], dtype=float)
+        accepted = np.asarray(rows["image_accepted"], dtype=bool)
+        if np.any(~accepted):
+            overlay.scatter(
+                x[~accepted],
+                y[~accepted],
+                marker="x",
+                s=38,
+                color="red",
+                linewidths=0.9,
+                label="rejected",
+            )
+        if np.any(accepted):
+            overlay.scatter(
+                x[accepted],
+                y[accepted],
+                s=34,
+                facecolors="none",
+                edgecolors="lime",
+                linewidths=0.9,
+                label="accepted",
+            )
+        overlay.legend(loc="upper right", fontsize=8)
+    overlay.set_xlabel("x [pixel]")
+    overlay.set_ylabel("y [pixel]")
+
+    role_axis = axes[0, 1]
+    role_axis.imshow(
+        data,
+        origin="lower",
+        cmap="gray",
+        vmin=low,
+        vmax=high,
+        interpolation="nearest",
+    )
+    role_axis.set_title("Independent star roles")
+    role_styles = {
+        "astrometry": ("o", "cyan"),
+        "psf": ("s", "yellow"),
+        "calibration": ("^", "lime"),
+        "ensemble": ("D", "magenta"),
+        "qc_anchor": ("*", "orange"),
+    }
+    if len(rows):
+        x = np.asarray(rows["x"], dtype=float)
+        y = np.asarray(rows["y"], dtype=float)
+        for role, (marker, color) in role_styles.items():
+            selected = np.asarray(rows["role_{}".format(role)], dtype=bool)
+            if not np.any(selected):
+                continue
+            role_axis.scatter(
+                x[selected],
+                y[selected],
+                marker=marker,
+                s=48 if role != "qc_anchor" else 90,
+                facecolors="none" if role != "qc_anchor" else color,
+                edgecolors=color,
+                linewidths=1.0,
+                label=role.replace("_", " "),
+            )
+        role_axis.legend(loc="upper right", fontsize=8)
+    role_axis.set_xlabel("x [pixel]")
+    role_axis.set_ylabel("y [pixel]")
+
+    reason_axis = axes[1, 0]
+    reason_axis.set_title("Rejection reasons")
+    reason_counts = {}
+    for value in rows["rejection_reasons"] if len(rows) else []:
+        for reason in str(value).split(";"):
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    if reason_counts:
+        ordered = sorted(reason_counts, key=reason_counts.get)
+        reason_axis.barh(
+            ordered,
+            [reason_counts[reason] for reason in ordered],
+            color="tab:red",
+            alpha=0.8,
+        )
+    else:
+        reason_axis.text(
+            0.5, 0.5, "No rejected candidates", ha="center", va="center"
+        )
+    reason_axis.set_xlabel("candidate count")
+    reason_axis.grid(axis="x", alpha=0.2)
+
+    summary_axis = axes[1, 1]
+    summary_axis.set_axis_off()
+    if summary is None:
+        summary = {}
+    role_counts = summary.get("role_counts", {})
+    lines = [
+        "Image: {}".format(image_id),
+        "Candidates: {}".format(summary.get("candidate_count", len(rows))),
+        "Strictly accepted: {}".format(
+            summary.get(
+                "strictly_accepted_count",
+                int(np.count_nonzero(rows["image_accepted"])) if len(rows) else 0,
+            )
+        ),
+        "Rejected: {}".format(
+            summary.get(
+                "rejected_count",
+                int(np.count_nonzero(~rows["image_accepted"])) if len(rows) else 0,
+            )
+        ),
+        "",
+        "Role counts:",
+    ]
+    for role in role_styles:
+        count = role_counts.get(
+            role,
+            int(np.count_nonzero(rows["role_{}".format(role)])) if len(rows) else 0,
+        )
+        lines.append("  {:12s} {}".format(role, count))
+    lines.extend(
+        [
+            "",
+            "Selection flags: {}".format(
+                ", ".join(summary.get("flags", [])) or "none"
+            ),
+            "Image rejected: {}".format(summary.get("image_rejected", False)),
+        ]
+    )
+    summary_axis.text(
+        0.02,
+        0.98,
+        "\n".join(lines),
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=11,
+    )
+
+    filename = None if metadata is None else metadata.get("filename")
+    title = "Comparison and PSF star selection"
+    if filename:
+        title += " — {}".format(filename)
+    fig.suptitle(title, fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_astrometry_diagnostics",
     "plot_image_quality_diagnostics",
+    "plot_star_selection_diagnostics",
 ]
