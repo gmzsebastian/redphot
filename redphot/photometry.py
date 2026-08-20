@@ -23,7 +23,8 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy import ndimage
 from scipy.optimize import least_squares
 
-from .config import get_default_settings, merge_settings
+from .catalogs import normalize_catalog_name
+from .config import get_default_settings, merge_settings, normalize_filter_name
 
 
 PSF_DOWNSTREAM_STAGES = (
@@ -1586,7 +1587,8 @@ def _measurement_table(rows, flux_unit):
     )
     boolean_fields = ("fixed_position", "valid")
     numeric_fields = (
-        "mjd_mid", "x", "y", "ra_deg", "dec_deg", "flux", "flux_uncertainty",
+        "mjd_mid", "exposure_time", "airmass", "x", "y", "ra_deg", "dec_deg",
+        "flux", "flux_uncertainty",
         "snr", "local_background", "local_background_rms", "local_background_error",
         "local_background_pixels", "aperture_radius_pixels", "sky_inner_radius_pixels",
         "sky_outer_radius_pixels", "coverage_fraction", "unmasked_weight",
@@ -1608,6 +1610,7 @@ def _measurement_table(rows, flux_unit):
         table[name].unit = u.pixel
     for name in ("ra_deg", "dec_deg"):
         table[name].unit = u.deg
+    table["exposure_time"].unit = u.s
     table["centroid_offset_arcsec"].unit = u.arcsec
     for name in ("flux", "flux_uncertainty", "local_background", "local_background_rms", "local_background_error", "free_centroid_flux"):
         table[name].unit = flux_unit
@@ -1741,6 +1744,8 @@ def perform_science_image_photometry(
                     "filename": metadata.get("filename", image_id),
                     "filter": metadata.get("filter", ""),
                     "mjd_mid": metadata.get("mjd_mid", metadata.get("mjd")),
+                    "exposure_time": metadata.get("exposure_time"),
+                    "airmass": metadata.get("airmass"),
                     "source_id": source["source_id"],
                     "source_type": source["source_type"],
                     "roles": source["roles"],
@@ -1916,9 +1921,1159 @@ def save_science_photometry_products(
     return paths
 
 
+def route_calibration_catalog(filter_name, settings=None, available_catalogs=None):
+    """Return the configured photometric catalog for a normalized filter."""
+
+    if settings is None:
+        settings = get_default_settings()
+    band = normalize_filter_name(filter_name)
+    calibration = settings.get("calibration", {})
+    configured = calibration.get("catalog", "auto")
+    if configured in (None, "auto"):
+        configured = settings.get("catalogs", {}).get(
+            "photometry_catalog_by_filter", {}
+        ).get(band)
+        if configured is None:
+            configured = settings.get("catalogs", {}).get("photometry_catalog")
+    routed = normalize_catalog_name(configured)
+    available = [normalize_catalog_name(value) for value in (available_catalogs or [])]
+    if routed in (None, "auto") and available:
+        routed = "user" if "user" in available else available[0]
+    return routed, band
+
+
+def _catalog_collection(catalogs):
+    """Normalize one table or a mapping of tables into catalog-name groups."""
+
+    if catalogs is None:
+        return {}
+    if isinstance(catalogs, Mapping):
+        return {
+            normalize_catalog_name(name) or "user": Table(table, masked=True, copy=False)
+            for name, table in catalogs.items()
+        }
+    table = Table(catalogs, masked=True, copy=False)
+    if "catalog_name" in table.colnames:
+        names = list(dict.fromkeys(str(value) for value in table["catalog_name"]))
+        return {
+            normalize_catalog_name(name) or "user": table[
+                np.asarray(table["catalog_name"], dtype=str) == name
+            ]
+            for name in names
+        }
+    name = normalize_catalog_name(table.meta.get("catalog_name")) or "user"
+    return {name: table}
+
+
+def _catalog_identifier_column(table):
+    """Return the source identifier column in a normalized or master catalog."""
+
+    for name in ("persistent_id", "source_id"):
+        if name in table.colnames:
+            return name
+    return None
+
+
+def _catalog_band_column(filter_name, catalog_name, settings):
+    """Return the configured normalized magnitude column for one filter."""
+
+    mapping = settings.get("calibration", {}).get("filter_column_map", {})
+    value = mapping.get(filter_name)
+    if isinstance(value, Mapping):
+        value = value.get(catalog_name) or value.get("default")
+    if value is None:
+        value = "mag_{}".format(filter_name)
+    value = str(value)
+    return value if value.startswith("mag_") else "mag_{}".format(value)
+
+
+def _catalog_value(table, column, index):
+    """Read one finite catalog number, returning ``None`` when masked."""
+
+    if column not in table.colnames:
+        return None
+    return _finite_float(table[column][index])
+
+
+def _catalog_entry(catalogs, source_id, routed_catalog, band, settings):
+    """Look up one source's routed magnitude, uncertainty, and color."""
+
+    calibration = settings.get("calibration", {})
+    names = []
+    if routed_catalog is not None:
+        names.append(routed_catalog)
+    if calibration.get("allow_catalog_fallback", True):
+        names.extend(name for name in catalogs if name not in names)
+    for name in names:
+        table = catalogs.get(name)
+        if table is None:
+            continue
+        identifier = _catalog_identifier_column(table)
+        if identifier is None:
+            continue
+        identifiers = np.asarray(table[identifier], dtype=str)
+        match = np.flatnonzero(identifiers == str(source_id))
+        if match.size == 0 and ":" in str(source_id):
+            match = np.flatnonzero(identifiers == str(source_id).split(":", 1)[1])
+        if match.size == 0:
+            continue
+        index = int(match[0])
+        magnitude_column = _catalog_band_column(band, name, settings)
+        magnitude = _catalog_value(table, magnitude_column, index)
+        if magnitude is None:
+            continue
+        error_column = magnitude_column.replace("mag_", "magerr_", 1)
+        magnitude_error = _catalog_value(table, error_column, index)
+        color = _catalog_value(table, "catalog_color", index)
+        if color is None:
+            color_bands = settings.get("catalogs", {}).get(
+                "comparison_stars", {}
+            ).get("color_bands", ["g", "r"])
+            first = _catalog_value(table, "mag_{}".format(color_bands[0]), index)
+            second = _catalog_value(table, "mag_{}".format(color_bands[1]), index)
+            color = None if first is None or second is None else first - second
+        system = calibration.get("magnitude_system_by_catalog", {}).get(name)
+        return {
+            "catalog_name": name,
+            "routed_catalog": routed_catalog,
+            "magnitude_band": magnitude_column.replace("mag_", "", 1),
+            "magnitude_system": system,
+            "catalog_magnitude": magnitude,
+            "catalog_magnitude_error": magnitude_error,
+            "catalog_color": color,
+            "catalog_fallback": name != routed_catalog,
+        }
+    return None
+
+
+def _science_row_value(row, name, default=None):
+    """Return one optional unmasked science-table value."""
+
+    if name not in row.colnames or np.ma.is_masked(row[name]):
+        return default
+    value = row[name]
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _instrumental_magnitude(flux, uncertainty, exposure):
+    """Return a rate-based instrumental magnitude and uncertainty."""
+
+    flux = _finite_float(flux)
+    uncertainty = _finite_float(uncertainty)
+    exposure = _finite_float(exposure)
+    if flux is None or flux <= 0 or exposure is None or exposure <= 0:
+        return None, None
+    magnitude = -2.5 * np.log10(flux / exposure)
+    error = (
+        2.5 / np.log(10.0) * uncertainty / flux
+        if uncertainty is not None and uncertainty >= 0
+        else None
+    )
+    return float(magnitude), None if error is None else float(error)
+
+
+def _calibration_records(measurements, catalogs, settings):
+    """Build calibration-star records from valid role assignments and catalog data."""
+
+    calibration = settings.get("calibration", {})
+    excluded_flags = set(calibration.get("excluded_measurement_flags", []))
+    records = []
+    available = list(catalogs)
+    for index, row in enumerate(measurements):
+        roles = str(_science_row_value(row, "roles", ""))
+        if "calibration" not in roles.split(";"):
+            continue
+        image_id = str(row["image_id"])
+        method = str(row["method"])
+        filter_name = normalize_filter_name(_science_row_value(row, "filter"))
+        routed, band = route_calibration_catalog(filter_name, settings, available)
+        source_id = str(row["source_id"])
+        entry = _catalog_entry(catalogs, source_id, routed, band, settings)
+        reasons = []
+        flux = _finite_float(_science_row_value(row, "flux"))
+        flux_error = _finite_float(_science_row_value(row, "flux_uncertainty"))
+        exposure = _finite_float(_science_row_value(row, "exposure_time"))
+        snr = _finite_float(_science_row_value(row, "snr"))
+        if not bool(_science_row_value(row, "valid", False)):
+            reasons.append("MEASUREMENT_INVALID")
+        flags = set(filter(None, str(_science_row_value(row, "flags", "")).split(";")))
+        if flags & excluded_flags:
+            reasons.append("MEASUREMENT_FLAGGED")
+        if flux is None or flux <= 0 or flux_error is None or exposure in (None, 0):
+            reasons.append("FLUX_INVALID")
+        if snr is None or snr < float(calibration.get("minimum_star_snr", 10.0)):
+            reasons.append("SNR_LOW")
+        if entry is None:
+            reasons.append("CATALOG_MAGNITUDE_MISSING")
+        elif calibration.get("require_routed_catalog", False) and entry["catalog_fallback"]:
+            reasons.append("CATALOG_MISMATCH")
+        if entry is not None:
+            catalog_error = entry["catalog_magnitude_error"]
+            if catalog_error is None:
+                if not calibration.get("allow_missing_catalog_error", True):
+                    reasons.append("CATALOG_ERROR_MISSING")
+            elif catalog_error > float(
+                calibration.get("maximum_catalog_error_mag", 0.10)
+            ):
+                reasons.append("CATALOG_ERROR_HIGH")
+        instrumental, instrumental_error = _instrumental_magnitude(
+            flux, flux_error, exposure
+        )
+        if instrumental is None:
+            reasons.append("INSTRUMENTAL_MAGNITUDE_INVALID")
+        individual_zeropoint = (
+            None
+            if entry is None or instrumental is None
+            else entry["catalog_magnitude"] - instrumental
+        )
+        records.append(
+            {
+                "measurement_index": index,
+                "image_id": image_id,
+                "method": method,
+                "filter": band,
+                "source_id": source_id,
+                "routed_catalog": routed,
+                "catalog_name": None if entry is None else entry["catalog_name"],
+                "magnitude_band": None if entry is None else entry["magnitude_band"],
+                "magnitude_system": None if entry is None else entry["magnitude_system"],
+                "catalog_magnitude": None if entry is None else entry["catalog_magnitude"],
+                "catalog_magnitude_error": None if entry is None else entry["catalog_magnitude_error"],
+                "catalog_color": None if entry is None else entry["catalog_color"],
+                "flux": flux,
+                "flux_uncertainty": flux_error,
+                "snr": snr,
+                "x": _finite_float(_science_row_value(row, "x")),
+                "y": _finite_float(_science_row_value(row, "y")),
+                "airmass": _finite_float(_science_row_value(row, "airmass")),
+                "exposure_time": exposure,
+                "instrumental_magnitude": instrumental,
+                "instrumental_magnitude_uncertainty": instrumental_error,
+                "individual_zeropoint": individual_zeropoint,
+                "input_accepted": not reasons,
+                "inlier": False,
+                "unstable": False,
+                "zeropoint_residual": None,
+                "calibrated_residual": None,
+                "rejection_reason": ";".join(dict.fromkeys(reasons)),
+            }
+        )
+    return records
+
+
+def _robust_scatter(values):
+    """Return a finite MAD scatter with a standard-deviation fallback."""
+
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    median = float(np.median(values))
+    scatter = float(1.4826 * np.median(np.abs(values - median)))
+    if values.size > 1 and (not np.isfinite(scatter) or scatter == 0):
+        scatter = float(np.std(values, ddof=1))
+    return scatter if np.isfinite(scatter) else None
+
+
+def _solve_zeropoint_group(records, indices, unstable_pairs, settings):
+    """Solve one robust inverse-variance method-specific zeropoint."""
+
+    calibration = settings.get("calibration", {})
+    usable = []
+    for index in indices:
+        record = records[index]
+        if (record["source_id"], record["method"]) in unstable_pairs:
+            record["unstable"] = True
+            record["rejection_reason"] = ";".join(
+                filter(None, [record["rejection_reason"], "STAR_UNSTABLE"])
+            )
+            continue
+        if record["input_accepted"] and record["individual_zeropoint"] is not None:
+            usable.append(index)
+    usable.sort(key=lambda index: -(records[index]["snr"] or 0.0))
+    usable = usable[: int(calibration.get("maximum_stars", 100))]
+    inlier = np.ones(len(usable), dtype=bool)
+    sigma = float(calibration.get("sigma_clip", 3.0))
+    for _ in range(int(calibration.get("maximum_iterations", 5))):
+        active = [index for index, keep in zip(usable, inlier) if keep]
+        if not active:
+            break
+        values = np.asarray(
+            [records[index]["individual_zeropoint"] for index in active], dtype=float
+        )
+        center = float(np.median(values))
+        scatter = _robust_scatter(values)
+        errors = []
+        for index in active:
+            record = records[index]
+            errors.append(
+                np.hypot(
+                    record["instrumental_magnitude_uncertainty"] or 0.0,
+                    record["catalog_magnitude_error"] or 0.0,
+                )
+            )
+        scale = max(scatter or 0.0, float(np.median(errors)) if errors else 0.0, 1.0e-4)
+        new_inlier = np.array(
+            [
+                abs(records[index]["individual_zeropoint"] - center) <= sigma * scale
+                for index in usable
+            ],
+            dtype=bool,
+        )
+        if np.array_equal(new_inlier, inlier):
+            break
+        inlier = new_inlier
+    accepted = [index for index, keep in zip(usable, inlier) if keep]
+    minimum = int(calibration.get("minimum_stars", 3))
+    first = records[usable[0]] if usable else records[indices[0]]
+    solution = {
+        "image_id": first["image_id"],
+        "method": first["method"],
+        "filter": first["filter"],
+        "catalog_name": first["routed_catalog"],
+        "magnitude_band": first["magnitude_band"],
+        "magnitude_system": first["magnitude_system"],
+        "zeropoint_mag": None,
+        "zeropoint_uncertainty_mag": None,
+        "zeropoint_scatter_mag": None,
+        "star_count": len(accepted),
+        "rejected_star_count": len(indices) - len(accepted),
+        "status": "FAIL",
+        "flags": [],
+        "airmass": None,
+    }
+    if len(accepted) < minimum:
+        solution["flags"].append("TOO_FEW_CALIBRATION_STARS")
+        return solution
+    values = np.asarray(
+        [records[index]["individual_zeropoint"] for index in accepted], dtype=float
+    )
+    variances = []
+    for index in accepted:
+        record = records[index]
+        error = np.hypot(
+            record["instrumental_magnitude_uncertainty"] or 0.0,
+            record["catalog_magnitude_error"] or 0.0,
+        )
+        variances.append(max(error, 1.0e-4) ** 2)
+    weights = 1.0 / np.asarray(variances)
+    zeropoint = float(np.sum(weights * values) / np.sum(weights))
+    scatter = _robust_scatter(values)
+    formal = float(np.sqrt(1.0 / np.sum(weights)))
+    uncertainty = max(
+        formal,
+        0.0 if scatter is None else scatter / np.sqrt(len(values)),
+    )
+    solution.update(
+        {
+            "zeropoint_mag": zeropoint,
+            "zeropoint_uncertainty_mag": uncertainty,
+            "zeropoint_scatter_mag": scatter,
+            "status": "PASS",
+            "airmass": float(np.median([
+                records[index]["airmass"] for index in accepted
+                if records[index]["airmass"] is not None
+            ])) if any(records[index]["airmass"] is not None for index in accepted) else None,
+        }
+    )
+    warn = float(calibration.get("zeropoint_scatter_warn_mag", 0.10))
+    fail = float(calibration.get("zeropoint_scatter_fail_mag", 0.30))
+    if scatter is not None and scatter > fail:
+        solution["status"] = "FAIL"
+        solution["flags"].append("ZEROPOINT_SCATTER_HIGH")
+    elif scatter is not None and scatter > warn:
+        solution["status"] = "WARN"
+        solution["flags"].append("ZEROPOINT_SCATTER_HIGH")
+    for index in indices:
+        records[index]["inlier"] = index in accepted
+        individual = records[index]["individual_zeropoint"]
+        if records[index]["input_accepted"] and individual is not None:
+            residual = individual - zeropoint
+            records[index]["zeropoint_residual"] = residual
+            records[index]["calibrated_residual"] = -residual
+        if (
+            index not in accepted
+            and records[index]["input_accepted"]
+            and not records[index]["rejection_reason"]
+        ):
+            records[index]["rejection_reason"] = "ZEROPOINT_OUTLIER"
+    return solution
+
+
+def _solve_all_zeropoints(records, settings, unstable_pairs=None):
+    """Solve every image and method group, updating calibration-star records."""
+
+    unstable_pairs = unstable_pairs or set()
+    groups = {}
+    for index, record in enumerate(records):
+        key = (record["image_id"], record["method"])
+        groups.setdefault(key, []).append(index)
+    solutions = []
+    for key in sorted(groups):
+        solutions.append(
+            _solve_zeropoint_group(
+                records, groups[key], unstable_pairs, settings
+            )
+        )
+    return solutions
+
+
+def _unstable_calibration_stars(records, settings):
+    """Identify repeat stars whose zeropoint residuals vary across images."""
+
+    calibration = settings.get("calibration", {})
+    minimum = int(calibration.get("minimum_epochs_for_stability", 2))
+    maximum = float(calibration.get("maximum_star_rms_mag", 0.10))
+    grouped = {}
+    for record in records:
+        if record["input_accepted"] and record["zeropoint_residual"] is not None:
+            grouped.setdefault((record["source_id"], record["method"]), []).append(
+                record["zeropoint_residual"]
+            )
+    return {
+        key for key, values in grouped.items()
+        if len(values) >= minimum
+        and (_robust_scatter(values) or 0.0) > maximum
+    }
+
+
+def _aperture_corrections(measurements, settings):
+    """Calculate robust method-to-reference aperture corrections per image."""
+
+    calibration = settings.get("calibration", {})
+    reference = calibration.get("reference_aperture_method", "large_aperture")
+    minimum = int(calibration.get("minimum_aperture_correction_stars", 3))
+    rows = []
+    image_ids = list(dict.fromkeys(str(value) for value in measurements["image_id"]))
+    methods = list(dict.fromkeys(str(value) for value in measurements["method"]))
+    for image_id in image_ids:
+        image_rows = measurements[np.asarray(measurements["image_id"], dtype=str) == image_id]
+        by_source = {}
+        for row in image_rows:
+            if "calibration" not in str(row["roles"]).split(";"):
+                continue
+            magnitude, error = _instrumental_magnitude(
+                _science_row_value(row, "flux"),
+                _science_row_value(row, "flux_uncertainty"),
+                _science_row_value(row, "exposure_time"),
+            )
+            if magnitude is not None and bool(_science_row_value(row, "valid", False)):
+                by_source.setdefault(str(row["source_id"]), {})[str(row["method"])] = (
+                    magnitude, error
+                )
+        for method in methods:
+            differences = []
+            for values in by_source.values():
+                if reference in values and method in values:
+                    differences.append(values[reference][0] - values[method][0])
+            if method == reference:
+                differences = [0.0] * max(minimum, len(differences))
+            if differences:
+                clipped = sigma_clip(
+                    differences,
+                    sigma=float(calibration.get("aperture_correction_sigma_clip", 3.0)),
+                    maxiters=int(calibration.get("maximum_iterations", 5)),
+                    masked=True,
+                )
+                accepted = np.asarray(clipped.compressed(), dtype=float)
+            else:
+                accepted = np.array([], dtype=float)
+            correction = float(np.median(accepted)) if len(accepted) >= minimum else None
+            scatter = _robust_scatter(accepted)
+            rows.append(
+                {
+                    "image_id": image_id,
+                    "method": method,
+                    "reference_method": reference,
+                    "aperture_correction_mag": correction,
+                    "aperture_correction_uncertainty_mag": (
+                        None if scatter is None else scatter / np.sqrt(len(accepted))
+                    ),
+                    "scatter_mag": scatter,
+                    "star_count": len(accepted),
+                    "status": "PASS" if correction is not None else "FAIL",
+                    "flags": "" if correction is not None else "APERTURE_CORRECTION_FAILED",
+                }
+            )
+    return _records_table(rows)
+
+
+def _linear_trend(x, y):
+    """Return a centered linear slope and correlation for finite values."""
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    if len(x) < 3 or np.ptp(x) <= 0:
+        return None, None, len(x)
+    normalized = (x - np.min(x)) / np.ptp(x)
+    slope = float(np.polyfit(normalized, y, 1)[0])
+    correlation = (
+        0.0 if np.ptp(y) == 0
+        else float(np.corrcoef(normalized, y)[0, 1])
+    )
+    return slope, correlation, len(x)
+
+
+def _calibration_trends(records, settings):
+    """Measure residual trends against catalog, measurement, and detector variables."""
+
+    calibration = settings.get("calibration", {})
+    methods = sorted({record["method"] for record in records})
+    rows = []
+    variables = {
+        "magnitude": "catalog_magnitude",
+        "color": "catalog_color",
+        "snr": "snr",
+        "detector_x": "x",
+        "detector_y": "y",
+        "airmass": "airmass",
+    }
+    for method in methods:
+        selected = [record for record in records if record["method"] == method and record["inlier"]]
+        residuals = [record["calibrated_residual"] for record in selected]
+        for variable, key in variables.items():
+            slope, correlation, count = _linear_trend(
+                [np.nan if record[key] is None else record[key] for record in selected],
+                residuals,
+            )
+            warning = (
+                slope is not None
+                and abs(slope) > float(calibration.get("trend_slope_warn_mag", 0.05))
+            )
+            rows.append(
+                {
+                    "method": method,
+                    "variable": variable,
+                    "slope_mag_per_span": slope,
+                    "correlation": correlation,
+                    "point_count": count,
+                    "status": "WARN" if warning else "PASS",
+                }
+            )
+    return _records_table(rows)
+
+
+def _records_table(records):
+    """Convert scalar dictionaries with missing values into a masked table."""
+
+    if not records:
+        return Table(masked=True)
+    names = list(dict.fromkeys(name for record in records for name in record))
+    table = Table(masked=True)
+    for name in names:
+        values = [record.get(name) for record in records]
+        nonmissing = [value for value in values if value is not None]
+        if nonmissing and all(isinstance(value, (bool, np.bool_)) for value in nonmissing):
+            table[name] = MaskedColumn(
+                [False if value is None else bool(value) for value in values],
+                mask=[value is None for value in values],
+            )
+        elif nonmissing and all(
+            isinstance(value, (int, float, np.integer, np.floating))
+            and not isinstance(value, (bool, np.bool_))
+            for value in nonmissing
+        ):
+            numeric = np.asarray(
+                [np.nan if value is None else float(value) for value in values]
+            )
+            table[name] = MaskedColumn(
+                np.where(np.isfinite(numeric), numeric, 0.0),
+                mask=~np.isfinite(numeric),
+            )
+        else:
+            table[name] = MaskedColumn(
+                ["" if value is None else str(value) for value in values],
+                mask=[value is None for value in values],
+            )
+    return table
+
+
+def _add_numeric_columns(table, values_by_name):
+    """Add masked floating columns to an existing table copy."""
+
+    for name, values in values_by_name.items():
+        numeric = np.asarray(
+            [np.nan if value is None else float(value) for value in values], dtype=float
+        )
+        table[name] = MaskedColumn(
+            np.where(np.isfinite(numeric), numeric, 0.0),
+            mask=~np.isfinite(numeric),
+        )
+
+
+def _append_flag(value, flag):
+    """Append one semicolon-delimited flag without duplication."""
+
+    flags = list(filter(None, str(value or "").split(";")))
+    if flag and flag not in flags:
+        flags.append(flag)
+    return ";".join(flags)
+
+
+def _empty_source_mask(record, science_result, settings):
+    """Build a conservative source-exclusion mask for empty apertures."""
+
+    data = _prepared_data(record)
+    exclusion = np.zeros(data.shape, dtype=bool)
+    products = record.get("background_products") or {}
+    for name in ("detected_source_mask", "protected_source_mask"):
+        value = products.get(name)
+        if value is not None and np.shape(value) == data.shape:
+            exclusion |= np.asarray(value, dtype=bool)
+    if settings.get("upper_limits", {}).get("exclude_sources", True):
+        fwhm = float(science_result.get("fwhm_pixels") or 4.0)
+        radius = float(
+            settings.get("upper_limits", {}).get(
+                "empty_aperture_source_exclusion_fwhm", 3.0
+            )
+        ) * fwhm
+        table = science_result.get("measurements")
+        seen = set()
+        if table is not None:
+            for row in table:
+                key = (float(row["x"]), float(row["y"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                slices, weights = _radial_weights(
+                    data.shape, key[0], key[1], radius, 1, method="center"
+                )
+                exclusion[slices] |= weights > 0
+    return exclusion
+
+
+def _empty_aperture_noise(record, science_result, psf_result, method, settings):
+    """Measure empirical blank-sky flux scatter for one photometry method."""
+
+    limit_settings = settings.get("upper_limits", {})
+    data = _prepared_data(record)
+    standard_deviation, _ = _standard_deviation(record, data, settings)
+    variance = standard_deviation ** 2
+    masks = _measurement_masks(record, data.shape)
+    exclusion = _empty_source_mask(record, science_result, settings)
+    target = science_result.get("target_diagnostics") or {}
+    center_x = _finite_float(target.get("fixed_x"), data.shape[1] / 2.0)
+    center_y = _finite_float(target.get("fixed_y"), data.shape[0] / 2.0)
+    pixel_scale = _finite_float(science_result.get("pixel_scale_arcsec"))
+    local_arcsec = _finite_float(
+        limit_settings.get("empty_aperture_local_radius_arcsec")
+    )
+    local_pixels = (
+        local_arcsec / pixel_scale
+        if local_arcsec is not None and pixel_scale is not None and pixel_scale > 0
+        else max(data.shape)
+    )
+    fwhm = float(science_result.get("fwhm_pixels") or 4.0)
+    aperture_settings = settings.get("apertures", {})
+    method_radius = {
+        "small_aperture": float(aperture_settings.get("small_radius_fwhm", 1.0)) * fwhm,
+        "large_aperture": float(aperture_settings.get("large_radius_fwhm", 2.5)) * fwhm,
+        "psf": (
+            max(np.shape(psf_result.get("model_native"))) / 2.0
+            if psf_result.get("model_native") is not None else fwhm * 2.5
+        ),
+    }[method]
+    margin = max(
+        method_radius,
+        float(aperture_settings.get("sky_outer_radius_fwhm", 7.0)) * fwhm,
+    ) + 1.0
+    requested = int(limit_settings.get("number_empty_apertures", 100))
+    maximum_attempts = requested * int(
+        limit_settings.get("maximum_empty_aperture_attempts_factor", 30)
+    )
+    seed_text = "{}:{}:{}".format(
+        limit_settings.get("empty_aperture_random_seed", 12345),
+        science_result.get("image_id"),
+        method,
+    )
+    seed = int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+    fluxes = []
+    positions = []
+    x_low = max(margin, center_x - local_pixels)
+    x_high = min(data.shape[1] - margin, center_x + local_pixels)
+    y_low = max(margin, center_y - local_pixels)
+    y_high = min(data.shape[0] - margin, center_y + local_pixels)
+    if x_low >= x_high or y_low >= y_high:
+        return {
+            "noise": None,
+            "fluxes": np.array([], dtype=float),
+            "positions": np.empty((0, 2), dtype=float),
+            "accepted_count": 0,
+            "requested_count": requested,
+            "status": "FAIL",
+        }
+    for _ in range(maximum_attempts):
+        if len(fluxes) >= requested:
+            break
+        x = float(rng.uniform(x_low, x_high))
+        y = float(rng.uniform(y_low, y_high))
+        slices, weights = _radial_weights(
+            data.shape, x, y, method_radius, 1, method="center"
+        )
+        if weights.size == 0 or np.any(exclusion[slices] & (weights > 0)):
+            continue
+        if (
+            limit_settings.get("exclude_masked_regions", True)
+            and np.any(masks["combined"][slices] & (weights > 0))
+        ):
+            continue
+        background = _local_background(
+            data, standard_deviation, masks["combined"], x, y, fwhm, settings
+        )
+        source = {"x": x, "y": y, "source_type": "empty"}
+        if method == "psf":
+            measurement, _ = _psf_measurement(
+                data,
+                variance,
+                masks,
+                source,
+                background,
+                psf_result,
+                settings,
+                pixel_scale,
+            )
+        else:
+            measurement = _aperture_measurement(
+                data,
+                variance,
+                masks,
+                source,
+                method_radius,
+                background,
+                settings,
+                method,
+            )
+        flux = _finite_float(measurement.get("flux"))
+        if measurement.get("valid") and flux is not None:
+            fluxes.append(flux)
+            positions.append((x, y))
+    minimum = int(limit_settings.get("minimum_empty_apertures", 20))
+    noise = _robust_scatter(fluxes) if len(fluxes) >= minimum else None
+    return {
+        "noise": noise,
+        "fluxes": np.asarray(fluxes, dtype=float),
+        "positions": np.asarray(positions, dtype=float),
+        "accepted_count": len(fluxes),
+        "requested_count": requested,
+        "status": "PASS" if noise is not None and noise > 0 else "FAIL",
+    }
+
+
+def _magnitude_limit(zeropoint, flux_limit, exposure):
+    """Convert a positive count limit to a calibrated rate magnitude."""
+
+    if None in (zeropoint, flux_limit, exposure):
+        return None
+    if flux_limit <= 0 or exposure <= 0:
+        return None
+    return float(zeropoint - 2.5 * np.log10(flux_limit / exposure))
+
+
+def _limit_products(
+    measurements,
+    solutions,
+    image_records,
+    science_results,
+    psf_results,
+    settings,
+):
+    """Calculate analytic and empirical empty-aperture limits per method."""
+
+    limit_settings = settings.get("upper_limits", {})
+    if not limit_settings.get("enabled", True) or not limit_settings.get(
+        "calculate_on_science", True
+    ):
+        return Table(masked=True)
+    sigma_levels = [float(value) for value in limit_settings.get("sigma_levels", [3.0, 5.0])]
+    solution_lookup = {
+        (str(row["image_id"]), str(row["method"])): row for row in solutions
+    }
+    record_lookup = {
+        _image_id(record, index): record for index, record in enumerate(image_records or [])
+    }
+    science_lookup = {
+        str(result["image_id"]): result for result in (science_results or [])
+    }
+    if isinstance(psf_results, Mapping):
+        psf_lookup = dict(psf_results)
+    else:
+        psf_lookup = {
+            str(result["image_id"]): result for result in (psf_results or [])
+        }
+    rows = []
+    target_rows = measurements[
+        np.asarray(measurements["source_type"], dtype=str) == "target"
+    ]
+    for target_row in target_rows:
+        image_id = str(target_row["image_id"])
+        method = str(target_row["method"])
+        solution = solution_lookup.get((image_id, method))
+        zeropoint = None if solution is None else _finite_float(solution["zeropoint_mag"])
+        exposure = _finite_float(_science_row_value(target_row, "exposure_time"))
+        uncertainty = _finite_float(_science_row_value(target_row, "flux_uncertainty"))
+        row = {
+            "image_id": image_id,
+            "method": method,
+            "filter": str(target_row["filter"]),
+            "zeropoint_mag": zeropoint,
+            "empty_aperture_count": None,
+            "empty_aperture_noise": None,
+            "empty_aperture_status": "NOT_REQUESTED",
+            "flags": "",
+        }
+        for sigma in sigma_levels:
+            label = "{}sigma".format(int(sigma) if sigma.is_integer() else sigma)
+            analytic_flux = (
+                sigma * uncertainty
+                if limit_settings.get("analytic", True) and uncertainty is not None
+                else None
+            )
+            row["analytic_flux_{}".format(label)] = analytic_flux
+            row["analytic_limit_{}_mag".format(label)] = _magnitude_limit(
+                zeropoint, analytic_flux, exposure
+            )
+        if (
+            limit_settings.get("empty_apertures", True)
+            and method in limit_settings.get("empty_aperture_methods", [])
+            and image_id in record_lookup
+            and image_id in science_lookup
+            and image_id in psf_lookup
+        ):
+            empty = _empty_aperture_noise(
+                record_lookup[image_id],
+                science_lookup[image_id],
+                psf_lookup[image_id],
+                method,
+                settings,
+            )
+            row["empty_aperture_count"] = empty["accepted_count"]
+            row["empty_aperture_noise"] = empty["noise"]
+            row["empty_aperture_status"] = empty["status"]
+            if empty["status"] == "FAIL":
+                row["flags"] = "EMPTY_APERTURE_LIMIT_FAILED"
+            for sigma in sigma_levels:
+                label = "{}sigma".format(int(sigma) if sigma.is_integer() else sigma)
+                flux_limit = None if empty["noise"] is None else sigma * empty["noise"]
+                row["empty_flux_{}".format(label)] = flux_limit
+                row["empty_limit_{}_mag".format(label)] = _magnitude_limit(
+                    zeropoint, flux_limit, exposure
+                )
+        else:
+            for sigma in sigma_levels:
+                label = "{}sigma".format(int(sigma) if sigma.is_integer() else sigma)
+                row["empty_flux_{}".format(label)] = None
+                row["empty_limit_{}_mag".format(label)] = None
+        rows.append(row)
+    return _records_table(rows)
+
+
+def _calibrated_measurements(
+    measurements, catalogs, solutions, calibration_records, corrections, limits, settings
+):
+    """Append instrumental and calibrated quantities without replacing fluxes."""
+
+    output = Table(measurements, masked=True, copy=True)
+    solution_lookup = {
+        (str(row["image_id"]), str(row["method"])): row for row in solutions
+    }
+    correction_lookup = {
+        (str(row["image_id"]), str(row["method"])): row for row in corrections
+    }
+    calibration_lookup = {
+        int(record["measurement_index"]): record for record in calibration_records
+    }
+    numeric = {
+        name: [] for name in (
+            "instrumental_magnitude", "instrumental_magnitude_uncertainty",
+            "zeropoint_mag", "zeropoint_uncertainty_mag", "zeropoint_scatter_mag",
+            "calibrated_magnitude", "calibrated_magnitude_uncertainty",
+            "catalog_magnitude", "catalog_magnitude_error", "catalog_color",
+            "catalog_residual_mag", "aperture_correction_mag",
+        )
+    }
+    classifications = []
+    calibration_statuses = []
+    calibration_catalogs = []
+    magnitude_bands = []
+    magnitude_systems = []
+    calibration_inliers = []
+    flags = []
+    detection_sigma = float(settings.get("calibration", {}).get("detection_sigma", 3.0))
+    available = list(catalogs)
+    for index, row in enumerate(output):
+        image_id, method = str(row["image_id"]), str(row["method"])
+        solution = solution_lookup.get((image_id, method))
+        correction = correction_lookup.get((image_id, method))
+        flux = _finite_float(_science_row_value(row, "flux"))
+        flux_error = _finite_float(_science_row_value(row, "flux_uncertainty"))
+        exposure = _finite_float(_science_row_value(row, "exposure_time"))
+        instrumental, instrumental_error = _instrumental_magnitude(
+            flux, flux_error, exposure
+        )
+        zeropoint = None if solution is None else _finite_float(solution["zeropoint_mag"])
+        zeropoint_error = None if solution is None else _finite_float(solution["zeropoint_uncertainty_mag"])
+        scatter = None if solution is None else _finite_float(solution["zeropoint_scatter_mag"])
+        calibrated = (
+            None if instrumental is None or zeropoint is None
+            else instrumental + zeropoint
+        )
+        calibrated_error = (
+            None
+            if calibrated is None
+            else float(np.hypot(instrumental_error or 0.0, zeropoint_error or 0.0))
+        )
+        filter_name = normalize_filter_name(_science_row_value(row, "filter"))
+        routed, band = route_calibration_catalog(filter_name, settings, available)
+        entry = _catalog_entry(
+            catalogs, str(row["source_id"]), routed, band, settings
+        ) if str(row["source_type"]) != "target" else None
+        catalog_magnitude = None if entry is None else entry["catalog_magnitude"]
+        numeric["instrumental_magnitude"].append(instrumental)
+        numeric["instrumental_magnitude_uncertainty"].append(instrumental_error)
+        numeric["zeropoint_mag"].append(zeropoint)
+        numeric["zeropoint_uncertainty_mag"].append(zeropoint_error)
+        numeric["zeropoint_scatter_mag"].append(scatter)
+        numeric["calibrated_magnitude"].append(calibrated)
+        numeric["calibrated_magnitude_uncertainty"].append(calibrated_error)
+        numeric["catalog_magnitude"].append(catalog_magnitude)
+        numeric["catalog_magnitude_error"].append(
+            None if entry is None else entry["catalog_magnitude_error"]
+        )
+        numeric["catalog_color"].append(None if entry is None else entry["catalog_color"])
+        numeric["catalog_residual_mag"].append(
+            None if calibrated is None or catalog_magnitude is None
+            else calibrated - catalog_magnitude
+        )
+        numeric["aperture_correction_mag"].append(
+            None if correction is None else _finite_float(correction["aperture_correction_mag"])
+        )
+        valid = bool(_science_row_value(row, "valid", False))
+        snr = _finite_float(_science_row_value(row, "snr"))
+        if not valid or flux is None or flux_error is None:
+            classification = "measurement_failure"
+        elif flux > 0 and snr is not None and snr >= detection_sigma:
+            classification = "detection"
+        else:
+            classification = "nondetection"
+        classifications.append(classification)
+        calibration_statuses.append("FAIL" if solution is None else str(solution["status"]))
+        calibration_catalogs.append("" if solution is None else str(solution["catalog_name"]))
+        magnitude_bands.append("" if solution is None else str(solution["magnitude_band"]))
+        magnitude_systems.append("" if solution is None else str(solution["magnitude_system"]))
+        calibration_inliers.append(bool(calibration_lookup.get(index, {}).get("inlier", False)))
+        row_flags = str(_science_row_value(row, "flags", ""))
+        if classification == "nondetection":
+            row_flags = _append_flag(row_flags, "NONDETECTION")
+        if solution is None or str(solution["status"]) == "FAIL":
+            row_flags = _append_flag(row_flags, "CALIBRATION_FAILED")
+        flags.append(row_flags)
+    _add_numeric_columns(output, numeric)
+    output["classification"] = classifications
+    output["calibration_status"] = calibration_statuses
+    output["calibration_catalog"] = calibration_catalogs
+    output["magnitude_band"] = magnitude_bands
+    output["magnitude_system"] = magnitude_systems
+    output["calibration_inlier"] = calibration_inliers
+    output["flags"] = flags
+    magnitude_columns = [
+        name for name in output.colnames
+        if "magnitude" in name or "zeropoint" in name
+        or name.endswith("_mag") or name == "catalog_color"
+    ]
+    for name in magnitude_columns:
+        output[name].unit = u.mag
+    for name in limits.colnames:
+        if name in {"image_id", "method", "filter", "flags", "empty_aperture_status"}:
+            continue
+        lookup = {
+            (str(row["image_id"]), str(row["method"])): _finite_float(row[name])
+            for row in limits
+        }
+        values = [lookup.get((str(row["image_id"]), str(row["method"]))) for row in output]
+        _add_numeric_columns(output, {name: values})
+        if "limit" in name and name.endswith("_mag"):
+            output[name].unit = u.mag
+        elif "flux" in name or name == "empty_aperture_noise":
+            output[name].unit = getattr(output["flux"], "unit", None)
+    output.meta["instrumental_flux_preserved"] = True
+    output.meta["calibration_version"] = 1
+    return output
+
+
+def calibrate_photometry(
+    measurements,
+    catalogs,
+    image_records=None,
+    science_results=None,
+    psf_results=None,
+    settings=None,
+):
+    """Calibrate instrumental photometry and calculate detection limits.
+
+    Zeropoints are solved independently for each image and measurement method.
+    The input signed flux table is copied and retained in full. Catalog-star
+    residuals are sigma clipped, repeat-variable stars are removed in a second
+    pass, and measurement and zeropoint uncertainties are propagated into the
+    calibrated magnitude columns.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    if not settings.get("calibration", {}).get("enabled", True):
+        raise RuntimeError("Photometric calibration is disabled")
+    measurements = Table(measurements, masked=True, copy=True)
+    catalog_collection = _catalog_collection(catalogs)
+    records = _calibration_records(measurements, catalog_collection, settings)
+    first_solutions = _solve_all_zeropoints(records, settings)
+    unstable = _unstable_calibration_stars(records, settings)
+    if unstable:
+        for record in records:
+            record["inlier"] = False
+            record["zeropoint_residual"] = None
+            record["calibrated_residual"] = None
+            reasons = [
+                value for value in record["rejection_reason"].split(";")
+                if value and value != "ZEROPOINT_OUTLIER"
+            ]
+            record["rejection_reason"] = ";".join(reasons)
+        solutions_records = _solve_all_zeropoints(records, settings, unstable)
+    else:
+        solutions_records = first_solutions
+    zeropoints = _records_table(solutions_records)
+    calibration_stars = _records_table(records)
+    corrections = _aperture_corrections(measurements, settings)
+    correction_lookup = {
+        (str(row["image_id"]), str(row["method"])): row for row in corrections
+    }
+    if len(zeropoints):
+        correction_values = []
+        correction_errors = []
+        for row in zeropoints:
+            correction = correction_lookup.get((str(row["image_id"]), str(row["method"])))
+            correction_values.append(
+                None if correction is None else _finite_float(correction["aperture_correction_mag"])
+            )
+            correction_errors.append(
+                None if correction is None else _finite_float(correction["aperture_correction_uncertainty_mag"])
+            )
+        _add_numeric_columns(
+            zeropoints,
+            {
+                "aperture_correction_mag": correction_values,
+                "aperture_correction_uncertainty_mag": correction_errors,
+            },
+        )
+    trends = _calibration_trends(records, settings)
+    limits = _limit_products(
+        measurements,
+        zeropoints,
+        image_records,
+        science_results,
+        psf_results,
+        settings,
+    )
+    calibrated = _calibrated_measurements(
+        measurements,
+        catalog_collection,
+        zeropoints,
+        records,
+        corrections,
+        limits,
+        settings,
+    )
+    flux_unit = getattr(measurements["flux"], "unit", None)
+    for table in (zeropoints, calibration_stars, corrections, trends, limits):
+        for name in table.colnames:
+            if (
+                "magnitude" in name
+                or "zeropoint" in name
+                or name.endswith("_mag")
+                or name == "catalog_color"
+                or name == "slope_mag_per_span"
+            ):
+                table[name].unit = u.mag
+            elif flux_unit is not None and (
+                "flux" in name or name == "empty_aperture_noise"
+            ):
+                table[name].unit = flux_unit
+    return {
+        "measurements": calibrated,
+        "zeropoints": zeropoints,
+        "calibration_stars": calibration_stars,
+        "aperture_corrections": corrections,
+        "trends": trends,
+        "limits": limits,
+        "unstable_stars": sorted("{}:{}".format(*value) for value in unstable),
+        "catalogs_available": sorted(catalog_collection),
+        "status": (
+            "FAIL"
+            if len(zeropoints) == 0 or all(str(value) == "FAIL" for value in zeropoints["status"])
+            else "WARN"
+            if any(str(value) != "PASS" for value in zeropoints["status"])
+            else "PASS"
+        ),
+        "artificial_star_injection_enabled": bool(
+            settings.get("upper_limits", {}).get("injection_recovery", False)
+        ),
+        "artificial_star_injection_implemented": False,
+    }
+
+
+def save_calibration_products(
+    products, output_directory, object_name="field", settings=None, overwrite=None
+):
+    """Save calibrated measurements, zeropoints, residuals, corrections, and limits."""
+
+    if settings is None:
+        settings = get_default_settings()
+    if overwrite is None:
+        overwrite = settings.get("output", {}).get("overwrite", False)
+    calibration = settings.get("calibration", {})
+    limits_settings = settings.get("upper_limits", {})
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    stem = _safe_stem(object_name)
+    paths = {}
+    requests = {
+        "measurements": calibration.get("save_calibrated_table", True),
+        "zeropoints": calibration.get("save_zeropoints", True),
+        "calibration_stars": calibration.get("save_calibration_stars", True),
+        "aperture_corrections": calibration.get("save_aperture_corrections", True),
+        "trends": calibration.get("save_summary", True),
+        "limits": limits_settings.get("save_limit_table", True),
+    }
+    for name, enabled in requests.items():
+        table = products.get(name)
+        if not enabled or table is None:
+            continue
+        path = output_directory / "{}_{}.ecsv".format(stem, name)
+        table.write(path, format="ascii.ecsv", overwrite=bool(overwrite))
+        paths[name] = str(path)
+    if calibration.get("save_summary", True):
+        path = output_directory / "{}_calibration_summary.json".format(stem)
+        if path.exists() and not overwrite:
+            raise FileExistsError(str(path))
+        summary = {
+            "status": products.get("status"),
+            "catalogs_available": products.get("catalogs_available", []),
+            "unstable_stars": products.get("unstable_stars", []),
+            "artificial_star_injection_enabled": products.get(
+                "artificial_star_injection_enabled", False
+            ),
+            "artificial_star_injection_implemented": False,
+        }
+        path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        paths["summary"] = str(path)
+    return paths
+
+
 __all__ = [
     "PSF_DOWNSTREAM_STAGES",
     "apply_psf_review",
+    "calibrate_photometry",
     "construct_psf",
     "construct_psfs",
     "perform_science_image_photometry",
@@ -1926,6 +3081,8 @@ __all__ = [
     "plan_psf_rerun",
     "psf_dependency_signature",
     "require_approved_psf",
+    "route_calibration_catalog",
+    "save_calibration_products",
     "save_science_photometry_products",
     "save_psf_products",
 ]

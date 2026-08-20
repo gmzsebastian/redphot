@@ -202,6 +202,9 @@ QUALITY_FLAGS = {
         "COSMIC_RAY_OVERLAP",
         "TRAIL_OVERLAP",
         "CALIBRATION_FAILED",
+        "CALIBRATION_STAR_REJECTED",
+        "APERTURE_CORRECTION_FAILED",
+        "EMPTY_APERTURE_LIMIT_FAILED",
         "NONDETECTION",
     ],
     "subtraction": [
@@ -858,21 +861,54 @@ DEFAULT_SETTINGS = {
     "calibration": {
         "enabled": True,
         "catalog": "auto",
+        "allow_catalog_fallback": True,
+        "require_routed_catalog": False,
+        "filter_column_map": {},
+        "magnitude_system_by_catalog": {
+            "ps1": "AB",
+            "sdss": "AB",
+            "skymapper": "AB",
+            "gaia": "Vega",
+            "apass": "mixed",
+            "user": "user",
+        },
         "minimum_stars": 3,
         "maximum_stars": 100,
         "minimum_star_snr": 10.0,
+        "maximum_catalog_error_mag": 0.10,
+        "allow_missing_catalog_error": True,
+        "excluded_measurement_flags": [
+            "APERTURE_INCOMPLETE",
+            "INSUFFICIENT_UNMASKED_PIXELS",
+            "BAD_LOCAL_BACKGROUND",
+            "COSMIC_RAY_OVERLAP",
+            "TRAIL_OVERLAP",
+            "MASKED_PIXELS",
+        ],
         "sigma_clip": 3.0,
         "maximum_iterations": 5,
+        "maximum_star_rms_mag": 0.10,
+        "minimum_epochs_for_stability": 2,
         "maximum_catalog_separation_arcsec": 2.0,
         "calculate_psf_zeropoint": True,
         "calculate_aperture_zeropoint": True,
+        "reference_aperture_method": "large_aperture",
+        "minimum_aperture_correction_stars": 3,
+        "aperture_correction_sigma_clip": 3.0,
         "calculate_color_term": False,
         "apply_color_term": False,
         "apply_atmospheric_extinction": False,
         "apply_galactic_extinction": False,
         "zeropoint_scatter_warn_mag": 0.10,
         "zeropoint_scatter_fail_mag": 0.30,
+        "trend_slope_warn_mag": 0.05,
+        "detection_sigma": 3.0,
         "retain_instrumental_measurements": True,
+        "save_calibrated_table": True,
+        "save_zeropoints": True,
+        "save_calibration_stars": True,
+        "save_aperture_corrections": True,
+        "save_summary": True,
     },
     "subtraction": {
         "enabled": False,
@@ -915,13 +951,19 @@ DEFAULT_SETTINGS = {
         "analytic": True,
         "empty_apertures": True,
         "number_empty_apertures": 100,
+        "minimum_empty_apertures": 20,
+        "maximum_empty_aperture_attempts_factor": 30,
+        "empty_aperture_methods": ["small_aperture", "large_aperture", "psf"],
         "empty_aperture_radius_fwhm": 1.0,
         "empty_aperture_local_radius_arcsec": 60.0,
+        "empty_aperture_source_exclusion_fwhm": 3.0,
+        "empty_aperture_random_seed": 12345,
         "exclude_sources": True,
         "exclude_masked_regions": True,
         "injection_recovery": False,
         "number_injected_sources": 100,
         "minimum_recovery_fraction": 0.50,
+        "save_limit_table": True,
         "calculate_on_science": True,
         "calculate_on_difference": True,
     },
@@ -1652,6 +1694,32 @@ def validate_settings(settings):
     if not psf_statuses or not psf_statuses.issubset({"PASS", "WARN", "FAIL"}):
         raise ValueError("psf.approved_statuses must contain PASS, WARN, or FAIL")
 
+    calibration_settings = settings["calibration"]
+    if int(calibration_settings.get("minimum_stars", 3)) < 1:
+        raise ValueError("calibration.minimum_stars must be positive")
+    if int(calibration_settings.get("maximum_stars", 100)) < int(
+        calibration_settings.get("minimum_stars", 3)
+    ):
+        raise ValueError(
+            "calibration.maximum_stars cannot be below calibration.minimum_stars"
+        )
+    if float(calibration_settings.get("minimum_star_snr", 10.0)) <= 0:
+        raise ValueError("calibration.minimum_star_snr must be positive")
+    if float(calibration_settings.get("maximum_catalog_error_mag", 0.10)) <= 0:
+        raise ValueError("calibration.maximum_catalog_error_mag must be positive")
+    if float(calibration_settings.get("sigma_clip", 3.0)) <= 0:
+        raise ValueError("calibration.sigma_clip must be positive")
+    if int(calibration_settings.get("minimum_aperture_correction_stars", 3)) < 1:
+        raise ValueError(
+            "calibration.minimum_aperture_correction_stars must be positive"
+        )
+    if calibration_settings.get("reference_aperture_method", "large_aperture") not in {
+        "small_aperture", "large_aperture", "psf"
+    }:
+        raise ValueError("calibration.reference_aperture_method is not recognized")
+    if float(calibration_settings.get("detection_sigma", 3.0)) <= 0:
+        raise ValueError("calibration.detection_sigma must be positive")
+
     subtraction_method = settings["subtraction"]["method"]
     if subtraction_method not in {"hotpants", "pyzogy"}:
         raise ValueError(
@@ -1776,6 +1844,21 @@ def validate_settings(settings):
         raise ValueError(
             "upper_limits.sigma_levels must contain positive values"
         )
+    limit_settings = settings["upper_limits"]
+    if int(limit_settings.get("number_empty_apertures", 100)) < 1:
+        raise ValueError("upper_limits.number_empty_apertures must be positive")
+    if not 1 <= int(limit_settings.get("minimum_empty_apertures", 20)) <= int(
+        limit_settings.get("number_empty_apertures", 100)
+    ):
+        raise ValueError(
+            "upper_limits.minimum_empty_apertures must be between 1 and the "
+            "requested empty-aperture count"
+        )
+    allowed_limit_methods = {"small_aperture", "large_aperture", "psf"}
+    if not set(limit_settings.get("empty_aperture_methods", [])).issubset(
+        allowed_limit_methods
+    ):
+        raise ValueError("upper_limits.empty_aperture_methods contains an unknown method")
 
 
 def resolve_settings(instrument_name=None, run_settings=None, filter_name=None, filter_settings=None,

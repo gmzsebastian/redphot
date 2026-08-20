@@ -1637,8 +1637,140 @@ def plot_science_photometry_diagnostics(result, output_path=None, show=False):
     return fig
 
 
+def plot_calibration_diagnostics(products, output_path=None, show=False):
+    """Plot method zeropoints, calibration residual trends, and depth limits."""
+
+    import matplotlib.pyplot as plt
+
+    zeropoints = products.get("zeropoints")
+    stars = products.get("calibration_stars")
+    limits = products.get("limits")
+    fig, axes = plt.subplots(3, 3, figsize=(17, 14), constrained_layout=True)
+
+    zeropoint_axis = axes[0, 0]
+    zeropoint_axis.set_title("Method-specific zeropoints")
+    if zeropoints is not None and len(zeropoints):
+        methods = list(dict.fromkeys(str(value) for value in zeropoints["method"]))
+        colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(methods))))
+        for color, method in zip(colors, methods):
+            selected = zeropoints[np.asarray(zeropoints["method"], dtype=str) == method]
+            values = np.ma.asarray(selected["zeropoint_mag"], dtype=float).filled(np.nan)
+            errors = np.ma.asarray(
+                selected["zeropoint_uncertainty_mag"], dtype=float
+            ).filled(np.nan)
+            zeropoint_axis.errorbar(
+                np.arange(len(selected)), values, yerr=errors, fmt="o-",
+                color=color, label=method, capsize=2,
+            )
+        zeropoint_axis.legend(fontsize=8)
+    else:
+        zeropoint_axis.text(0.5, 0.5, "No zeropoints", ha="center", va="center")
+    zeropoint_axis.set_xlabel("image index")
+    zeropoint_axis.set_ylabel("zeropoint [mag]")
+    zeropoint_axis.grid(alpha=0.2)
+
+    inlier = None
+    if stars is not None and len(stars):
+        inlier = stars[np.asarray(stars["inlier"], dtype=bool)]
+    variables = (
+        ("catalog_magnitude", "Catalog magnitude [mag]", axes[0, 1]),
+        ("catalog_color", "Catalog color [mag]", axes[0, 2]),
+        ("snr", "S/N", axes[1, 0]),
+        ("x", "Detector x [pixel]", axes[1, 1]),
+        ("y", "Detector y [pixel]", axes[1, 2]),
+        ("airmass", "Airmass", axes[2, 0]),
+    )
+    for column, label, axis in variables:
+        axis.set_title("Residual versus {}".format(label.split(" [")[0].lower()))
+        if inlier is not None and len(inlier) and column in inlier.colnames:
+            x = np.ma.asarray(inlier[column], dtype=float).filled(np.nan)
+            residual = np.ma.asarray(
+                inlier["calibrated_residual"], dtype=float
+            ).filled(np.nan)
+            methods = np.asarray(inlier["method"], dtype=str)
+            for method in list(dict.fromkeys(methods)):
+                selected = methods == method
+                axis.scatter(x[selected], residual[selected], s=18, alpha=0.7, label=method)
+            axis.axhline(0.0, color="0.4", linewidth=1.0)
+        else:
+            axis.text(0.5, 0.5, "Not available", ha="center", va="center")
+        axis.set_xlabel(label)
+        axis.set_ylabel("calibrated - catalog [mag]")
+        axis.grid(alpha=0.2)
+    if inlier is not None and len(inlier):
+        axes[0, 1].legend(fontsize=7)
+
+    limit_axis = axes[2, 1]
+    limit_axis.set_title("Target limiting magnitudes")
+    if limits is not None and len(limits):
+        columns = [
+            name for name in limits.colnames
+            if name.endswith("_mag") and "limit_" in name
+        ]
+        labels = []
+        values = []
+        for row in limits:
+            for name in columns:
+                value = row[name]
+                if np.ma.is_masked(value):
+                    continue
+                labels.append("{}\n{}".format(row["method"], name.replace("_mag", "")))
+                values.append(float(value))
+        if values:
+            positions = np.arange(len(values))
+            limit_axis.bar(positions, values, color="tab:purple", alpha=0.75)
+            limit_axis.set_xticks(positions)
+            limit_axis.set_xticklabels(labels, rotation=70, ha="right", fontsize=6)
+        else:
+            limit_axis.text(0.5, 0.5, "No calibrated limits", ha="center", va="center")
+    else:
+        limit_axis.text(0.5, 0.5, "No limits", ha="center", va="center")
+    limit_axis.set_ylabel("limiting magnitude")
+    limit_axis.invert_yaxis()
+    limit_axis.grid(axis="y", alpha=0.2)
+
+    summary_axis = axes[2, 2]
+    summary_axis.set_axis_off()
+    status_counts = {}
+    if zeropoints is not None and len(zeropoints):
+        for value in zeropoints["status"]:
+            status_counts[str(value)] = status_counts.get(str(value), 0) + 1
+    classification_counts = {}
+    measurements = products.get("measurements")
+    if measurements is not None and len(measurements):
+        for value in measurements["classification"]:
+            classification_counts[str(value)] = classification_counts.get(str(value), 0) + 1
+    summary = [
+        "Overall status: {}".format(products.get("status")),
+        "Catalogs: {}".format(", ".join(products.get("catalogs_available", [])) or "none"),
+        "Zeropoints: {}".format(status_counts or "none"),
+        "Classifications: {}".format(classification_counts or "none"),
+        "Unstable stars: {}".format(len(products.get("unstable_stars", []))),
+        "Empty-aperture rows: {}".format(0 if limits is None else len(limits)),
+        "Injection/recovery: later" if not products.get(
+            "artificial_star_injection_implemented", False
+        ) else "Injection/recovery: enabled",
+    ]
+    if products.get("unstable_stars"):
+        summary.extend(["", "Rejected unstable stars:"])
+        summary.extend("  {}".format(value) for value in products["unstable_stars"])
+    summary_axis.text(
+        0.02, 0.98, "\n".join(summary), va="top", ha="left",
+        family="monospace", fontsize=10,
+    )
+    fig.suptitle("Photometric calibration and limiting-depth diagnostics", fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
+    "plot_calibration_diagnostics",
     "plot_astrometry_diagnostics",
     "plot_alignment_target_diagnostics",
     "plot_image_quality_diagnostics",
