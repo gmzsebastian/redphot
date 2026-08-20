@@ -188,6 +188,7 @@ QUALITY_FLAGS = {
         "TOO_FEW_CALIBRATION_STARS",
         "PSF_MODEL_FAILED",
         "PSF_RESIDUAL_HIGH",
+        "PSF_REVIEW_REQUIRED",
         "TARGET_MASKED",
         "TARGET_FIT_FAILED",
         "TARGET_CENTROID_OFFSET",
@@ -787,19 +788,40 @@ DEFAULT_SETTINGS = {
         "box_size_pixels": 25,
         "oversampling": 2,
         "minimum_stars": 5,
+        "minimum_fallback_stars": 1,
         "maximum_stars": 20,
         "minimum_star_snr": 30.0,
         "minimum_edge_distance_fwhm": 5.0,
         "reject_saturated": True,
         "reject_masked": True,
         "reject_blended": True,
+        "maximum_masked_fraction": 0.05,
+        "local_background_border_pixels": 3,
+        "normalization_radius_fwhm": 2.5,
         "sigma_clip": 3.0,
         "maximum_iterations": 3,
         "spatial_order": 0,
-        "maximum_residual_fraction": 0.10,
+        "minimum_spatial_stars": 20,
+        "minimum_spatial_cells": 6,
+        "spatial_grid": [3, 3],
+        "maximum_residual_fraction": 0.20,
+        "residual_warn_fraction": 0.15,
+        "residual_fail_fraction": 0.30,
+        "minimum_correlation": 0.90,
+        "analytic_beta": 2.5,
+        "fit_analytic_beta": True,
+        "minimum_fwhm_pixels": 0.8,
+        "maximum_fwhm_pixels": 30.0,
+        "require_manual_review": False,
+        "approved_statuses": ["PASS", "WARN"],
+        "manual_decisions": {},
+        "model_version": 1,
         "fix_target_centroid": True,
         "save_model": True,
+        "save_cutouts": True,
         "save_residuals": True,
+        "save_star_table": True,
+        "save_review": True,
     },
     "apertures": {
         "enabled": True,
@@ -1540,6 +1562,43 @@ def validate_settings(settings):
                     name
                 )
             )
+
+    psf_settings = settings["psf"]
+    if psf_settings.get("model", "empirical") not in {"empirical", "moffat", "gaussian"}:
+        raise ValueError("psf.model must be empirical, moffat, or gaussian")
+    if psf_settings.get("fallback_model", "moffat") not in {"moffat", "gaussian"}:
+        raise ValueError("psf.fallback_model must be moffat or gaussian")
+    box_size = int(psf_settings.get("box_size_pixels", 25))
+    if box_size < 7 or box_size % 2 == 0:
+        raise ValueError("psf.box_size_pixels must be an odd integer of at least 7")
+    if int(psf_settings.get("oversampling", 2)) < 1:
+        raise ValueError("psf.oversampling must be at least 1")
+    minimum_psf_stars = int(psf_settings.get("minimum_stars", 5))
+    fallback_psf_stars = int(psf_settings.get("minimum_fallback_stars", 1))
+    maximum_psf_stars = int(psf_settings.get("maximum_stars", 20))
+    if not 1 <= fallback_psf_stars <= minimum_psf_stars <= maximum_psf_stars:
+        raise ValueError(
+            "PSF star counts must satisfy 1 <= fallback minimum <= empirical "
+            "minimum <= maximum"
+        )
+    if not 0 <= float(psf_settings.get("maximum_masked_fraction", 0.05)) < 1:
+        raise ValueError("psf.maximum_masked_fraction must be in [0, 1)")
+    residual_warn = float(psf_settings.get("residual_warn_fraction", 0.15))
+    residual_fail = float(psf_settings.get("residual_fail_fraction", 0.30))
+    if not 0 <= residual_warn <= residual_fail:
+        raise ValueError("PSF residual limits must satisfy 0 <= warn <= fail")
+    if not 0 <= float(psf_settings.get("minimum_correlation", 0.90)) <= 1:
+        raise ValueError("psf.minimum_correlation must be in [0, 1]")
+    spatial_grid = psf_settings.get("spatial_grid", [3, 3])
+    if len(spatial_grid) != 2 or any(int(value) <= 0 for value in spatial_grid):
+        raise ValueError("psf.spatial_grid must contain two positive integers")
+    if int(psf_settings.get("spatial_order", 0)) < 0:
+        raise ValueError("psf.spatial_order cannot be negative")
+    if int(psf_settings.get("model_version", 1)) <= 0:
+        raise ValueError("psf.model_version must be positive")
+    psf_statuses = set(psf_settings.get("approved_statuses", ["PASS", "WARN"]))
+    if not psf_statuses or not psf_statuses.issubset({"PASS", "WARN", "FAIL"}):
+        raise ValueError("psf.approved_statuses must contain PASS, WARN, or FAIL")
 
     subtraction_method = settings["subtraction"]["method"]
     if subtraction_method not in {"hotpants", "pyzogy"}:

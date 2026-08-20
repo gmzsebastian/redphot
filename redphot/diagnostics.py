@@ -1346,11 +1346,177 @@ def plot_alignment_target_diagnostics(
     return fig
 
 
+def _image_mosaic(cube, columns=4, gap=1):
+    """Arrange a small image cube into a compact diagnostic mosaic."""
+
+    cube = np.asarray(cube, dtype=float)
+    if cube.ndim != 3 or cube.shape[0] == 0:
+        return None
+    columns = max(1, min(int(columns), cube.shape[0]))
+    rows = int(np.ceil(cube.shape[0] / columns))
+    height, width = cube.shape[1:]
+    mosaic = np.full(
+        (rows * height + (rows - 1) * gap, columns * width + (columns - 1) * gap),
+        np.nan,
+    )
+    for index, image in enumerate(cube):
+        row, column = divmod(index, columns)
+        y0 = row * (height + gap)
+        x0 = column * (width + gap)
+        mosaic[y0:y0 + height, x0:x0 + width] = image
+    return mosaic
+
+
+def plot_psf_diagnostics(result, output_path=None, show=False):
+    """Plot PSF-star cutouts, model, profiles, residuals, and review gate.
+
+    Parameters
+    ----------
+    result : mapping
+        Result returned by :func:`redphot.photometry.construct_psf`.
+    output_path : str or pathlib.Path, optional
+        PNG or PDF destination. Parent directories are created when needed.
+    show : bool, optional
+        Display the figure interactively.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The completed six-panel diagnostic figure.
+    """
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
+    grid = fig.add_gridspec(2, 3)
+    cutout_axis = fig.add_subplot(grid[0, 0])
+    model_axis = fig.add_subplot(grid[0, 1])
+    surface_axis = fig.add_subplot(grid[0, 2], projection="3d")
+    profile_axis = fig.add_subplot(grid[1, 0])
+    residual_axis = fig.add_subplot(grid[1, 1])
+    summary_axis = fig.add_subplot(grid[1, 2])
+
+    cutout_mosaic = _image_mosaic(result.get("cutouts", []))
+    _show_image(fig, cutout_axis, cutout_mosaic, "Accepted PSF-star cutouts")
+    model = result.get("model_native")
+    _show_image(fig, model_axis, model, "Normalized PSF model", cmap="viridis")
+
+    surface_axis.set_title("PSF surface")
+    if model is None:
+        surface_axis.text2D(0.5, 0.5, "Not available", ha="center", va="center")
+    else:
+        model_array = np.asarray(model, dtype=float)
+        yy, xx = np.indices(model_array.shape)
+        surface_axis.plot_surface(
+            xx, yy, model_array, cmap="viridis", linewidth=0, antialiased=True
+        )
+        surface_axis.set_xlabel("x [pixel]")
+        surface_axis.set_ylabel("y [pixel]")
+        surface_axis.set_zlabel("normalized value")
+
+    profile_axis.set_title("Radial and detector-axis profiles")
+    if model is not None:
+        model_array = np.asarray(model, dtype=float)
+        cy = (model_array.shape[0] - 1) / 2.0
+        cx = (model_array.shape[1] - 1) / 2.0
+        yy, xx = np.indices(model_array.shape, dtype=float)
+        radius = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        radial_index = np.floor(radius).astype(int)
+        radial = np.array(
+            [
+                np.nanmean(model_array[radial_index == index])
+                for index in range(radial_index.max() + 1)
+            ]
+        )
+        profile_axis.plot(radial, "o-", label="radial", markersize=3)
+        profile_axis.plot(
+            np.arange(model_array.shape[1]) - cx,
+            model_array[int(round(cy)), :],
+            label="x axis",
+        )
+        profile_axis.plot(
+            np.arange(model_array.shape[0]) - cy,
+            model_array[:, int(round(cx))],
+            label="y axis",
+        )
+        profile_axis.legend(loc="best")
+    profile_axis.set_xlabel("distance [pixel]")
+    profile_axis.set_ylabel("normalized value")
+    profile_axis.grid(alpha=0.2)
+
+    residual_mosaic = _image_mosaic(result.get("residuals", []))
+    _show_image(
+        fig,
+        residual_axis,
+        residual_mosaic,
+        "PSF-star residuals",
+        cmap="coolwarm",
+        lower=2.0,
+        upper=98.0,
+    )
+
+    summary_axis.set_axis_off()
+    summary = [
+        "Model: {}".format(result.get("model_type") or "failed"),
+        "Status: {}".format(result.get("status")),
+        "Automatic: {}".format(result.get("automatic_status")),
+        "Review: {}".format(result.get("review_state")),
+        "Approved: {}".format(result.get("approved_for_photometry")),
+        "Stars used: {}/{}".format(
+            result.get("star_count_used"), result.get("star_count_considered")
+        ),
+        "FWHM: {} pixel".format(
+            "--" if result.get("fwhm_pixels") is None
+            else "{:.3f}".format(result["fwhm_pixels"])
+        ),
+        "Ellipticity: {}".format(
+            "--" if result.get("ellipticity") is None
+            else "{:.3f}".format(result["ellipticity"])
+        ),
+        "Normalization: {}".format(
+            "--" if result.get("normalization") is None
+            else "{:.6f}".format(result["normalization"])
+        ),
+        "Median residual: {}".format(
+            "--" if result.get("residual_median_fraction") is None
+            else "{:.2%}".format(result["residual_median_fraction"])
+        ),
+        "Median correlation: {}".format(
+            "--" if result.get("correlation_median") is None
+            else "{:.4f}".format(result["correlation_median"])
+        ),
+        "Spatial support: {} ({} cells)".format(
+            result.get("spatial_support"), result.get("spatial_cells_occupied")
+        ),
+        "",
+        "Flags: {}".format(", ".join(result.get("quality_flags", [])) or "none"),
+    ]
+    summary.extend(result.get("reasons", []))
+    if result.get("review_note"):
+        summary.extend(["", "Review note: {}".format(result["review_note"])])
+    summary_axis.text(
+        0.02, 0.98, "\n".join(summary), va="top", ha="left",
+        family="monospace", fontsize=10,
+    )
+    fig.suptitle(
+        "PSF construction and review — {}".format(result.get("filename", "image")),
+        fontsize=15,
+    )
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_astrometry_diagnostics",
     "plot_alignment_target_diagnostics",
     "plot_image_quality_diagnostics",
     "plot_image_usability_diagnostics",
+    "plot_psf_diagnostics",
     "plot_star_selection_diagnostics",
 ]
