@@ -16,7 +16,7 @@ import numpy as np
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.nddata import StdDevUncertainty
+from astropy.nddata import CCDData, StdDevUncertainty
 from astropy.stats import sigma_clip
 from astropy.table import MaskedColumn, Table, vstack
 from astropy.wcs.utils import proj_plane_pixel_scales
@@ -3070,6 +3070,804 @@ def save_calibration_products(
     return paths
 
 
+def _difference_image_record(science_record, subtraction_result, settings):
+    """Build a non-destructive image record for a generated difference image."""
+
+    difference = subtraction_result.get("difference")
+    if difference is None or np.ndim(difference) != 2:
+        raise ValueError("A valid two-dimensional difference image is required")
+    data = np.asarray(difference, dtype=float)
+    aligned = subtraction_result.get("aligned_template") or {}
+    wcs = aligned.get("wcs") or _record_wcs(science_record)
+    if wcs is None:
+        raise ValueError("Difference-image photometry requires a celestial WCS")
+    masks = _measurement_masks(science_record, data.shape)
+    combined = masks["combined"].copy()
+    aligned_mask = aligned.get("mask")
+    if aligned_mask is not None and np.shape(aligned_mask) == data.shape:
+        combined |= np.asarray(aligned_mask, dtype=bool)
+    combined |= ~np.isfinite(data)
+    quality = subtraction_result.get("quality") or {}
+    rms = _finite_float(quality.get("background_rms"))
+    if rms is None or rms <= 0:
+        finite = data[~combined]
+        rms = _robust_scatter(finite) if finite.size else None
+    if rms is None or rms <= 0:
+        raise ValueError("The difference image has no usable noise estimate")
+    science_ccd = None
+    for name in ("prepared_ccd", "working_ccd", "ccd"):
+        if science_record.get(name) is not None:
+            science_ccd = science_record[name]
+            break
+    unit = getattr(science_ccd, "unit", u.adu)
+    ccd = CCDData(
+        data,
+        unit=unit,
+        wcs=deepcopy(wcs),
+        mask=combined,
+        uncertainty=StdDevUncertainty(np.full(data.shape, rms, dtype=float)),
+    )
+    metadata = deepcopy(science_record.get("metadata") or {})
+    metadata["filename"] = "{}_difference.fits".format(
+        _safe_stem(metadata.get("filename") or _image_id(science_record))
+    )
+    image_id = _image_id(science_record)
+    return {
+        "image_id": image_id,
+        "prepared_ccd": ccd,
+        "metadata": metadata,
+        "quality": {
+            "background": quality.get("background"),
+            "background_rms": rms,
+            "fwhm_pixels": (science_record.get("quality") or {}).get("fwhm_pixels"),
+        },
+        "masks": {"combined": combined},
+        "background_products": {
+            key: value for key, value in (science_record.get("background_products") or {}).items()
+            if key in {"detected_source_mask", "protected_source_mask"}
+            and np.shape(value) == data.shape
+        },
+        "settings": settings,
+        "science_record": science_record,
+        "subtraction_result": subtraction_result,
+    }
+
+
+def _difference_psf(science_psf, subtraction_result, difference_psf=None):
+    """Return the PSF appropriate for the transient signal in the difference."""
+
+    if difference_psf is not None:
+        return deepcopy(difference_psf), "supplied_difference_psf"
+    parameters = subtraction_result.get("parameters") or {}
+    method = subtraction_result.get("method")
+    if method == "hotpants" and parameters.get("convolve") == "science":
+        fwhm = _finite_float(parameters.get("template_fwhm_pixels"))
+        if fwhm is not None:
+            size = max(9, int(np.ceil(6.0 * fwhm)))
+            if size % 2 == 0:
+                size += 1
+            sigma = fwhm / 2.354820045
+            model = _analytic_array((size, size), "gaussian", sigma)
+            model = _normalize_model(model)
+            result = deepcopy(science_psf)
+            result.update(
+                {
+                    "model": model,
+                    "model_native": model,
+                    "model_type": "difference_gaussian",
+                    "fwhm_pixels": fwhm,
+                    "normalization": float(np.sum(model)),
+                    "approved_for_photometry": True,
+                    "status": "PASS",
+                    "review_state": "DERIVED",
+                }
+            )
+            return result, "analytic_template_seeing"
+    return deepcopy(science_psf), "science_psf"
+
+
+def _target_rows(table):
+    """Return the target-only subset of a measurement table."""
+
+    if table is None or len(table) == 0 or "source_type" not in table.colnames:
+        return Table(masked=True)
+    return table[np.asarray(table["source_type"], dtype=str) == "target"]
+
+
+def _science_measurement_table(science_photometry):
+    """Normalize a science result mapping or direct table to a copied table."""
+
+    if science_photometry is None:
+        return Table(masked=True)
+    if isinstance(science_photometry, Mapping):
+        value = science_photometry.get("measurements")
+    else:
+        value = science_photometry
+    return Table(masked=True) if value is None else Table(value, masked=True, copy=True)
+
+
+def _zeropoint_lookup(zeropoints, image_id, method):
+    """Return a method-specific zeropoint and uncertainty when available."""
+
+    if zeropoints is None:
+        return None, None
+    if isinstance(zeropoints, Mapping):
+        value = zeropoints.get((str(image_id), str(method)), zeropoints.get(str(method)))
+        if isinstance(value, Mapping):
+            return _finite_float(value.get("zeropoint_mag")), _finite_float(
+                value.get("zeropoint_uncertainty_mag")
+            )
+        return _finite_float(value), None
+    for row in zeropoints:
+        names = row.colnames
+        if (
+            "image_id" in names and "method" in names
+            and str(row["image_id"]) == str(image_id)
+            and str(row["method"]) == str(method)
+        ):
+            return _finite_float(row["zeropoint_mag"]), _finite_float(
+                row["zeropoint_uncertainty_mag"]
+                if "zeropoint_uncertainty_mag" in names else None
+            )
+    return None, None
+
+
+def _difference_dipole(data, x, y, fwhm, rms, settings):
+    """Measure significant positive and negative lobes around the target."""
+
+    configured = settings.get("subtraction", {}).get("photometry", {})
+    radius = max(3.0, 2.5 * float(fwhm))
+    slices, weights = _radial_weights(data.shape, x, y, radius, 1, method="center")
+    patch = np.asarray(data[slices], dtype=float)
+    yy, xx = np.indices(patch.shape, dtype=float)
+    xx += slices[1].start
+    yy += slices[0].start
+    inside = (weights > 0) & np.isfinite(patch)
+    threshold = float(configured.get("dipole_sigma", 3.0)) * float(rms)
+    positive = inside & (patch > threshold)
+    negative = inside & (patch < -threshold)
+    positive_flux = float(np.sum(patch[positive])) if np.any(positive) else 0.0
+    negative_flux = float(np.sum(-patch[negative])) if np.any(negative) else 0.0
+
+    def centroid(selection, values):
+        if not np.any(selection) or np.sum(values[selection]) <= 0:
+            return None
+        total = np.sum(values[selection])
+        return (
+            float(np.sum(xx[selection] * values[selection]) / total),
+            float(np.sum(yy[selection] * values[selection]) / total),
+        )
+
+    positive_center = centroid(positive, patch)
+    negative_center = centroid(negative, -patch)
+    separation = None
+    if positive_center is not None and negative_center is not None:
+        separation = float(np.hypot(
+            positive_center[0] - negative_center[0],
+            positive_center[1] - negative_center[1],
+        ))
+    ratio = min(positive_flux, negative_flux) / max(positive_flux, negative_flux, 1.0e-12)
+    detected = bool(
+        positive_flux > 0 and negative_flux > 0
+        and ratio >= float(configured.get("dipole_ratio_threshold", 0.25))
+        and separation is not None
+        and separation >= float(configured.get("dipole_minimum_separation_pixels", 0.5))
+    )
+    return {
+        "detected": detected,
+        "positive_flux": positive_flux,
+        "negative_flux": -negative_flux,
+        "absolute_lobe_ratio": float(ratio),
+        "separation_pixels": separation,
+        "positive_centroid": positive_center,
+        "negative_centroid": negative_center,
+        "threshold": threshold,
+        "slices": slices,
+    }
+
+
+def _annotate_measurement_origin(table, image_kind, host_light_included):
+    """Add common provenance and selection columns to a measurement table."""
+
+    result = Table(table, masked=True, copy=True)
+    count = len(result)
+    result["image_kind"] = [str(image_kind)] * count
+    result["host_light_included"] = [bool(host_light_included)] * count
+    result["preferred"] = [False] * count
+    classifications = (
+        [str(value) for value in result["classification"]]
+        if "classification" in result.colnames else [""] * count
+    )
+    result["classification"] = np.asarray(classifications, dtype="U32")
+    result["selection_reason"] = np.full(count, "", dtype="U256")
+    if "flags" in result.colnames:
+        result["flags"] = np.asarray([str(value) for value in result["flags"]], dtype="U1024")
+    return result
+
+
+def _difference_comparison(science_table, difference_table):
+    """Compare target fluxes method by method without discarding either table."""
+
+    science = {str(row["method"]): row for row in _target_rows(science_table)}
+    difference = {str(row["method"]): row for row in _target_rows(difference_table)}
+    rows = []
+    for method in sorted(set(science) | set(difference)):
+        science_flux = _finite_float(science.get(method)["flux"]) if method in science else None
+        science_error = _finite_float(science.get(method)["flux_uncertainty"]) if method in science else None
+        difference_flux = _finite_float(difference.get(method)["flux"]) if method in difference else None
+        difference_error = _finite_float(difference.get(method)["flux_uncertainty"]) if method in difference else None
+        delta = (
+            difference_flux - science_flux
+            if difference_flux is not None and science_flux is not None else None
+        )
+        combined_error = (
+            np.hypot(difference_error, science_error)
+            if difference_error is not None and science_error is not None else None
+        )
+        rows.append(
+            {
+                "method": method,
+                "science_flux": science_flux,
+                "science_uncertainty": science_error,
+                "difference_flux": difference_flux,
+                "difference_uncertainty": difference_error,
+                "difference_minus_science": delta,
+                "difference_significance": (
+                    delta / combined_error if delta is not None and combined_error not in {None, 0.0}
+                    else None
+                ),
+            }
+        )
+    return _records_table(rows)
+
+
+def perform_difference_image_photometry(
+    science_record,
+    subtraction_result,
+    target_solution,
+    psf_result,
+    measurements=None,
+    science_photometry=None,
+    zeropoints=None,
+    settings=None,
+    difference_psf_result=None,
+):
+    """Perform and validate forced photometry on one difference image.
+
+    All three science-image methods are repeated with the same frozen sky
+    coordinate and base schema.  Signed fluxes are retained.  Empirical blank
+    apertures can inflate underestimated formal errors but never reduce them.
+    The preferred-result decision is stored as provenance rather than removing
+    any measurement.
+    """
+
+    if settings is None:
+        settings = science_record.get("settings") or get_default_settings()
+    settings = merge_settings(get_default_settings(), settings)
+    configured = settings.get("subtraction", {}).get("photometry", {})
+    if not configured.get("enabled", True):
+        raise RuntimeError("Difference-image photometry is disabled")
+    if not target_solution.get("frozen", False):
+        raise ValueError("Difference photometry requires a frozen target coordinate")
+    if subtraction_result.get("difference") is None:
+        raise ValueError("The subtraction result contains no difference image")
+    subtraction_accepted = subtraction_result.get("status") == "PASS"
+    difference_flags = []
+    if not subtraction_accepted:
+        difference_flags.append("DIFFERENCE_SUBTRACTION_REJECTED")
+        if configured.get("require_accepted_subtraction", True):
+            science_annotated = _annotate_measurement_origin(
+                _science_measurement_table(science_photometry), "science", True
+            )
+            preferred = None
+            reason = "subtraction rejected; first valid science method used"
+            for method in configured.get("preferred_science_methods", []):
+                matches = [
+                    index for index, row in enumerate(science_annotated)
+                    if str(row["source_type"]) == "target"
+                    and str(row["method"]) == method and bool(row["valid"])
+                ]
+                if not matches:
+                    continue
+                index = matches[0]
+                row = science_annotated[index]
+                snr = _finite_float(row["snr"])
+                classification = str(row["classification"])
+                if not classification:
+                    classification = (
+                        "detection" if snr is not None and abs(snr) >= float(
+                            configured.get("detection_sigma", 3.0)
+                        ) else "nondetection"
+                    )
+                    science_annotated["classification"][index] = classification
+                science_annotated["preferred"][index] = True
+                science_annotated["selection_reason"][index] = reason
+                preferred = {
+                    "image_kind": "science", "method": method,
+                    "row_index": index, "host_light_included": True,
+                    "flux": _finite_float(row["flux"]),
+                    "flux_uncertainty": _finite_float(row["flux_uncertainty"]),
+                    "snr": snr, "classification": classification,
+                    "reason": reason,
+                }
+                break
+            if preferred is None:
+                difference_flags.append("PREFERRED_RESULT_UNAVAILABLE")
+            return {
+                "image_id": _image_id(science_record),
+                "status": "WARN" if preferred is not None else "FAIL",
+                "flags": difference_flags,
+                "measurements": Table(masked=True),
+                "all_measurements": science_annotated,
+                "science_measurements": science_annotated,
+                "comparison": Table(masked=True),
+                "limits": Table(masked=True),
+                "preferred_result": preferred,
+                "selection_rule": reason if preferred is not None else "accepted subtraction required",
+                "preferred_host_light_included": None if preferred is None else True,
+                "subtraction_result": subtraction_result,
+            }
+    difference_record = _difference_image_record(science_record, subtraction_result, settings)
+    difference_psf, psf_source = _difference_psf(
+        psf_result, subtraction_result, difference_psf_result
+    )
+    local_settings = merge_settings(
+        settings,
+        {
+            "apertures": {"add_poisson_noise_when_needed": False},
+            "upper_limits": {
+                "minimum_empty_apertures": configured.get("minimum_empty_apertures", 20),
+                "calculate_on_difference": True,
+            },
+        },
+    )
+    base = perform_science_image_photometry(
+        difference_record,
+        target_solution,
+        difference_psf,
+        measurements=measurements,
+        settings=local_settings,
+        wcs=_record_wcs(difference_record),
+    )
+    difference_table = _annotate_measurement_origin(
+        base["measurements"], "difference", False
+    )
+    target_indices = [
+        index for index, row in enumerate(difference_table)
+        if str(row["source_type"]) == "target"
+    ]
+    empty_results = {}
+    uncertainty_validation = {}
+    limit_rows = []
+    sigma_levels = [
+        float(value) for value in settings.get("upper_limits", {}).get("sigma_levels", [3, 5])
+    ]
+    detection_sigma = float(configured.get("detection_sigma", 3.0))
+    calculate_limits = bool(
+        settings.get("upper_limits", {}).get("enabled", True)
+        and settings.get("upper_limits", {}).get("calculate_on_difference", True)
+    )
+    uncertainty_failed = False
+    for index in target_indices:
+        row = difference_table[index]
+        method = str(row["method"])
+        formal = _finite_float(row["flux_uncertainty"])
+        empty = None
+        if configured.get("validate_with_empty_apertures", True):
+            empty = _empty_aperture_noise(
+                difference_record, base, difference_psf, method, local_settings
+            )
+        empty_results[method] = empty
+        empirical = None if empty is None else _finite_float(empty.get("noise"))
+        ratio = empirical / formal if empirical is not None and formal not in {None, 0.0} else None
+        adopted = formal
+        if (
+            empirical is not None and formal is not None and empirical > formal
+            and configured.get("inflate_underestimated_uncertainties", True)
+        ):
+            adopted = empirical
+        uncertainty_validation[method] = {
+            "formal": formal,
+            "empirical": empirical,
+            "ratio": ratio,
+            "adopted": adopted,
+        }
+        difference_table["flux_uncertainty"][index] = (
+            np.ma.masked if adopted is None else adopted
+        )
+        flux = _finite_float(row["flux"])
+        snr = flux / adopted if flux is not None and adopted not in {None, 0.0} else None
+        difference_table["snr"][index] = np.ma.masked if snr is None else snr
+        flags = list(filter(None, str(row["flags"]).split(";")))
+        if ratio is not None and ratio > float(configured.get("uncertainty_warn_ratio", 1.25)):
+            flags.append("DIFFERENCE_UNCERTAINTY_UNDERESTIMATED")
+            difference_flags.append("DIFFERENCE_UNCERTAINTY_UNDERESTIMATED")
+        if ratio is not None and ratio > float(configured.get("uncertainty_fail_ratio", 2.0)):
+            uncertainty_failed = True
+        classification = (
+            "measurement_failure" if not bool(row["valid"]) or flux is None or adopted is None
+            else "detection" if abs(snr) >= detection_sigma
+            else "nondetection"
+        )
+        difference_table["classification"][index] = classification
+        difference_table["flags"][index] = ";".join(dict.fromkeys(flags))
+        zeropoint, zeropoint_error = _zeropoint_lookup(
+            zeropoints, row["image_id"], method
+        )
+        limit_row = {
+            "image_id": str(row["image_id"]),
+            "method": method,
+            "filter": str(row["filter"]),
+            "formal_uncertainty": formal,
+            "empirical_uncertainty": empirical,
+            "uncertainty_ratio": ratio,
+            "adopted_uncertainty": adopted,
+            "empty_aperture_count": None if empty is None else empty.get("accepted_count"),
+            "empty_aperture_status": "NOT_REQUESTED" if empty is None else empty.get("status"),
+            "zeropoint_mag": zeropoint,
+            "zeropoint_uncertainty_mag": zeropoint_error,
+        }
+        exposure = _finite_float(row["exposure_time"])
+        for sigma in sigma_levels:
+            label = "{}sigma".format(int(sigma) if sigma.is_integer() else sigma)
+            flux_limit = None if adopted is None else sigma * adopted
+            limit_row["flux_{}".format(label)] = flux_limit
+            limit_row["limit_{}_mag".format(label)] = _magnitude_limit(
+                zeropoint, flux_limit, exposure
+            )
+        if calculate_limits:
+            limit_rows.append(limit_row)
+    limits = _records_table(limit_rows)
+    flux_unit = getattr(difference_table["flux"], "unit", None)
+    for name in limits.colnames:
+        if name.endswith("_mag"):
+            limits[name].unit = u.mag
+        elif flux_unit is not None and (
+            "uncertainty" in name or name.startswith("flux_")
+        ):
+            limits[name].unit = flux_unit
+    additions = {
+        "formal_flux_uncertainty": [],
+        "empirical_flux_uncertainty": [],
+        "uncertainty_ratio": [],
+        "zeropoint_mag": [],
+        "zeropoint_uncertainty_mag": [],
+        "calibrated_magnitude": [],
+        "calibrated_magnitude_uncertainty": [],
+    }
+    for row in difference_table:
+        method = str(row["method"])
+        validation = (
+            uncertainty_validation.get(method, {})
+            if str(row["source_type"]) == "target" else {}
+        )
+        formal = validation.get("formal")
+        empirical = validation.get("empirical")
+        ratio = validation.get("ratio")
+        zeropoint, zeropoint_error = _zeropoint_lookup(
+            zeropoints, row["image_id"], method
+        )
+        flux = _finite_float(row["flux"])
+        error = _finite_float(row["flux_uncertainty"])
+        exposure = _finite_float(row["exposure_time"])
+        magnitude = (
+            zeropoint - 2.5 * np.log10(flux / exposure)
+            if zeropoint is not None and flux is not None and flux > 0
+            and exposure is not None and exposure > 0 else None
+        )
+        magnitude_error = (
+            np.hypot(2.5 / np.log(10.0) * error / flux, zeropoint_error or 0.0)
+            if magnitude is not None and error is not None else None
+        )
+        for name, value in (
+            ("formal_flux_uncertainty", formal),
+            ("empirical_flux_uncertainty", empirical),
+            ("uncertainty_ratio", ratio),
+            ("zeropoint_mag", zeropoint),
+            ("zeropoint_uncertainty_mag", zeropoint_error),
+            ("calibrated_magnitude", magnitude),
+            ("calibrated_magnitude_uncertainty", magnitude_error),
+        ):
+            additions[name].append(value)
+    _add_numeric_columns(difference_table, additions)
+    for index, row in enumerate(difference_table):
+        if str(row["classification"]):
+            continue
+        flux = _finite_float(row["flux"])
+        uncertainty = _finite_float(row["flux_uncertainty"])
+        snr = flux / uncertainty if flux is not None and uncertainty not in {None, 0.0} else None
+        difference_table["classification"][index] = (
+            "measurement_failure" if not bool(row["valid"]) or snr is None
+            else "detection" if abs(snr) >= detection_sigma
+            else "nondetection"
+        )
+    for name in ("zeropoint_mag", "zeropoint_uncertainty_mag", "calibrated_magnitude", "calibrated_magnitude_uncertainty"):
+        difference_table[name].unit = u.mag
+    for name in ("formal_flux_uncertainty", "empirical_flux_uncertainty"):
+        difference_table[name].unit = difference_table["flux"].unit
+
+    target = base.get("target_diagnostics") or {}
+    rms = _finite_float((difference_record.get("quality") or {}).get("background_rms"), 1.0)
+    target_x = _finite_float(target.get("fixed_x"))
+    target_y = _finite_float(target.get("fixed_y"))
+    if target_x is None or target_y is None:
+        coordinate = SkyCoord(
+            float(target_solution["ra_deg"]), float(target_solution["dec_deg"]),
+            unit="deg", frame="icrs",
+        )
+        target_x, target_y = _record_wcs(difference_record).world_to_pixel(coordinate)
+    dipole = _difference_dipole(
+        np.asarray(subtraction_result["difference"], dtype=float),
+        target_x, target_y, base.get("fwhm_pixels", 4.0),
+        rms, settings,
+    )
+    if dipole["detected"]:
+        difference_flags.append("DIFFERENCE_DIPOLE")
+    science_table = _science_measurement_table(science_photometry)
+    comparison = _difference_comparison(science_table, difference_table)
+    if flux_unit is not None:
+        for name in comparison.colnames:
+            if "flux" in name or "uncertainty" in name or name == "difference_minus_science":
+                comparison[name].unit = flux_unit
+    inverted = False
+    science_by_method = {str(row["method"]): row for row in _target_rows(science_table)}
+    for row in _target_rows(difference_table):
+        method = str(row["method"])
+        science_row = science_by_method.get(method)
+        difference_flux = _finite_float(row["flux"])
+        difference_error = _finite_float(row["flux_uncertainty"])
+        science_flux = None if science_row is None else _finite_float(science_row["flux"])
+        if (
+            difference_flux is not None and difference_error not in {None, 0.0}
+            and science_flux is not None and science_flux > 0
+            and difference_flux < -float(configured.get("inverted_residual_sigma", 3.0)) * difference_error
+        ):
+            inverted = True
+    if inverted:
+        difference_flags.append("DIFFERENCE_INVERTED_RESIDUAL")
+    difference_flags = list(dict.fromkeys(difference_flags))
+    if difference_flags:
+        for index in target_indices:
+            current = str(difference_table["flags"][index])
+            difference_table["flags"][index] = ";".join(
+                dict.fromkeys(list(filter(None, current.split(";"))) + difference_flags)
+            )
+
+    science_annotated = _annotate_measurement_origin(science_table, "science", True)
+    preferred = None
+    selection_reason = None
+    severe = {"DIFFERENCE_DIPOLE", "DIFFERENCE_INVERTED_RESIDUAL"}
+    difference_allowed = (
+        subtraction_accepted
+        and not uncertainty_failed
+        and not severe.intersection(difference_flags)
+    )
+    if configured.get("prefer_difference_when_valid", True) and difference_allowed:
+        for method in configured.get("preferred_difference_methods", []):
+            matches = [
+                index for index in target_indices
+                if str(difference_table["method"][index]) == method
+                and bool(difference_table["valid"][index])
+            ]
+            if matches:
+                index = matches[0]
+                preferred = {
+                    "image_kind": "difference", "method": method,
+                    "row_index": index, "host_light_included": False,
+                }
+                selection_reason = (
+                    "accepted difference image; first valid method in configured preference order"
+                )
+                difference_table["preferred"][index] = True
+                difference_table["selection_reason"][index] = selection_reason
+                break
+    if preferred is None and len(science_annotated):
+        science_targets = [
+            index for index, row in enumerate(science_annotated)
+            if str(row["source_type"]) == "target"
+        ]
+        for method in configured.get("preferred_science_methods", []):
+            matches = [
+                index for index in science_targets
+                if str(science_annotated["method"][index]) == method
+                and bool(science_annotated["valid"][index])
+            ]
+            if matches:
+                index = matches[0]
+                preferred = {
+                    "image_kind": "science", "method": method,
+                    "row_index": index, "host_light_included": True,
+                }
+                selection_reason = (
+                    "difference result unavailable or rejected; first valid science method used"
+                )
+                science_annotated["preferred"][index] = True
+                science_annotated["selection_reason"][index] = selection_reason
+                break
+    if preferred is None:
+        difference_flags.append("PREFERRED_RESULT_UNAVAILABLE")
+    else:
+        table = difference_table if preferred["image_kind"] == "difference" else science_annotated
+        selected = table[preferred["row_index"]]
+        classification = str(selected["classification"])
+        if not classification:
+            selected_snr = _finite_float(selected["snr"])
+            classification = (
+                "measurement_failure" if not bool(selected["valid"])
+                else "detection" if selected_snr is not None and abs(selected_snr) >= detection_sigma
+                else "nondetection"
+            )
+            table["classification"][preferred["row_index"]] = classification
+        preferred.update(
+            {
+                "flux": _finite_float(selected["flux"]),
+                "flux_uncertainty": _finite_float(selected["flux_uncertainty"]),
+                "snr": _finite_float(selected["snr"]),
+                "classification": classification,
+                "reason": selection_reason,
+            }
+        )
+    all_measurements = (
+        vstack([science_annotated, difference_table], metadata_conflicts="silent")
+        if len(science_annotated) else difference_table
+    )
+    base.update(
+        {
+            "status": (
+                "FAIL" if preferred is None
+                else "WARN" if difference_flags else "PASS"
+            ),
+            "flags": list(dict.fromkeys(difference_flags)),
+            "measurements": difference_table,
+            "all_measurements": all_measurements,
+            "science_measurements": science_annotated,
+            "comparison": comparison,
+            "limits": limits,
+            "empty_apertures": empty_results,
+            "uncertainty_validation": uncertainty_validation,
+            "dipole": dipole,
+            "inverted_residual": inverted,
+            "preferred_result": preferred,
+            "selection_rule": selection_reason,
+            "preferred_host_light_included": (
+                None if preferred is None else preferred["host_light_included"]
+            ),
+            "difference_psf_source": psf_source,
+            "difference_record": difference_record,
+            "subtraction_result": subtraction_result,
+        }
+    )
+    return base
+
+
+def perform_difference_photometry(
+    image_records,
+    subtraction_results,
+    target_solution,
+    psf_results,
+    measurements=None,
+    science_results=None,
+    zeropoints=None,
+    settings=None,
+    difference_psf_results=None,
+    continue_on_error=True,
+):
+    """Perform difference-image photometry for a complete image batch."""
+
+    if settings is None:
+        settings = get_default_settings()
+    subtraction_lookup = {
+        str(item["image_id"]): item for item in subtraction_results
+    }
+    psf_lookup = dict(psf_results) if isinstance(psf_results, Mapping) else {
+        str(item["image_id"]): item for item in psf_results
+    }
+    science_lookup = {
+        str(item["image_id"]): item for item in (science_results or [])
+    }
+    difference_psf_lookup = (
+        dict(difference_psf_results) if isinstance(difference_psf_results, Mapping)
+        else {str(item["image_id"]): item for item in (difference_psf_results or [])}
+    )
+    results = []
+    tables = []
+    for index, record in enumerate(image_records):
+        image_id = _image_id(record, index)
+        try:
+            if image_id not in subtraction_lookup:
+                raise ValueError(
+                    "No subtraction result is available for {}".format(image_id)
+                )
+            if image_id not in psf_lookup:
+                raise ValueError("No PSF result is available for {}".format(image_id))
+            result = perform_difference_image_photometry(
+                record,
+                subtraction_lookup[image_id],
+                target_solution,
+                psf_lookup[image_id],
+                measurements,
+                science_lookup.get(image_id),
+                zeropoints,
+                record.get("settings") or settings,
+                difference_psf_lookup.get(image_id),
+            )
+        except Exception as error:
+            if not continue_on_error:
+                raise
+            result = {
+                "image_id": image_id,
+                "status": "FAIL",
+                "flags": ["DIFFERENCE_PHOTOMETRY_FAILED"],
+                "error": str(error),
+                "measurements": Table(masked=True),
+                "all_measurements": _annotate_measurement_origin(
+                    _science_measurement_table(science_lookup.get(image_id)),
+                    "science", True,
+                ),
+                "comparison": Table(masked=True),
+                "limits": Table(masked=True),
+                "preferred_result": None,
+                "preferred_host_light_included": None,
+            }
+        results.append(result)
+        if len(result.get("measurements", [])):
+            tables.append(result["measurements"])
+    combined = vstack(tables, metadata_conflicts="silent") if tables else Table(masked=True)
+    return combined, results
+
+
+def save_difference_photometry_products(
+    result, output_directory, settings=None, overwrite=None
+):
+    """Save difference measurements, limits, comparisons, and selection summary."""
+
+    if settings is None:
+        settings = get_default_settings()
+    configured = settings.get("subtraction", {}).get("photometry", {})
+    if overwrite is None:
+        overwrite = settings.get("output", {}).get("overwrite", False)
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    stem = _safe_stem(result.get("filename") or result.get("image_id"))
+    paths = {}
+    requests = {
+        "difference_photometry": ("measurements", configured.get("save_measurements", True)),
+        "all_photometry": ("all_measurements", configured.get("save_measurements", True)),
+        "science_difference_comparison": ("comparison", configured.get("save_comparison", True)),
+        "difference_limits": ("limits", configured.get("save_limits", True)),
+    }
+    for suffix, (key, enabled) in requests.items():
+        table = result.get(key)
+        if not enabled or table is None:
+            continue
+        path = output / "{}_{}.ecsv".format(stem, suffix)
+        table.write(path, format="ascii.ecsv", overwrite=bool(overwrite))
+        paths[key] = str(path)
+    if configured.get("save_summary", True):
+        path = output / "{}_difference_photometry.json".format(stem)
+        if path.exists() and not overwrite:
+            raise FileExistsError(str(path))
+        summary = {
+            "image_id": result.get("image_id"),
+            "status": result.get("status"),
+            "flags": result.get("flags", []),
+            "preferred_result": result.get("preferred_result"),
+            "selection_rule": result.get("selection_rule"),
+            "preferred_host_light_included": result.get(
+                "preferred_host_light_included"
+            ),
+            "difference_psf_source": result.get("difference_psf_source"),
+            "dipole": {
+                key: value for key, value in (result.get("dipole") or {}).items()
+                if key != "slices"
+            },
+            "inverted_residual": result.get("inverted_residual"),
+        }
+        path.write_text(json.dumps(summary, indent=2, default=str, sort_keys=True) + "\n")
+        paths["summary"] = str(path)
+    return paths
+
+
 __all__ = [
     "PSF_DOWNSTREAM_STAGES",
     "apply_psf_review",
@@ -3078,11 +3876,14 @@ __all__ = [
     "construct_psfs",
     "perform_science_image_photometry",
     "perform_science_photometry",
+    "perform_difference_image_photometry",
+    "perform_difference_photometry",
     "plan_psf_rerun",
     "psf_dependency_signature",
     "require_approved_psf",
     "route_calibration_catalog",
     "save_calibration_products",
+    "save_difference_photometry_products",
     "save_science_photometry_products",
     "save_psf_products",
 ]

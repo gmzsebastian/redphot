@@ -1900,9 +1900,155 @@ def plot_subtraction_diagnostics(result, science_record=None, output_path=None,
     return fig
 
 
+def plot_difference_photometry_diagnostics(result, output_path=None, show=False):
+    """Plot forced difference photometry, limits, and science comparison."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10), constrained_layout=True)
+    subtraction = result.get("subtraction_result") or {}
+    difference_record = result.get("difference_record") or {}
+    science_record = difference_record.get("science_record") or {}
+    science = None
+    for name in ("prepared_ccd", "working_ccd", "ccd"):
+        value = science_record.get(name)
+        if value is not None:
+            science = np.asarray(getattr(value, "data", value), dtype=float)
+            break
+    template = (subtraction.get("template") or {}).get("data")
+    aligned_template = (subtraction.get("aligned_template") or {}).get("data")
+    _show_image(fig, axes[0, 0], science, "Science")
+    _show_image(
+        fig, axes[0, 1], template if template is not None else aligned_template,
+        "Template",
+    )
+    diagnostics = result.get("target_diagnostics") or {}
+    context = diagnostics.get("context_data")
+    _show_image(fig, axes[0, 2], context, "Difference target", cmap="coolwarm")
+    if context is not None:
+        origin = diagnostics.get("context_origin", (0, 0))
+        center = (
+            diagnostics.get("fixed_x", 0.0) - origin[0],
+            diagnostics.get("fixed_y", 0.0) - origin[1],
+        )
+        for name, color in (
+            ("small_radius_pixels", "cyan"),
+            ("large_radius_pixels", "yellow"),
+        ):
+            radius = diagnostics.get(name)
+            if radius is not None:
+                axes[0, 2].add_patch(
+                    Circle(center, radius, fill=False, color=color, linewidth=1.2)
+                )
+    _show_image(fig, axes[0, 3], diagnostics.get("model"),
+                "Forced difference PSF model", cmap="viridis")
+    _show_image(fig, axes[1, 0], diagnostics.get("residual"),
+                "Difference minus model", cmap="coolwarm", lower=2, upper=98)
+
+    comparison_axis = axes[1, 1]
+    comparison_axis.set_title("Science and difference flux")
+    comparison = result.get("comparison")
+    if comparison is not None and len(comparison):
+        methods = [str(value) for value in comparison["method"]]
+        positions = np.arange(len(methods))
+        science_flux = np.ma.asarray(comparison["science_flux"], dtype=float).filled(np.nan)
+        science_error = np.ma.asarray(
+            comparison["science_uncertainty"], dtype=float
+        ).filled(np.nan)
+        difference_flux = np.ma.asarray(
+            comparison["difference_flux"], dtype=float
+        ).filled(np.nan)
+        difference_error = np.ma.asarray(
+            comparison["difference_uncertainty"], dtype=float
+        ).filled(np.nan)
+        comparison_axis.errorbar(
+            positions - 0.08, science_flux, yerr=science_error,
+            fmt="o", capsize=3, label="science (host included)",
+        )
+        comparison_axis.errorbar(
+            positions + 0.08, difference_flux, yerr=difference_error,
+            fmt="o", capsize=3, label="difference (host removed)",
+        )
+        comparison_axis.set_xticks(positions)
+        comparison_axis.set_xticklabels(methods, rotation=20, ha="right")
+        comparison_axis.legend(fontsize=8)
+    else:
+        comparison_axis.text(0.5, 0.5, "No paired measurements",
+                             ha="center", va="center")
+    comparison_axis.axhline(0, color="0.5", linewidth=1)
+    comparison_axis.set_ylabel("signed flux")
+    comparison_axis.grid(alpha=0.2)
+
+    limit_axis = axes[1, 2]
+    limit_axis.set_title("Difference-image limits")
+    limits = result.get("limits")
+    plotted = False
+    if limits is not None and len(limits):
+        columns = [name for name in limits.colnames if name.startswith("limit_") and name.endswith("_mag")]
+        labels, values = [], []
+        for row in limits:
+            for name in columns:
+                value = row[name]
+                if not np.ma.is_masked(value) and np.isfinite(float(value)):
+                    labels.append("{}\n{}".format(row["method"], name[6:-4]))
+                    values.append(float(value))
+        if values:
+            positions = np.arange(len(values))
+            limit_axis.bar(positions, values, color="tab:purple", alpha=0.75)
+            limit_axis.set_xticks(positions)
+            limit_axis.set_xticklabels(labels, rotation=65, ha="right", fontsize=7)
+            limit_axis.invert_yaxis()
+            limit_axis.set_ylabel("limiting magnitude")
+            plotted = True
+    if not plotted:
+        limit_axis.text(0.5, 0.5, "No calibrated magnitude limits",
+                        ha="center", va="center")
+
+    summary_axis = axes[1, 3]
+    summary_axis.set_axis_off()
+    preferred = result.get("preferred_result") or {}
+    dipole = result.get("dipole") or {}
+    summary = [
+        "Status: {}".format(result.get("status")),
+        "Preferred: {} / {}".format(
+            preferred.get("image_kind", "none"), preferred.get("method", "none")
+        ),
+        "Host light included: {}".format(
+            result.get("preferred_host_light_included")
+        ),
+        "Classification: {}".format(preferred.get("classification", "none")),
+        "S/N: {}".format(
+            "n/a" if preferred.get("snr") is None else "{:.2f}".format(preferred["snr"])
+        ),
+        "Difference PSF: {}".format(result.get("difference_psf_source")),
+        "Dipole: {}".format(dipole.get("detected", False)),
+        "Dipole ratio: {}".format(
+            "n/a" if dipole.get("absolute_lobe_ratio") is None
+            else "{:.3f}".format(dipole["absolute_lobe_ratio"])
+        ),
+        "Inverted residual: {}".format(result.get("inverted_residual")),
+        "Flags: {}".format(", ".join(result.get("flags", [])) or "none"),
+        "",
+        "Rule:",
+        str(result.get("selection_rule") or "none"),
+    ]
+    summary_axis.text(0.02, 0.98, "\n".join(summary), va="top", ha="left",
+                      family="monospace", fontsize=10, wrap=True)
+    fig.suptitle("Difference-image forced photometry", fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_calibration_diagnostics",
+    "plot_difference_photometry_diagnostics",
     "plot_astrometry_diagnostics",
     "plot_alignment_target_diagnostics",
     "plot_image_quality_diagnostics",

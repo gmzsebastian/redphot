@@ -206,6 +206,12 @@ QUALITY_FLAGS = {
         "APERTURE_CORRECTION_FAILED",
         "EMPTY_APERTURE_LIMIT_FAILED",
         "NONDETECTION",
+        "DIFFERENCE_PHOTOMETRY_FAILED",
+        "DIFFERENCE_UNCERTAINTY_UNDERESTIMATED",
+        "DIFFERENCE_DIPOLE",
+        "DIFFERENCE_INVERTED_RESIDUAL",
+        "DIFFERENCE_SUBTRACTION_REJECTED",
+        "PREFERRED_RESULT_UNAVAILABLE",
     ],
     "subtraction": [
         "TEMPLATE_MISSING",
@@ -988,6 +994,35 @@ DEFAULT_SETTINGS = {
         "save_logs": True,
         "save_parameters": True,
         "save_quality_table": True,
+        "photometry": {
+            "enabled": True,
+            "require_accepted_subtraction": True,
+            "validate_with_empty_apertures": True,
+            "minimum_empty_apertures": 20,
+            "uncertainty_warn_ratio": 1.25,
+            "uncertainty_fail_ratio": 2.0,
+            "inflate_underestimated_uncertainties": True,
+            "dipole_sigma": 3.0,
+            "dipole_ratio_threshold": 0.25,
+            "dipole_minimum_separation_pixels": 0.5,
+            "inverted_residual_sigma": 3.0,
+            "detection_sigma": 3.0,
+            "preferred_difference_methods": [
+                "psf",
+                "small_aperture",
+                "large_aperture",
+            ],
+            "preferred_science_methods": [
+                "psf",
+                "small_aperture",
+                "large_aperture",
+            ],
+            "prefer_difference_when_valid": True,
+            "save_measurements": True,
+            "save_comparison": True,
+            "save_limits": True,
+            "save_summary": True,
+        },
     },
     "upper_limits": {
         "enabled": True,
@@ -1817,6 +1852,41 @@ def validate_settings(settings):
         raise ValueError(
             "subtraction.hotpants.stamp_grid must contain two positive integers"
         )
+    difference_settings = subtraction_settings.get("photometry", {})
+    if int(difference_settings.get("minimum_empty_apertures", 20)) < 1:
+        raise ValueError(
+            "subtraction.photometry.minimum_empty_apertures must be positive"
+        )
+    uncertainty_warn = float(
+        difference_settings.get("uncertainty_warn_ratio", 1.25)
+    )
+    uncertainty_fail = float(
+        difference_settings.get("uncertainty_fail_ratio", 2.0)
+    )
+    if not 1 <= uncertainty_warn <= uncertainty_fail:
+        raise ValueError(
+            "difference uncertainty ratios must satisfy 1 <= warn <= fail"
+        )
+    for name in (
+        "dipole_sigma",
+        "dipole_minimum_separation_pixels",
+        "inverted_residual_sigma",
+        "detection_sigma",
+    ):
+        if float(difference_settings.get(name, 1.0)) <= 0:
+            raise ValueError("subtraction.photometry.{} must be positive".format(name))
+    dipole_ratio = float(difference_settings.get("dipole_ratio_threshold", 0.25))
+    if not 0 < dipole_ratio <= 1:
+        raise ValueError(
+            "subtraction.photometry.dipole_ratio_threshold must be in (0, 1]"
+        )
+    methods = {"small_aperture", "large_aperture", "psf"}
+    for name in ("preferred_difference_methods", "preferred_science_methods"):
+        values = difference_settings.get(name, [])
+        if not values or not set(values).issubset(methods):
+            raise ValueError(
+                "subtraction.photometry.{} contains an unknown method".format(name)
+            )
 
     target_ra = settings["target_position"]["ra"]
     target_dec = settings["target_position"]["dec"]
