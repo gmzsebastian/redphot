@@ -212,6 +212,10 @@ QUALITY_FLAGS = {
         "DIFFERENCE_INVERTED_RESIDUAL",
         "DIFFERENCE_SUBTRACTION_REJECTED",
         "PREFERRED_RESULT_UNAVAILABLE",
+        "COMPARISON_STAR_UNSTABLE",
+        "BATCH_MEASUREMENT_OUTLIER",
+        "BATCH_EPOCH_PROBLEM",
+        "BATCH_GROUP_PROBLEM",
     ],
     "subtraction": [
         "TEMPLATE_MISSING",
@@ -1046,6 +1050,53 @@ DEFAULT_SETTINGS = {
         "calculate_on_science": True,
         "calculate_on_difference": True,
     },
+    "batch_consistency": {
+        "enabled": True,
+        "comparison_methods": ["small_aperture", "large_aperture", "psf"],
+        "minimum_comparison_epochs": 3,
+        "comparison_star_rms_warn_mag": 0.05,
+        "comparison_star_rms_fail_mag": 0.15,
+        "comparison_star_reduced_chi2_warn": 3.0,
+        "comparison_star_reduced_chi2_fail": 10.0,
+        "minimum_stable_comparison_stars": 3,
+        "metric_outlier_warn_sigma": 3.5,
+        "metric_outlier_fail_sigma": 6.0,
+        "problem_group_warn_fraction": 0.25,
+        "problem_group_fail_fraction": 0.50,
+        "minimum_group_images": 2,
+        "ensemble_correction": {
+            "enabled": False,
+            "components": ["telescope", "epoch"],
+            "minimum_stars": 3,
+            "sigma_clip": 3.0,
+            "maximum_iterations": 5,
+            "maximum_absolute_correction_mag": 0.50,
+            "apply_to_target": True,
+        },
+        "method_disagreement_warn_sigma": 3.0,
+        "method_disagreement_fail_sigma": 5.0,
+        "method_disagreement_floor_mag": 0.05,
+        "temporal_outlier_sigma": 5.0,
+        "temporal_maximum_gap_days": 30.0,
+        "preferred_order": [
+            "difference:psf",
+            "difference:small_aperture",
+            "difference:large_aperture",
+            "science:psf",
+            "science:small_aperture",
+            "science:large_aperture",
+        ],
+        "accepted_image_statuses": ["PASS", "WARN"],
+        "retain_rejected_measurements": True,
+        "save_comparison_light_curves": True,
+        "save_stability_table": True,
+        "save_epoch_metrics": True,
+        "save_group_summary": True,
+        "save_method_comparison": True,
+        "save_preferred_light_curve": True,
+        "save_all_flagged_measurements": True,
+        "save_summary": True,
+    },
     "diagnostics": {
         "enabled": True,
         "show_plots": False,
@@ -1259,6 +1310,7 @@ REQUIRED_SECTIONS = [
     "calibration",
     "subtraction",
     "upper_limits",
+    "batch_consistency",
     "diagnostics",
     "output",
 ]
@@ -2021,6 +2073,54 @@ def validate_settings(settings):
         allowed_limit_methods
     ):
         raise ValueError("upper_limits.empty_aperture_methods contains an unknown method")
+
+    batch_settings = settings["batch_consistency"]
+    if int(batch_settings.get("minimum_comparison_epochs", 3)) < 2:
+        raise ValueError("batch_consistency.minimum_comparison_epochs must be at least 2")
+    if int(batch_settings.get("minimum_stable_comparison_stars", 3)) < 1:
+        raise ValueError(
+            "batch_consistency.minimum_stable_comparison_stars must be positive"
+        )
+    rms_warn = float(batch_settings.get("comparison_star_rms_warn_mag", 0.05))
+    rms_fail = float(batch_settings.get("comparison_star_rms_fail_mag", 0.15))
+    if not 0 < rms_warn <= rms_fail:
+        raise ValueError("comparison-star RMS limits must satisfy 0 < warn <= fail")
+    chi_warn = float(batch_settings.get("comparison_star_reduced_chi2_warn", 3.0))
+    chi_fail = float(batch_settings.get("comparison_star_reduced_chi2_fail", 10.0))
+    if not 1 <= chi_warn <= chi_fail:
+        raise ValueError("comparison-star chi-square limits must satisfy 1 <= warn <= fail")
+    metric_warn = float(batch_settings.get("metric_outlier_warn_sigma", 3.5))
+    metric_fail = float(batch_settings.get("metric_outlier_fail_sigma", 6.0))
+    if not 0 < metric_warn <= metric_fail:
+        raise ValueError("batch metric limits must satisfy 0 < warn <= fail")
+    fraction_warn = float(batch_settings.get("problem_group_warn_fraction", 0.25))
+    fraction_fail = float(batch_settings.get("problem_group_fail_fraction", 0.50))
+    if not 0 <= fraction_warn <= fraction_fail <= 1:
+        raise ValueError("batch group fractions must satisfy 0 <= warn <= fail <= 1")
+    if int(batch_settings.get("minimum_group_images", 2)) < 1:
+        raise ValueError("batch_consistency.minimum_group_images must be positive")
+    allowed_methods = {"small_aperture", "large_aperture", "psf"}
+    if not set(batch_settings.get("comparison_methods", [])).issubset(allowed_methods):
+        raise ValueError("batch_consistency.comparison_methods contains an unknown method")
+    allowed_preferences = {
+        "{}:{}".format(kind, method)
+        for kind in ("science", "difference") for method in allowed_methods
+    }
+    preferred = batch_settings.get("preferred_order", [])
+    if not preferred or not set(preferred).issubset(allowed_preferences):
+        raise ValueError("batch_consistency.preferred_order contains an unknown result")
+    statuses = set(batch_settings.get("accepted_image_statuses", ["PASS", "WARN"]))
+    if not statuses or not statuses.issubset({"PASS", "WARN", "FAIL"}):
+        raise ValueError(
+            "batch_consistency.accepted_image_statuses must contain PASS, WARN, or FAIL"
+        )
+    ensemble = batch_settings.get("ensemble_correction", {})
+    if not set(ensemble.get("components", [])).issubset({"epoch", "telescope"}):
+        raise ValueError("ensemble correction components must be epoch or telescope")
+    if int(ensemble.get("minimum_stars", 3)) < 1:
+        raise ValueError("ensemble_correction.minimum_stars must be positive")
+    if float(ensemble.get("maximum_absolute_correction_mag", 0.50)) <= 0:
+        raise ValueError("ensemble maximum correction must be positive")
 
 
 def resolve_settings(instrument_name=None, run_settings=None, filter_name=None, filter_settings=None,

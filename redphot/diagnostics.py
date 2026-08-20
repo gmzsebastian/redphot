@@ -2045,8 +2045,196 @@ def plot_difference_photometry_diagnostics(result, output_path=None, show=False)
     return fig
 
 
+def plot_batch_consistency_diagnostics(products, output_path=None, show=False):
+    """Plot batch trends, rejected epochs, star stability, and light curves."""
+
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 2, figsize=(17, 14), constrained_layout=True)
+    epoch = products.get("epoch_metrics")
+    trends_axis = axes[0, 0]
+    trends_axis.set_title("Batch metrics over time")
+    if epoch is not None and len(epoch):
+        mjd = np.ma.asarray(epoch["mjd"], dtype=float).filled(np.nan)
+        metric_styles = (
+            ("zeropoint_mag", "zeropoint", "o"),
+            ("depth_5sigma_mag", "5-sigma depth", "s"),
+            ("seeing_fwhm_arcsec", "seeing", "^"),
+            ("background_rms", "background RMS", "v"),
+            ("wcs_rms_arcsec", "WCS RMS", "D"),
+        )
+        for name, label, marker in metric_styles:
+            if name not in epoch.colnames:
+                continue
+            values = np.ma.asarray(epoch[name], dtype=float).filled(np.nan)
+            valid = np.isfinite(mjd) & np.isfinite(values)
+            if np.any(valid):
+                normalized = values[valid] - np.nanmedian(values[valid])
+                scatter = 1.4826 * np.nanmedian(np.abs(normalized))
+                if np.isfinite(scatter) and scatter > 0:
+                    normalized /= scatter
+                trends_axis.plot(mjd[valid], normalized, marker=marker,
+                                 linestyle="-", alpha=0.7, label=label)
+        trends_axis.axhline(0, color="0.5", linewidth=1)
+        trends_axis.set_xlabel("MJD")
+        trends_axis.set_ylabel("median-centered robust units")
+        trends_axis.legend(fontsize=8, ncol=2)
+    else:
+        trends_axis.text(0.5, 0.5, "No epoch metrics", ha="center", va="center")
+    trends_axis.grid(alpha=0.2)
+
+    rejected_axis = axes[0, 1]
+    rejected_axis.set_title("Accepted and rejected epochs")
+    if epoch is not None and len(epoch):
+        colors = {"PASS": "tab:green", "WARN": "tab:orange", "FAIL": "tab:red"}
+        for status in ("PASS", "WARN", "FAIL"):
+            selection = np.asarray(epoch["status"], dtype=str) == status
+            if np.any(selection):
+                rejected_axis.scatter(
+                    np.ma.asarray(epoch["mjd"], dtype=float).filled(np.nan)[selection],
+                    np.arange(len(epoch))[selection], color=colors[status],
+                    label=status, s=45,
+                )
+        rejected_axis.set_xlabel("MJD")
+        rejected_axis.set_ylabel("image index")
+        rejected_axis.legend(fontsize=8)
+    else:
+        rejected_axis.text(0.5, 0.5, "No image decisions", ha="center", va="center")
+    rejected_axis.grid(alpha=0.2)
+
+    stability_axis = axes[1, 0]
+    stability_axis.set_title("Comparison-star stability")
+    stability = products.get("comparison_stability")
+    if stability is not None and len(stability):
+        order = np.argsort(np.ma.asarray(stability["rms_mag"], dtype=float).filled(np.inf))
+        values = np.ma.asarray(stability["rms_mag"], dtype=float).filled(np.nan)[order]
+        labels = [
+            "{} {} {}".format(stability[index]["source_id"], stability[index]["filter"],
+                              stability[index]["method"])
+            for index in order
+        ]
+        colors = [
+            {"PASS": "tab:green", "WARN": "tab:orange", "FAIL": "tab:red"}.get(
+                str(stability[index]["status"]), "0.5"
+            ) for index in order
+        ]
+        positions = np.arange(len(values))
+        stability_axis.bar(positions, values, color=colors, alpha=0.8)
+        stability_axis.set_xticks(positions)
+        stability_axis.set_xticklabels(labels, rotation=70, ha="right", fontsize=6)
+        stability_axis.set_ylabel("RMS [mag]")
+    else:
+        stability_axis.text(0.5, 0.5, "No comparison-star light curves",
+                            ha="center", va="center")
+    stability_axis.grid(axis="y", alpha=0.2)
+
+    group_axis = axes[1, 1]
+    group_axis.set_title("Problem fraction by telescope, site, and filter")
+    groups = products.get("group_summary")
+    if groups is not None and len(groups):
+        labels = ["{}:{}".format(row["group_type"], row["group_value"]) for row in groups]
+        values = np.ma.asarray(groups["problem_fraction"], dtype=float).filled(np.nan)
+        colors = [
+            {"PASS": "tab:green", "WARN": "tab:orange", "FAIL": "tab:red"}.get(
+                str(row["status"]), "0.5"
+            ) for row in groups
+        ]
+        positions = np.arange(len(values))
+        group_axis.bar(positions, values, color=colors, alpha=0.8)
+        group_axis.set_xticks(positions)
+        group_axis.set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
+        group_axis.set_ylim(0, 1)
+        group_axis.set_ylabel("WARN + FAIL fraction")
+    else:
+        group_axis.text(0.5, 0.5, "No group summary", ha="center", va="center")
+    group_axis.grid(axis="y", alpha=0.2)
+
+    methods_axis = axes[2, 0]
+    methods_axis.set_title("Multi-method target light curve")
+    measurements = products.get("measurements")
+    if measurements is not None and len(measurements):
+        target = measurements[np.asarray(measurements["source_type"], dtype=str) == "target"]
+        styles = {
+            ("science", "small_aperture"): ("o", "tab:cyan"),
+            ("science", "large_aperture"): ("s", "tab:blue"),
+            ("science", "psf"): ("^", "navy"),
+            ("difference", "small_aperture"): ("o", "tab:pink"),
+            ("difference", "large_aperture"): ("s", "tab:red"),
+            ("difference", "psf"): ("^", "darkred"),
+        }
+        for (kind, method), (marker, color) in styles.items():
+            selection = (
+                (np.asarray(target["image_kind"], dtype=str) == kind)
+                & (np.asarray(target["method"], dtype=str) == method)
+            )
+            if not np.any(selection):
+                continue
+            rows = target[selection]
+            magnitude_name = (
+                "ensemble_corrected_magnitude"
+                if "ensemble_corrected_magnitude" in rows.colnames
+                else "calibrated_magnitude"
+            )
+            if magnitude_name not in rows.colnames:
+                continue
+            methods_axis.scatter(
+                np.ma.asarray(rows["mjd_mid"], dtype=float).filled(np.nan),
+                np.ma.asarray(rows[magnitude_name], dtype=float).filled(np.nan),
+                marker=marker, color=color, label="{} {}".format(kind, method), s=30,
+            )
+        methods_axis.invert_yaxis()
+        methods_axis.set_xlabel("MJD")
+        methods_axis.set_ylabel("magnitude")
+        methods_axis.legend(fontsize=7, ncol=2)
+    else:
+        methods_axis.text(0.5, 0.5, "No target measurements", ha="center", va="center")
+    methods_axis.grid(alpha=0.2)
+
+    preferred_axis = axes[2, 1]
+    preferred_axis.set_title("Final preferred light curve")
+    preferred = products.get("preferred_light_curve")
+    if preferred is not None and len(preferred):
+        for included, marker, color, label in (
+            (True, "o", "tab:blue", "included"),
+            (False, "x", "tab:red", "retained but rejected"),
+        ):
+            selection = np.asarray(preferred["included_in_final"], dtype=bool) == included
+            if not np.any(selection):
+                continue
+            rows = preferred[selection]
+            preferred_axis.errorbar(
+                np.ma.asarray(rows["mjd"], dtype=float).filled(np.nan),
+                np.ma.asarray(rows["magnitude"], dtype=float).filled(np.nan),
+                yerr=np.ma.asarray(rows["magnitude_uncertainty"], dtype=float).filled(np.nan),
+                fmt=marker, color=color, label=label, capsize=2,
+            )
+        preferred_axis.invert_yaxis()
+        preferred_axis.set_xlabel("MJD")
+        preferred_axis.set_ylabel("preferred magnitude")
+        preferred_axis.legend(fontsize=8)
+    else:
+        preferred_axis.text(0.5, 0.5, "No preferred light curve",
+                            ha="center", va="center")
+    preferred_axis.grid(alpha=0.2)
+    fig.suptitle(
+        "Batch consistency — status {} — unstable stars {} — failed epochs {} — outliers {}".format(
+            products.get("status"), products.get("unstable_comparison_count", 0),
+            products.get("failed_epoch_count", 0), products.get("measurement_outlier_count", 0),
+        ),
+        fontsize=15,
+    )
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
+    "plot_batch_consistency_diagnostics",
     "plot_calibration_diagnostics",
     "plot_difference_photometry_diagnostics",
     "plot_astrometry_diagnostics",

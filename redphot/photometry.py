@@ -1581,7 +1581,8 @@ def _measurement_table(rows, flux_unit):
 
     table = Table(masked=True)
     string_fields = (
-        "image_id", "filename", "filter", "source_id", "source_type", "roles",
+        "image_id", "filename", "filter", "telescope", "site", "instrument",
+        "detector", "source_id", "source_type", "roles",
         "method", "coordinate_version", "model_type", "psf_version",
         "uncertainty_source", "flags",
     )
@@ -1743,6 +1744,10 @@ def perform_science_image_photometry(
                     "image_id": image_id,
                     "filename": metadata.get("filename", image_id),
                     "filter": metadata.get("filter", ""),
+                    "telescope": metadata.get("telescope", ""),
+                    "site": metadata.get("site", ""),
+                    "instrument": metadata.get("instrument", ""),
+                    "detector": metadata.get("detector", ""),
                     "mjd_mid": metadata.get("mjd_mid", metadata.get("mjd")),
                     "exposure_time": metadata.get("exposure_time"),
                     "airmass": metadata.get("airmass"),
