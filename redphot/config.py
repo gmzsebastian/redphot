@@ -211,10 +211,18 @@ QUALITY_FLAGS = {
         "TEMPLATE_MISSING",
         "TEMPLATE_COVERAGE_INCOMPLETE",
         "TEMPLATE_FILTER_MISMATCH",
+        "TEMPLATE_DEPTH_INSUFFICIENT",
+        "TEMPLATE_SEEING_POOR",
+        "TEMPLATE_SATURATION_HIGH",
+        "TEMPLATE_POST_TRANSIENT",
+        "TEMPLATE_WCS_INVALID",
         "TEMPLATE_ALIGNMENT_FAILED",
+        "SUBTRACTION_BACKEND_MISSING",
         "SUBTRACTION_FAILED",
         "SUBTRACTION_RESIDUAL_HIGH",
         "SUBTRACTION_DIPOLE",
+        "SUBTRACTION_FLUX_LOSS",
+        "SUBTRACTION_NOISE_HIGH",
     ],
 }
 
@@ -917,22 +925,49 @@ DEFAULT_SETTINGS = {
         "template_path": None,
         "template_source": "auto",
         "template_survey_priority": ["ps1", "legacy", "decam"],
+        "survey_names": {
+            "ps1": "PanSTARRS DR1",
+            "legacy": "DESI Legacy Imaging Surveys",
+            "decam": "DECaLS DR5",
+        },
+        "survey_filter_map": {},
+        "download_pixel_scale_arcsec": None,
+        "download_timeout_s": 120,
+        "maximum_mosaic_pixels": 100000000,
+        "cache_directory": "redphot_cache/templates",
+        "use_cached_templates": True,
+        "save_downloaded_templates": True,
         "template_margin_arcmin": 2.0,
         "require_pretransient_template": True,
+        "transient_epoch_mjd": None,
         "require_filter_match": True,
         "allow_approximate_filter_match": False,
+        "approximate_filter_matches": {},
+        "minimum_coverage_fraction": 0.99,
+        "minimum_template_depth_margin_mag": 0.5,
+        "maximum_template_fwhm_ratio": 2.0,
+        "maximum_template_saturated_fraction": 0.01,
         "keep_science_grid": True,
         "resample_template_only": True,
+        "resampling_order": 3,
+        "resampling_tile_rows": 256,
         "background_match": True,
         "photometric_scale": True,
+        "scale_sigma_clip": 3.0,
+        "scale_maximum_iterations": 5,
+        "minimum_scale_pixels": 1000,
         "automatic_parameters": True,
         "hotpants_executable": "hotpants",
+        "execution_timeout_s": 300,
         "hotpants": {
             "kernel_order": "auto",
             "background_order": "auto",
             "stamp_count": "auto",
+            "stamp_grid": "auto",
+            "kernel_radius": "auto",
             "lower_threshold": "auto",
             "upper_threshold": "auto",
+            "extra_arguments": [],
         },
         "pyzogy": {
             "enabled": False,
@@ -941,9 +976,18 @@ DEFAULT_SETTINGS = {
         },
         "maximum_alignment_rms_pixels": 0.5,
         "maximum_residual_fraction": 0.10,
+        "maximum_dipole_fraction": 0.20,
+        "maximum_flux_bias_fraction": 0.10,
+        "maximum_noise_ratio": 2.0,
+        "minimum_quality_stars": 3,
+        "blank_aperture_count": 50,
+        "blank_aperture_radius_fwhm": 1.0,
+        "blank_aperture_seed": 12345,
         "save_aligned_template": True,
         "save_difference": True,
         "save_logs": True,
+        "save_parameters": True,
+        "save_quality_table": True,
     },
     "upper_limits": {
         "enabled": True,
@@ -1720,10 +1764,58 @@ def validate_settings(settings):
     if float(calibration_settings.get("detection_sigma", 3.0)) <= 0:
         raise ValueError("calibration.detection_sigma must be positive")
 
-    subtraction_method = settings["subtraction"]["method"]
+    subtraction_settings = settings["subtraction"]
+    subtraction_method = subtraction_settings["method"]
     if subtraction_method not in {"hotpants", "pyzogy"}:
         raise ValueError(
             "subtraction.method must be hotpants or pyzogy"
+        )
+    fallback_method = subtraction_settings.get("fallback_method")
+    if fallback_method not in {None, "hotpants", "pyzogy"}:
+        raise ValueError(
+            "subtraction.fallback_method must be None, hotpants, or pyzogy"
+        )
+    for name in (
+        "minimum_coverage_fraction",
+        "maximum_template_saturated_fraction",
+        "maximum_residual_fraction",
+        "maximum_dipole_fraction",
+        "maximum_flux_bias_fraction",
+    ):
+        value = float(subtraction_settings.get(name, 0.0))
+        if not 0 <= value <= 1:
+            raise ValueError("subtraction.{} must be in [0, 1]".format(name))
+    for name in (
+        "template_margin_arcmin",
+        "maximum_template_fwhm_ratio",
+        "maximum_alignment_rms_pixels",
+        "maximum_noise_ratio",
+        "execution_timeout_s",
+    ):
+        if float(subtraction_settings.get(name, 0.0)) <= 0:
+            raise ValueError("subtraction.{} must be positive".format(name))
+    if int(subtraction_settings.get("resampling_order", 3)) not in {0, 1, 2, 3}:
+        raise ValueError("subtraction.resampling_order must be between 0 and 3")
+    if int(subtraction_settings.get("resampling_tile_rows", 256)) <= 0:
+        raise ValueError("subtraction.resampling_tile_rows must be positive")
+    if int(subtraction_settings.get("maximum_mosaic_pixels", 100000000)) <= 0:
+        raise ValueError("subtraction.maximum_mosaic_pixels must be positive")
+    if int(subtraction_settings.get("minimum_scale_pixels", 1000)) < 10:
+        raise ValueError("subtraction.minimum_scale_pixels must be at least 10")
+    if int(subtraction_settings.get("blank_aperture_count", 50)) < 1:
+        raise ValueError("subtraction.blank_aperture_count must be positive")
+    if int(subtraction_settings.get("minimum_quality_stars", 3)) < 1:
+        raise ValueError("subtraction.minimum_quality_stars must be positive")
+    hotpants_settings = subtraction_settings.get("hotpants", {})
+    stamp_count = hotpants_settings.get("stamp_count", "auto")
+    if stamp_count != "auto" and int(stamp_count) < 1:
+        raise ValueError("subtraction.hotpants.stamp_count must be positive or auto")
+    stamp_grid = hotpants_settings.get("stamp_grid", "auto")
+    if stamp_grid != "auto" and (
+        len(stamp_grid) != 2 or any(int(value) < 1 for value in stamp_grid)
+    ):
+        raise ValueError(
+            "subtraction.hotpants.stamp_grid must contain two positive integers"
         )
 
     target_ra = settings["target_position"]["ra"]

@@ -1768,6 +1768,138 @@ def plot_calibration_diagnostics(products, output_path=None, show=False):
     return fig
 
 
+def plot_subtraction_diagnostics(result, science_record=None, output_path=None,
+                                 show=False):
+    """Plot template preparation, difference quality, and backend diagnostics.
+
+    Parameters
+    ----------
+    result : mapping
+        Result returned by
+        :func:`redphot.subtraction.perform_image_subtraction`.
+    science_record : mapping, optional
+        Input image record.  Supplying it adds the original science panel.
+    output_path : str or pathlib.Path, optional
+        PNG or PDF destination.
+    show : bool, optional
+        Display the completed figure interactively.
+    """
+
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 3, figsize=(16, 13), constrained_layout=True)
+    science = None
+    if science_record is not None:
+        for name in ("prepared_ccd", "working_ccd", "ccd"):
+            value = science_record.get(name)
+            if value is not None:
+                science = np.asarray(getattr(value, "data", value), dtype=float)
+                break
+        if science is None and science_record.get("data") is not None:
+            science = np.asarray(science_record["data"], dtype=float)
+    template = result.get("template") or {}
+    aligned = result.get("aligned_template") or {}
+    difference = result.get("difference")
+    _show_image(fig, axes[0, 0], science, "Science (native grid)")
+    _show_image(fig, axes[0, 1], template.get("data"), "Template mosaic")
+    _show_image(fig, axes[0, 2], aligned.get("data"), "Aligned template")
+    _show_image(fig, axes[1, 0], difference, "Difference", cmap="coolwarm")
+
+    kernel_axis = axes[1, 1]
+    kernel_axis.set_title("Kernel choice")
+    parameters = result.get("parameters") or {}
+    components = parameters.get("gaussian_components", [])
+    if components:
+        x = np.linspace(-8, 8, 400)
+        for degree, sigma in components:
+            profile = np.exp(-0.5 * (x / float(sigma)) ** 2)
+            kernel_axis.plot(x, profile, label="degree {}, sigma {}".format(degree, sigma))
+        kernel_axis.legend(fontsize=8)
+        kernel_axis.set_xlabel("kernel coordinate [pixel]")
+        kernel_axis.set_ylabel("relative amplitude")
+    else:
+        kernel_axis.text(0.5, 0.5, "Kernel not available", ha="center", va="center")
+
+    histogram_axis = axes[1, 2]
+    histogram_axis.set_title("Difference-pixel distribution")
+    if difference is not None:
+        values = np.asarray(difference, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size:
+            low, high = np.nanpercentile(values, [0.5, 99.5])
+            histogram_axis.hist(values[(values >= low) & (values <= high)], bins=80,
+                                histtype="step", color="black")
+    histogram_axis.set_xlabel("difference value")
+    histogram_axis.set_ylabel("pixels")
+
+    residual_axis = axes[2, 0]
+    residual_axis.set_title("Stellar residuals")
+    quality = result.get("quality") or {}
+    residuals = quality.get("star_residuals")
+    if residuals is not None and len(residuals):
+        residual_axis.scatter(
+            residuals["science_flux"], residuals["residual_fraction"],
+            c=residuals["dipole_fraction"], cmap="viridis", edgecolor="none",
+        )
+        residual_axis.set_xscale("symlog")
+        residual_axis.axhline(0.10, color="tab:red", linestyle="--", alpha=0.6)
+    else:
+        residual_axis.text(0.5, 0.5, "No quality-star measurements",
+                           ha="center", va="center")
+    residual_axis.set_xlabel("science flux")
+    residual_axis.set_ylabel("absolute residual fraction")
+
+    blank_axis = axes[2, 1]
+    blank_axis.set_title("Blank-aperture noise")
+    blank = np.asarray(quality.get("blank_aperture_fluxes", []), dtype=float)
+    blank = blank[np.isfinite(blank)]
+    if blank.size:
+        blank_axis.hist(blank, bins=min(30, max(5, blank.size // 2)),
+                        histtype="stepfilled", alpha=0.5, color="tab:blue")
+        blank_axis.axvline(0, color="black", linewidth=1)
+    else:
+        blank_axis.text(0.5, 0.5, "No blank apertures", ha="center", va="center")
+    blank_axis.set_xlabel("aperture flux")
+
+    summary_axis = axes[2, 2]
+    summary_axis.set_axis_off()
+    summary = [
+        "Image: {}".format(result.get("image_id")),
+        "Status: {}".format(result.get("status")),
+        "Backend: {}".format(result.get("method")),
+        "Convolved: {}".format(parameters.get("convolve", "unknown")),
+        "Coverage: {}".format(
+            "n/a" if aligned.get("coverage_fraction") is None
+            else "{:.3f}".format(aligned["coverage_fraction"])
+        ),
+        "Residual fraction: {}".format(
+            "n/a" if quality.get("median_residual_fraction") is None
+            else "{:.4f}".format(quality["median_residual_fraction"])
+        ),
+        "Dipole fraction: {}".format(
+            "n/a" if quality.get("median_dipole_fraction") is None
+            else "{:.4f}".format(quality["median_dipole_fraction"])
+        ),
+        "Noise ratio: {}".format(
+            "n/a" if quality.get("noise_ratio") is None
+            else "{:.3f}".format(quality["noise_ratio"])
+        ),
+        "Flags: {}".format(", ".join(result.get("flags", [])) or "none"),
+    ]
+    if result.get("error"):
+        summary.extend(["", "Error:", str(result["error"])])
+    summary_axis.text(0.02, 0.98, "\n".join(summary), va="top", ha="left",
+                      family="monospace", fontsize=10, wrap=True)
+    fig.suptitle("Image-subtraction diagnostics", fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_calibration_diagnostics",
@@ -1777,5 +1909,6 @@ __all__ = [
     "plot_image_usability_diagnostics",
     "plot_psf_diagnostics",
     "plot_science_photometry_diagnostics",
+    "plot_subtraction_diagnostics",
     "plot_star_selection_diagnostics",
 ]
