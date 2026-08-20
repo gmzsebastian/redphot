@@ -196,6 +196,11 @@ QUALITY_FLAGS = {
         "TARGET_FILTER_SHIFT",
         "TARGET_CENTROID_HOST_DOMINATED",
         "APERTURE_INCOMPLETE",
+        "INSUFFICIENT_UNMASKED_PIXELS",
+        "MASKED_PIXELS",
+        "BAD_LOCAL_BACKGROUND",
+        "COSMIC_RAY_OVERLAP",
+        "TRAIL_OVERLAP",
         "CALIBRATION_FAILED",
         "NONDETECTION",
     ],
@@ -825,15 +830,30 @@ DEFAULT_SETTINGS = {
     },
     "apertures": {
         "enabled": True,
+        "perform_small_aperture": True,
+        "perform_large_aperture": True,
+        "perform_psf": True,
+        "perform_optimal": False,
+        "require_approved_psf": True,
         "small_radius_fwhm": 1.0,
         "large_radius_fwhm": 2.5,
         "sky_inner_radius_fwhm": 4.0,
         "sky_outer_radius_fwhm": 7.0,
         "minimum_sky_pixels": 50,
         "subpixel_method": "exact",
+        "subpixels": 5,
+        "minimum_unmasked_fraction": 0.80,
+        "local_background_estimator": "median",
+        "local_background_sigma_clip": 3.0,
+        "local_background_maximum_iterations": 5,
+        "add_poisson_noise_when_needed": True,
+        "minimum_uncertainty": 1.0e-6,
+        "diagnostic_cutout_radius_fwhm": 5.0,
         "apply_aperture_correction": True,
         "fixed_target_position": True,
         "local_background": True,
+        "save_measurement_table": True,
+        "save_target_cutouts": True,
     },
     "calibration": {
         "enabled": True,
@@ -1562,6 +1582,38 @@ def validate_settings(settings):
                     name
                 )
             )
+
+    aperture_settings = settings["apertures"]
+    aperture_radii = (
+        float(aperture_settings.get("small_radius_fwhm", 1.0)),
+        float(aperture_settings.get("large_radius_fwhm", 2.5)),
+        float(aperture_settings.get("sky_inner_radius_fwhm", 4.0)),
+        float(aperture_settings.get("sky_outer_radius_fwhm", 7.0)),
+    )
+    if not 0 < aperture_radii[0] < aperture_radii[1] < aperture_radii[2] < aperture_radii[3]:
+        raise ValueError(
+            "Aperture radii must satisfy 0 < small < large < sky inner < sky outer"
+        )
+    if int(aperture_settings.get("minimum_sky_pixels", 50)) < 1:
+        raise ValueError("apertures.minimum_sky_pixels must be positive")
+    if int(aperture_settings.get("subpixels", 5)) < 1:
+        raise ValueError("apertures.subpixels must be positive")
+    if aperture_settings.get("subpixel_method", "exact") not in {
+        "exact", "subpixel", "center"
+    }:
+        raise ValueError(
+            "apertures.subpixel_method must be exact, subpixel, or center"
+        )
+    if not 0 < float(aperture_settings.get("minimum_unmasked_fraction", 0.80)) <= 1:
+        raise ValueError("apertures.minimum_unmasked_fraction must be in (0, 1]")
+    if aperture_settings.get("local_background_estimator", "median") not in {
+        "median", "mean"
+    }:
+        raise ValueError("apertures.local_background_estimator must be median or mean")
+    if float(aperture_settings.get("local_background_sigma_clip", 3.0)) <= 0:
+        raise ValueError("apertures.local_background_sigma_clip must be positive")
+    if float(aperture_settings.get("minimum_uncertainty", 1.0e-6)) <= 0:
+        raise ValueError("apertures.minimum_uncertainty must be positive")
 
     psf_settings = settings["psf"]
     if psf_settings.get("model", "empirical") not in {"empirical", "moffat", "gaussian"}:

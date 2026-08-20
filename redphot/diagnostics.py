@@ -1511,6 +1511,132 @@ def plot_psf_diagnostics(result, output_path=None, show=False):
     return fig
 
 
+def plot_science_photometry_diagnostics(result, output_path=None, show=False):
+    """Plot fixed-position target photometry and centroid diagnostics.
+
+    The panels show the target context and configured apertures, the forced PSF
+    model, residuals, masks, signed flux and S/N measurements, and the offset
+    of the diagnostic free centroid from the frozen position.
+    """
+
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    diagnostics = result.get("target_diagnostics") or {}
+    table = result.get("measurements")
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10), constrained_layout=True)
+
+    context = diagnostics.get("context_data")
+    context_mask = diagnostics.get("context_mask")
+    _show_image(fig, axes[0, 0], context, "Target and apertures")
+    if context is not None:
+        origin = diagnostics.get("context_origin", (0, 0))
+        center = (
+            diagnostics.get("fixed_x", 0.0) - origin[0],
+            diagnostics.get("fixed_y", 0.0) - origin[1],
+        )
+        circles = (
+            ("small_radius_pixels", "tab:cyan", "small"),
+            ("large_radius_pixels", "yellow", "reference"),
+            ("sky_inner_radius_pixels", "tab:orange", "sky inner"),
+            ("sky_outer_radius_pixels", "tab:red", "sky outer"),
+        )
+        for name, color, label in circles:
+            radius = diagnostics.get(name)
+            if radius is not None:
+                axes[0, 0].add_patch(
+                    Circle(center, radius, fill=False, color=color, linewidth=1.2, label=label)
+                )
+        axes[0, 0].legend(loc="upper right", fontsize=7)
+        if context_mask is not None and np.any(context_mask):
+            axes[0, 0].imshow(
+                np.ma.masked_where(~np.asarray(context_mask, dtype=bool), context_mask),
+                origin="lower", cmap="Reds", alpha=0.45, interpolation="nearest",
+            )
+
+    _show_image(
+        fig, axes[0, 1], diagnostics.get("model"), "Forced PSF model", cmap="viridis"
+    )
+    _show_image(
+        fig, axes[0, 2], diagnostics.get("residual"), "Data minus forced model",
+        cmap="coolwarm", lower=2.0, upper=98.0,
+    )
+    _show_image(
+        fig, axes[1, 0], context_mask, "Combined measurement mask",
+        cmap="magma", lower=0.0, upper=100.0,
+    )
+
+    flux_axis = axes[1, 1]
+    flux_axis.set_title("Signed target measurements")
+    target_rows = None
+    if table is not None and len(table):
+        target_rows = table[np.asarray(table["source_type"], dtype=str) == "target"]
+    if target_rows is not None and len(target_rows):
+        methods = [str(value) for value in target_rows["method"]]
+        flux = np.ma.asarray(target_rows["flux"], dtype=float).filled(np.nan)
+        error = np.ma.asarray(target_rows["flux_uncertainty"], dtype=float).filled(np.nan)
+        positions = np.arange(len(methods))
+        flux_axis.errorbar(positions, flux, yerr=error, fmt="o", color="tab:blue", capsize=3)
+        flux_axis.axhline(0.0, color="0.4", linewidth=1.0)
+        flux_axis.set_xticks(positions)
+        flux_axis.set_xticklabels(methods, rotation=20, ha="right")
+        flux_axis.set_ylabel("flux [{}]".format(result.get("flux_unit", "image unit")))
+        for position, row in zip(positions, target_rows):
+            snr = row["snr"]
+            label = "S/N --" if np.ma.is_masked(snr) else "S/N {:.1f}".format(float(snr))
+            flux_axis.annotate(label, (position, float(row["flux"])), xytext=(0, 7),
+                               textcoords="offset points", ha="center", fontsize=8)
+    else:
+        flux_axis.text(0.5, 0.5, "No target measurements", ha="center", va="center")
+    flux_axis.grid(alpha=0.2)
+
+    centroid_axis = axes[1, 2]
+    centroid_axis.set_title("Fixed versus diagnostic centroid")
+    free = diagnostics.get("free_centroid")
+    centroid_axis.scatter([0.0], [0.0], marker="+", s=140, color="black", label="fixed")
+    if free is not None:
+        dx = free.get("offset_x_pixels", 0.0)
+        dy = free.get("offset_y_pixels", 0.0)
+        centroid_axis.arrow(
+            0.0, 0.0, dx, dy, width=0.01, length_includes_head=True,
+            color="tab:red", alpha=0.8,
+        )
+        centroid_axis.scatter([dx], [dy], color="tab:red", label="free diagnostic")
+        summary = "Offset: {:.3f} pixel".format(free.get("offset_pixels", np.nan))
+        if free.get("offset_arcsec") is not None:
+            summary += "\n{:.3f} arcsec".format(free["offset_arcsec"])
+        centroid_axis.text(0.03, 0.97, summary, transform=centroid_axis.transAxes,
+                           va="top", family="monospace")
+        span = max(1.0, abs(dx) * 1.5, abs(dy) * 1.5)
+    else:
+        centroid_axis.text(0.5, 0.5, "Free fit unavailable", ha="center", va="center")
+        span = 1.0
+    centroid_axis.set_xlim(-span, span)
+    centroid_axis.set_ylim(-span, span)
+    centroid_axis.set_aspect("equal")
+    centroid_axis.set_xlabel("x offset [pixel]")
+    centroid_axis.set_ylabel("y offset [pixel]")
+    centroid_axis.axhline(0.0, color="0.8", linewidth=0.8)
+    centroid_axis.axvline(0.0, color="0.8", linewidth=0.8)
+    centroid_axis.legend(loc="lower right", fontsize=8)
+    centroid_axis.grid(alpha=0.2)
+
+    title = "Science-image forced photometry — {}".format(
+        result.get("filename", result.get("image_id", "image"))
+    )
+    flags = result.get("target_flags", [])
+    if flags:
+        title += " — {}".format(", ".join(flags))
+    fig.suptitle(title, fontsize=15)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
+    if show:
+        plt.show()
+    return fig
+
+
 __all__ = [
     "plot_background_diagnostics",
     "plot_astrometry_diagnostics",
@@ -1518,5 +1644,6 @@ __all__ = [
     "plot_image_quality_diagnostics",
     "plot_image_usability_diagnostics",
     "plot_psf_diagnostics",
+    "plot_science_photometry_diagnostics",
     "plot_star_selection_diagnostics",
 ]

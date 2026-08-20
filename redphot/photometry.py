@@ -13,9 +13,13 @@ import json
 from pathlib import Path
 
 import numpy as np
+from astropy import units as u
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.nddata import StdDevUncertainty
 from astropy.stats import sigma_clip
-from astropy.table import MaskedColumn, Table
+from astropy.table import MaskedColumn, Table, vstack
+from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy import ndimage
 from scipy.optimize import least_squares
 
@@ -108,7 +112,7 @@ def _combined_mask(record, shape):
         if value is not None and np.shape(value) == shape:
             mask |= np.asarray(value, dtype=bool)
     cosmic = record.get("cosmic_ray_products") or {}
-    for name in ("mask", "cosmic_ray_mask"):
+    for name in ("mask", "cosmic_mask", "cosmic_ray_mask"):
         value = cosmic.get(name)
         if value is not None and np.shape(value) == shape:
             mask |= np.asarray(value, dtype=bool)
@@ -943,13 +947,985 @@ def save_psf_products(result, output_directory, settings=None, overwrite=None):
     return paths
 
 
+def _record_wcs(record, supplied=None):
+    """Return the derived image WCS used for forced coordinate projection."""
+
+    if supplied is not None:
+        return supplied
+    alignment = record.get("alignment") or {}
+    for value in (
+        alignment.get("wcs"),
+        record.get("refined_wcs"),
+        getattr(record.get("prepared_ccd"), "wcs", None),
+        getattr(record.get("working_ccd"), "wcs", None),
+        getattr(record.get("ccd"), "wcs", None),
+    ):
+        if value is not None and getattr(value, "has_celestial", False):
+            return value
+    return None
+
+
+def _pixel_scale_arcsec(record, wcs):
+    """Return the image pixel scale in arcseconds per pixel when available."""
+
+    metadata = record.get("metadata") or {}
+    scale = _finite_float(metadata.get("pixel_scale"))
+    if scale is not None and scale > 0:
+        return scale
+    if wcs is not None:
+        try:
+            return float(np.mean(np.abs(proj_plane_pixel_scales(wcs.celestial))) * 3600.0)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return None
+
+
+def _standard_deviation(record, data, settings):
+    """Return a per-pixel standard-deviation array and its provenance."""
+
+    ccd = record.get("prepared_ccd")
+    if ccd is None:
+        ccd = record.get("working_ccd")
+    if ccd is None:
+        ccd = record.get("ccd")
+    uncertainty = None if ccd is None else getattr(ccd, "uncertainty", None)
+    if uncertainty is not None:
+        try:
+            array = np.asarray(
+                uncertainty.represent_as(StdDevUncertainty).array, dtype=float
+            )
+        except (AttributeError, TypeError, ValueError):
+            array = None
+        if array is not None and array.shape == data.shape:
+            valid = np.isfinite(array) & (array > 0)
+            if np.any(valid):
+                replacement = float(np.median(array[valid]))
+                return np.where(valid, array, replacement), "ccd_uncertainty"
+
+    products = record.get("background_products") or {}
+    rms = products.get("background_rms")
+    if rms is not None and np.shape(rms) == data.shape:
+        base = np.asarray(rms, dtype=float)
+        source = "background_rms_map"
+    else:
+        quality = record.get("quality") or {}
+        scalar = _finite_float(quality.get("background_rms"))
+        if scalar is None or scalar <= 0:
+            finite = data[np.isfinite(data)]
+            scalar = float(np.std(finite)) if finite.size else 1.0
+        base = np.full(data.shape, scalar, dtype=float)
+        source = "background_rms_scalar"
+    valid = np.isfinite(base) & (base > 0)
+    replacement = float(np.median(base[valid])) if np.any(valid) else 1.0
+    variance = np.where(valid, base, replacement) ** 2
+    apertures = settings.get("apertures", {})
+    metadata = record.get("metadata") or {}
+    gain = _finite_float(metadata.get("gain"))
+    if apertures.get("add_poisson_noise_when_needed", True) and gain is not None and gain > 0:
+        variance += np.maximum(data, 0.0) / gain
+        source += "+poisson"
+    floor = float(apertures.get("minimum_uncertainty", 1.0e-6))
+    return np.sqrt(np.maximum(variance, floor ** 2)), source
+
+
+def _measurement_masks(record, shape):
+    """Return the combined mask plus separately traceable artifact masks."""
+
+    components = dict(record.get("masks") or {})
+    cosmic = record.get("cosmic_ray_products") or {}
+    for name in ("cosmic_mask", "cosmic_ray_mask", "mask"):
+        value = cosmic.get(name)
+        if value is not None and np.shape(value) == shape:
+            components["cosmic_rays"] = np.asarray(value, dtype=bool)
+            break
+    normalized = {}
+    for name, value in components.items():
+        if value is not None and np.shape(value) == shape:
+            normalized[name] = np.asarray(value, dtype=bool)
+    normalized["combined"] = _combined_mask(record, shape)
+    return normalized
+
+
+def _radial_weights(
+    shape, x, y, outer_radius, subpixels, inner_radius=0.0, method="exact"
+):
+    """Return fractional pixel weights and image slices for a circle or annulus."""
+
+    outer_radius = float(outer_radius)
+    try:
+        from photutils.aperture import CircularAnnulus, CircularAperture
+
+        if inner_radius > 0:
+            aperture = CircularAnnulus(
+                (x, y), r_in=float(inner_radius), r_out=outer_radius
+            )
+        else:
+            aperture = CircularAperture((x, y), r=outer_radius)
+        aperture_mask = aperture.to_mask(
+            method=method, subpixels=max(1, int(subpixels))
+        )
+        image_slice, mask_slice = aperture_mask.get_overlap_slices(shape)
+        if image_slice is None:
+            return (slice(0, 0), slice(0, 0)), np.empty((0, 0))
+        return image_slice, np.asarray(aperture_mask.data[mask_slice], dtype=float)
+    except (ImportError, TypeError, ValueError):
+        pass
+
+    x0 = max(0, int(np.floor(x - outer_radius - 0.5)))
+    x1 = min(shape[1], int(np.ceil(x + outer_radius + 0.5)))
+    y0 = max(0, int(np.floor(y - outer_radius - 0.5)))
+    y1 = min(shape[0], int(np.ceil(y + outer_radius + 0.5)))
+    if x0 >= x1 or y0 >= y1:
+        return (slice(0, 0), slice(0, 0)), np.empty((0, 0))
+    yy, xx = np.indices((y1 - y0, x1 - x0), dtype=float)
+    xx += x0
+    yy += y0
+    subpixels = max(1, int(subpixels))
+    offsets = (np.arange(subpixels, dtype=float) + 0.5) / subpixels - 0.5
+    weights = np.zeros(xx.shape, dtype=float)
+    outer2 = outer_radius ** 2
+    inner2 = float(inner_radius) ** 2
+    for dy in offsets:
+        for dx in offsets:
+            radius2 = (xx + dx - x) ** 2 + (yy + dy - y) ** 2
+            weights += (radius2 <= outer2) & (radius2 >= inner2)
+    weights /= subpixels ** 2
+    return (slice(y0, y1), slice(x0, x1)), weights
+
+
+def _local_background(data, standard_deviation, mask, x, y, fwhm, settings):
+    """Measure a sigma-clipped local sky in the configured annulus."""
+
+    apertures = settings.get("apertures", {})
+    inner = float(apertures.get("sky_inner_radius_fwhm", 4.0)) * fwhm
+    outer = float(apertures.get("sky_outer_radius_fwhm", 7.0)) * fwhm
+    slices, weights = _radial_weights(
+        data.shape,
+        x,
+        y,
+        outer,
+        apertures.get("subpixels", 5),
+        inner_radius=inner,
+        method=apertures.get("subpixel_method", "exact"),
+    )
+    if not apertures.get("local_background", True):
+        values = standard_deviation[slices]
+        valid = np.isfinite(values) & ~mask[slices] & (weights > 0)
+        rms = float(np.median(values[valid])) if np.any(valid) else None
+        return {
+            "value": 0.0,
+            "rms": rms,
+            "error": 0.0,
+            "pixel_count": int(np.count_nonzero(valid)),
+            "inner_radius_pixels": inner,
+            "outer_radius_pixels": outer,
+            "valid": True,
+            "slices": slices,
+            "weights": weights,
+        }
+    local = data[slices]
+    valid = np.isfinite(local) & ~mask[slices] & (weights > 0)
+    values = local[valid]
+    minimum = int(apertures.get("minimum_sky_pixels", 50))
+    result = {
+        "value": None,
+        "rms": None,
+        "error": None,
+        "pixel_count": int(values.size),
+        "inner_radius_pixels": inner,
+        "outer_radius_pixels": outer,
+        "valid": False,
+        "slices": slices,
+        "weights": weights,
+    }
+    if values.size < minimum:
+        return result
+    clipped = sigma_clip(
+        values,
+        sigma=float(apertures.get("local_background_sigma_clip", 3.0)),
+        maxiters=int(apertures.get("local_background_maximum_iterations", 5)),
+        masked=True,
+    )
+    kept = np.asarray(clipped.compressed(), dtype=float)
+    if kept.size < minimum:
+        result["pixel_count"] = int(kept.size)
+        return result
+    estimator = apertures.get("local_background_estimator", "median")
+    background = float(np.mean(kept)) if estimator == "mean" else float(np.median(kept))
+    median = float(np.median(kept))
+    rms = float(1.4826 * np.median(np.abs(kept - median)))
+    if not np.isfinite(rms) or rms <= 0:
+        rms = float(np.std(kept))
+    result.update(
+        {
+            "value": background,
+            "rms": rms,
+            "error": rms / np.sqrt(kept.size) if np.isfinite(rms) else None,
+            "pixel_count": int(kept.size),
+            "valid": bool(np.isfinite(background) and np.isfinite(rms)),
+        }
+    )
+    return result
+
+
+def _artifact_flags(source_type, masks, slices, weights):
+    """Return explicit flags for artifact masks overlapping one footprint."""
+
+    flags = []
+    footprint = weights > 0
+    combined = masks.get("combined")
+    if combined is not None and np.any(combined[slices] & footprint):
+        flags.append("TARGET_MASKED" if source_type == "target" else "MASKED_PIXELS")
+    cosmic = masks.get("cosmic_rays")
+    if cosmic is not None and np.any(cosmic[slices] & footprint):
+        flags.append("TARGET_COSMIC_RAY" if source_type == "target" else "COSMIC_RAY_OVERLAP")
+    trails = masks.get("trails")
+    if trails is not None and np.any(trails[slices] & footprint):
+        flags.append("TARGET_TRAIL" if source_type == "target" else "TRAIL_OVERLAP")
+    return flags
+
+
+def _aperture_measurement(
+    data,
+    variance,
+    masks,
+    source,
+    radius,
+    background,
+    settings,
+    method,
+):
+    """Measure one signed circular-aperture flux and propagated uncertainty."""
+
+    apertures = settings.get("apertures", {})
+    slices, weights = _radial_weights(
+        data.shape,
+        source["x"],
+        source["y"],
+        radius,
+        apertures.get("subpixels", 5),
+        method=apertures.get("subpixel_method", "exact"),
+    )
+    local_data = data[slices]
+    local_variance = variance[slices]
+    local_mask = masks["combined"][slices]
+    valid = (
+        (weights > 0)
+        & ~local_mask
+        & np.isfinite(local_data)
+        & np.isfinite(local_variance)
+        & (local_variance > 0)
+    )
+    expected_area = np.pi * radius ** 2
+    measured_area = float(np.sum(weights[valid]))
+    coverage = measured_area / expected_area if expected_area > 0 else 0.0
+    flags = _artifact_flags(source["source_type"], masks, slices, weights)
+    minimum_coverage = float(apertures.get("minimum_unmasked_fraction", 0.80))
+    if coverage < minimum_coverage:
+        flags.extend(["APERTURE_INCOMPLETE", "INSUFFICIENT_UNMASKED_PIXELS"])
+    if not background["valid"]:
+        flags.append("BAD_LOCAL_BACKGROUND")
+    background_value = background["value"] if background["valid"] else 0.0
+    background_error = background["error"] if background["valid"] else None
+    flux = None
+    uncertainty = None
+    if np.any(valid):
+        used_weights = weights[valid]
+        flux = float(np.sum(used_weights * (local_data[valid] - background_value)))
+        flux_variance = float(np.sum(used_weights ** 2 * local_variance[valid]))
+        if background_error is not None and np.isfinite(background_error):
+            flux_variance += (float(np.sum(used_weights)) * background_error) ** 2
+        uncertainty = float(np.sqrt(max(flux_variance, 0.0)))
+    snr = (
+        flux / uncertainty
+        if flux is not None and uncertainty is not None and uncertainty > 0
+        else None
+    )
+    return {
+        "method": method,
+        "flux": flux,
+        "flux_uncertainty": uncertainty,
+        "snr": snr,
+        "aperture_radius_pixels": float(radius),
+        "model_type": None,
+        "coverage_fraction": float(np.clip(coverage, 0.0, 1.0)),
+        "unmasked_weight": measured_area,
+        "flags": list(dict.fromkeys(flags)),
+        "valid": bool(
+            flux is not None
+            and coverage >= minimum_coverage
+            and (background["valid"] or not apertures.get("local_background", True))
+        ),
+    }
+
+
+def _psf_footprint(data, variance, masks, x, y, model):
+    """Place a normalized native PSF at a fixed subpixel detector position."""
+
+    model = np.asarray(model, dtype=float)
+    half_y = model.shape[0] // 2
+    half_x = model.shape[1] // 2
+    ix = int(np.floor(x + 0.5))
+    iy = int(np.floor(y + 0.5))
+    shifted = ndimage.shift(
+        model,
+        (y - iy, x - ix),
+        order=3,
+        mode="constant",
+        cval=0.0,
+        prefilter=True,
+    )
+    shifted = np.maximum(np.where(np.isfinite(shifted), shifted, 0.0), 0.0)
+    normalization = float(np.sum(shifted))
+    if normalization <= 0:
+        raise ValueError("The shifted PSF footprint has no finite normalization")
+    shifted /= normalization
+    raw_x0, raw_y0 = ix - half_x, iy - half_y
+    raw_x1, raw_y1 = raw_x0 + model.shape[1], raw_y0 + model.shape[0]
+    x0, x1 = max(0, raw_x0), min(data.shape[1], raw_x1)
+    y0, y1 = max(0, raw_y0), min(data.shape[0], raw_y1)
+    if x0 >= x1 or y0 >= y1:
+        return None
+    mx0, mx1 = x0 - raw_x0, x1 - raw_x0
+    my0, my1 = y0 - raw_y0, y1 - raw_y0
+    slices = (slice(y0, y1), slice(x0, x1))
+    return {
+        "slices": slices,
+        "data": np.asarray(data[slices], dtype=float),
+        "variance": np.asarray(variance[slices], dtype=float),
+        "mask": np.asarray(masks["combined"][slices], dtype=bool),
+        "model": shifted[my0:my1, mx0:mx1],
+        "origin": (x0, y0),
+    }
+
+
+def _fit_psf_flux(footprint, background):
+    """Fit a signed amplitude at a fixed position with inverse-variance weights."""
+
+    observed = footprint["data"]
+    variance = footprint["variance"]
+    model = footprint["model"]
+    valid = (
+        ~footprint["mask"]
+        & np.isfinite(observed)
+        & np.isfinite(variance)
+        & (variance > 0)
+        & np.isfinite(model)
+    )
+    if not np.any(valid):
+        return None, None, valid
+    sky = background["value"] if background["valid"] else 0.0
+    inverse_variance = 1.0 / variance[valid]
+    denominator = float(np.sum(model[valid] ** 2 * inverse_variance))
+    if denominator <= 0:
+        return None, None, valid
+    flux = float(
+        np.sum(model[valid] * (observed[valid] - sky) * inverse_variance)
+        / denominator
+    )
+    flux_variance = 1.0 / denominator
+    sky_error = background["error"] if background["valid"] else None
+    if sky_error is not None and np.isfinite(sky_error):
+        sensitivity = float(np.sum(model[valid] * inverse_variance) / denominator)
+        flux_variance += (sensitivity * sky_error) ** 2
+    return flux, float(np.sqrt(max(flux_variance, 0.0))), valid
+
+
+def _diagnostic_free_centroid(footprint, background, forced_flux, search_pixels):
+    """Fit a diagnostic PSF offset without changing the forced measurement."""
+
+    observed = footprint["data"]
+    variance = footprint["variance"]
+    base_model = footprint["model"]
+    valid = (
+        ~footprint["mask"]
+        & np.isfinite(observed)
+        & np.isfinite(variance)
+        & (variance > 0)
+    )
+    if np.count_nonzero(valid) < 6:
+        return None
+    sky = background["value"] if background["valid"] else 0.0
+    inverse_sigma = 1.0 / np.sqrt(variance[valid])
+
+    def model_and_flux(offset):
+        shifted = ndimage.shift(
+            base_model,
+            (offset[1], offset[0]),
+            order=3,
+            mode="constant",
+            cval=0.0,
+            prefilter=True,
+        )
+        denominator = float(np.sum(shifted[valid] ** 2 / variance[valid]))
+        if denominator <= 0:
+            return shifted, forced_flux
+        amplitude = float(
+            np.sum(shifted[valid] * (observed[valid] - sky) / variance[valid])
+            / denominator
+        )
+        return shifted, amplitude
+
+    def residual(offset):
+        shifted, amplitude = model_and_flux(offset)
+        return (observed[valid] - sky - amplitude * shifted[valid]) * inverse_sigma
+
+    try:
+        fit = least_squares(
+            residual,
+            [0.0, 0.0],
+            bounds=([-search_pixels, -search_pixels], [search_pixels, search_pixels]),
+        )
+    except (FloatingPointError, RuntimeError, ValueError):
+        return None
+    shifted, amplitude = model_and_flux(fit.x)
+    return {
+        "offset_x_pixels": float(fit.x[0]),
+        "offset_y_pixels": float(fit.x[1]),
+        "offset_pixels": float(np.hypot(*fit.x)),
+        "flux": amplitude,
+        "success": bool(fit.success),
+        "cost": float(fit.cost),
+        "model": amplitude * shifted + sky,
+    }
+
+
+def _psf_measurement(
+    data,
+    variance,
+    masks,
+    source,
+    background,
+    psf_result,
+    settings,
+    pixel_scale,
+):
+    """Measure one fixed-position signed PSF flux and diagnostic free centroid."""
+
+    model = psf_result.get("model_native")
+    flags = []
+    diagnostics = None
+    if model is None:
+        flags.append("TARGET_FIT_FAILED")
+        return {
+            "method": "psf",
+            "flux": None,
+            "flux_uncertainty": None,
+            "snr": None,
+            "aperture_radius_pixels": None,
+            "model_type": psf_result.get("model_type"),
+            "coverage_fraction": 0.0,
+            "unmasked_weight": 0.0,
+            "flags": flags,
+            "valid": False,
+        }, diagnostics
+    try:
+        footprint = _psf_footprint(
+            data, variance, masks, source["x"], source["y"], model
+        )
+    except ValueError:
+        footprint = None
+    if footprint is None:
+        flags.append("TARGET_FIT_FAILED")
+        return {
+            "method": "psf",
+            "flux": None,
+            "flux_uncertainty": None,
+            "snr": None,
+            "aperture_radius_pixels": None,
+            "model_type": psf_result.get("model_type"),
+            "coverage_fraction": 0.0,
+            "unmasked_weight": 0.0,
+            "flags": flags,
+            "valid": False,
+        }, diagnostics
+    flux, uncertainty, valid = _fit_psf_flux(footprint, background)
+    model_weights = footprint["model"]
+    coverage = float(np.sum(model_weights[valid]))
+    flags.extend(
+        _artifact_flags(
+            source["source_type"], masks, footprint["slices"], model_weights
+        )
+    )
+    minimum = float(settings.get("apertures", {}).get("minimum_unmasked_fraction", 0.80))
+    if coverage < minimum:
+        flags.append("INSUFFICIENT_UNMASKED_PIXELS")
+    if not background["valid"]:
+        flags.append("BAD_LOCAL_BACKGROUND")
+    if flux is None or uncertainty is None:
+        flags.append("TARGET_FIT_FAILED")
+    snr = flux / uncertainty if flux is not None and uncertainty not in (None, 0) else None
+    fixed_model = None
+    residual = None
+    if flux is not None:
+        sky = background["value"] if background["valid"] else 0.0
+        fixed_model = flux * model_weights + sky
+        residual = footprint["data"] - fixed_model
+        residual[~valid] = np.nan
+    free = None
+    target_settings = settings.get("target_position", {})
+    if source["source_type"] == "target" and target_settings.get("diagnostic_recenter", True):
+        search_arcsec = float(target_settings.get("centroid_search_radius_arcsec", 3.0))
+        search_pixels = search_arcsec / pixel_scale if pixel_scale else 3.0
+        free = _diagnostic_free_centroid(
+            footprint, background, flux or 0.0, max(0.25, search_pixels)
+        )
+        if free is not None:
+            free["x"] = source["x"] + free["offset_x_pixels"]
+            free["y"] = source["y"] + free["offset_y_pixels"]
+            free["offset_arcsec"] = (
+                free["offset_pixels"] * pixel_scale if pixel_scale else None
+            )
+            threshold = float(
+                target_settings.get("maximum_diagnostic_offset_arcsec", 1.0)
+            )
+            comparison = free["offset_arcsec"] if pixel_scale else free["offset_pixels"]
+            limit = threshold if pixel_scale else threshold
+            if comparison is not None and comparison > limit:
+                flags.append("TARGET_CENTROID_OFFSET")
+    diagnostics = {
+        "data": footprint["data"],
+        "model": fixed_model,
+        "residual": residual,
+        "mask": footprint["mask"],
+        "origin": footprint["origin"],
+        "fixed_x": source["x"],
+        "fixed_y": source["y"],
+        "free_centroid": free,
+    }
+    return {
+        "method": "psf",
+        "flux": flux,
+        "flux_uncertainty": uncertainty,
+        "snr": snr,
+        "aperture_radius_pixels": None,
+        "model_type": psf_result.get("model_type"),
+        "coverage_fraction": float(np.clip(coverage, 0.0, 1.0)),
+        "unmasked_weight": float(np.count_nonzero(valid)),
+        "flags": list(dict.fromkeys(flags)),
+        "valid": bool(
+            flux is not None
+            and coverage >= minimum
+            and (
+                background["valid"]
+                or not settings.get("apertures", {}).get("local_background", True)
+            )
+        ),
+    }, diagnostics
+
+
+def _science_sources(image_id, measurements, target_solution, wcs):
+    """Build the target and unique approved comparison/calibration source list."""
+
+    coordinate = SkyCoord(
+        float(target_solution["ra_deg"]),
+        float(target_solution["dec_deg"]),
+        unit="deg",
+        frame="icrs",
+    )
+    x, y = wcs.world_to_pixel(coordinate)
+    sources = [
+        {
+            "source_id": "target",
+            "source_type": "target",
+            "roles": "target",
+            "x": float(x),
+            "y": float(y),
+            "ra_deg": float(coordinate.ra.deg),
+            "dec_deg": float(coordinate.dec.deg),
+        }
+    ]
+    if measurements is None or len(measurements) == 0:
+        return sources
+    role_names = ("psf", "calibration", "ensemble", "qc_anchor")
+    seen = set()
+    for row in measurements:
+        if str(row["image_id"]) != str(image_id):
+            continue
+        roles = [
+            role for role in role_names
+            if "role_{}".format(role) in measurements.colnames
+            and bool(row["role_{}".format(role)])
+        ]
+        if not roles:
+            continue
+        if "image_accepted" in measurements.colnames and not bool(row["image_accepted"]):
+            continue
+        source_id = str(row["persistent_id"])
+        if source_id in seen:
+            continue
+        seen.add(source_id)
+        sx, sy = float(row["x"]), float(row["y"])
+        try:
+            sky = wcs.pixel_to_world(sx, sy).icrs
+            ra, dec = float(sky.ra.deg), float(sky.dec.deg)
+        except (AttributeError, TypeError, ValueError):
+            ra = dec = None
+        sources.append(
+            {
+                "source_id": source_id,
+                "source_type": "calibration" if "calibration" in roles else "comparison",
+                "roles": ";".join(roles),
+                "x": sx,
+                "y": sy,
+                "ra_deg": ra,
+                "dec_deg": dec,
+            }
+        )
+    return sources
+
+
+def _measurement_table(rows, flux_unit):
+    """Convert science-image measurement rows to a masked Astropy table."""
+
+    table = Table(masked=True)
+    string_fields = (
+        "image_id", "filename", "filter", "source_id", "source_type", "roles",
+        "method", "coordinate_version", "model_type", "psf_version",
+        "uncertainty_source", "flags",
+    )
+    boolean_fields = ("fixed_position", "valid")
+    numeric_fields = (
+        "mjd_mid", "x", "y", "ra_deg", "dec_deg", "flux", "flux_uncertainty",
+        "snr", "local_background", "local_background_rms", "local_background_error",
+        "local_background_pixels", "aperture_radius_pixels", "sky_inner_radius_pixels",
+        "sky_outer_radius_pixels", "coverage_fraction", "unmasked_weight",
+        "free_centroid_x", "free_centroid_y", "centroid_offset_pixels",
+        "centroid_offset_arcsec", "free_centroid_flux", "fwhm_pixels",
+        "psf_normalization",
+    )
+    for name in string_fields:
+        table[name] = [str(row.get(name, "")) for row in rows]
+    for name in boolean_fields:
+        table[name] = [bool(row.get(name, False)) for row in rows]
+    for name in numeric_fields:
+        values = np.asarray(
+            [_finite_float(row.get(name), np.nan) for row in rows], dtype=float
+        )
+        invalid = ~np.isfinite(values)
+        table[name] = MaskedColumn(np.where(invalid, 0.0, values), mask=invalid)
+    for name in ("x", "y", "aperture_radius_pixels", "sky_inner_radius_pixels", "sky_outer_radius_pixels", "free_centroid_x", "free_centroid_y", "centroid_offset_pixels", "fwhm_pixels"):
+        table[name].unit = u.pixel
+    for name in ("ra_deg", "dec_deg"):
+        table[name].unit = u.deg
+    table["centroid_offset_arcsec"].unit = u.arcsec
+    for name in ("flux", "flux_uncertainty", "local_background", "local_background_rms", "local_background_error", "free_centroid_flux"):
+        table[name].unit = flux_unit
+    table.meta["flux_unit"] = str(flux_unit)
+    table.meta["signed_fluxes"] = True
+    table.meta["free_centroids_diagnostic_only"] = True
+    return table
+
+
+def perform_science_image_photometry(
+    image_record,
+    target_solution,
+    psf_result,
+    measurements=None,
+    settings=None,
+    wcs=None,
+):
+    """Perform forced target and comparison-star photometry on one image.
+
+    Small-aperture, reference-aperture, and PSF measurements share a single
+    fixed position per source. The target position always comes from the
+    frozen sky-coordinate solution. A free-centroid PSF fit is retained only
+    as a diagnostic and never replaces the forced flux.
+    """
+
+    if settings is None:
+        settings = image_record.get("settings") or get_default_settings()
+    apertures = settings.get("apertures", {})
+    if not apertures.get("enabled", True):
+        raise RuntimeError("Science-image photometry is disabled")
+    if not target_solution.get("frozen", False):
+        raise ValueError("Target photometry requires a frozen target-coordinate solution")
+    if apertures.get("perform_psf", True) and apertures.get("require_approved_psf", True):
+        require_approved_psf(psf_result)
+    wcs = _record_wcs(image_record, supplied=wcs)
+    if wcs is None:
+        raise ValueError("Science-image photometry requires a celestial derived WCS")
+    data = _prepared_data(image_record)
+    standard_deviation, uncertainty_source = _standard_deviation(
+        image_record, data, settings
+    )
+    variance = standard_deviation ** 2
+    masks = _measurement_masks(image_record, data.shape)
+    image_id = _image_id(image_record)
+    metadata = image_record.get("metadata") or {}
+    ccd = None
+    for name in ("prepared_ccd", "working_ccd", "ccd"):
+        if image_record.get(name) is not None:
+            ccd = image_record[name]
+            break
+    flux_unit = getattr(ccd, "unit", u.adu) if ccd is not None else u.adu
+    fwhm = _finite_float(psf_result.get("fwhm_pixels"))
+    if fwhm is None:
+        fwhm = _finite_float((image_record.get("quality") or {}).get("fwhm_pixels"), 4.0)
+    pixel_scale = _pixel_scale_arcsec(image_record, wcs)
+    sources = _science_sources(image_id, measurements, target_solution, wcs)
+    rows = []
+    target_diagnostics = None
+    target_flags = []
+    for source in sources:
+        background = _local_background(
+            data,
+            standard_deviation,
+            masks["combined"],
+            source["x"],
+            source["y"],
+            fwhm,
+            settings,
+        )
+        source_measurements = []
+        if apertures.get("perform_small_aperture", True):
+            source_measurements.append(
+                _aperture_measurement(
+                    data,
+                    variance,
+                    masks,
+                    source,
+                    float(apertures.get("small_radius_fwhm", 1.0)) * fwhm,
+                    background,
+                    settings,
+                    "small_aperture",
+                )
+            )
+        if apertures.get("perform_large_aperture", True):
+            source_measurements.append(
+                _aperture_measurement(
+                    data,
+                    variance,
+                    masks,
+                    source,
+                    float(apertures.get("large_radius_fwhm", 2.5)) * fwhm,
+                    background,
+                    settings,
+                    "large_aperture",
+                )
+            )
+        if apertures.get("perform_psf", True):
+            psf_measurement, diagnostics = _psf_measurement(
+                data,
+                variance,
+                masks,
+                source,
+                background,
+                psf_result,
+                settings,
+                pixel_scale,
+            )
+            source_measurements.append(psf_measurement)
+            if source["source_type"] == "target":
+                target_diagnostics = diagnostics
+        if source["source_type"] == "target":
+            target_flags = list(
+                dict.fromkeys(
+                    flag
+                    for measurement in source_measurements
+                    for flag in measurement["flags"]
+                )
+            )
+        free = (
+            target_diagnostics.get("free_centroid")
+            if source["source_type"] == "target" and target_diagnostics is not None
+            else None
+        )
+        for measurement in source_measurements:
+            flags = list(measurement["flags"])
+            if source["source_type"] == "target":
+                flags = list(dict.fromkeys(flags + target_flags))
+            rows.append(
+                {
+                    "image_id": image_id,
+                    "filename": metadata.get("filename", image_id),
+                    "filter": metadata.get("filter", ""),
+                    "mjd_mid": metadata.get("mjd_mid", metadata.get("mjd")),
+                    "source_id": source["source_id"],
+                    "source_type": source["source_type"],
+                    "roles": source["roles"],
+                    "method": measurement["method"],
+                    "fixed_position": True,
+                    "coordinate_version": target_solution.get("version", ""),
+                    "x": source["x"],
+                    "y": source["y"],
+                    "ra_deg": source["ra_deg"],
+                    "dec_deg": source["dec_deg"],
+                    "flux": measurement["flux"],
+                    "flux_uncertainty": measurement["flux_uncertainty"],
+                    "snr": measurement["snr"],
+                    "local_background": background["value"],
+                    "local_background_rms": background["rms"],
+                    "local_background_error": background["error"],
+                    "local_background_pixels": background["pixel_count"],
+                    "aperture_radius_pixels": measurement["aperture_radius_pixels"],
+                    "sky_inner_radius_pixels": background["inner_radius_pixels"],
+                    "sky_outer_radius_pixels": background["outer_radius_pixels"],
+                    "model_type": measurement["model_type"],
+                    "psf_version": "psf-v{}".format(
+                        psf_result.get("model_version", 1)
+                    ),
+                    "psf_normalization": psf_result.get("normalization"),
+                    "coverage_fraction": measurement["coverage_fraction"],
+                    "unmasked_weight": measurement["unmasked_weight"],
+                    "uncertainty_source": uncertainty_source,
+                    "free_centroid_x": None if free is None else free.get("x"),
+                    "free_centroid_y": None if free is None else free.get("y"),
+                    "centroid_offset_pixels": None if free is None else free.get("offset_pixels"),
+                    "centroid_offset_arcsec": None if free is None else free.get("offset_arcsec"),
+                    "free_centroid_flux": None if free is None else free.get("flux"),
+                    "fwhm_pixels": fwhm,
+                    "flags": ";".join(flags),
+                    "valid": measurement["valid"],
+                }
+            )
+    table = _measurement_table(rows, flux_unit)
+    if target_diagnostics is not None:
+        context_radius = max(
+            float(apertures.get("diagnostic_cutout_radius_fwhm", 5.0)),
+            float(apertures.get("sky_outer_radius_fwhm", 7.0)),
+        ) * fwhm
+        target_x = sources[0]["x"]
+        target_y = sources[0]["y"]
+        context_slices, _ = _radial_weights(
+            data.shape,
+            target_x,
+            target_y,
+            context_radius,
+            1,
+            method="center",
+        )
+        target_diagnostics.update(
+            {
+                "small_radius_pixels": float(apertures.get("small_radius_fwhm", 1.0)) * fwhm,
+                "large_radius_pixels": float(apertures.get("large_radius_fwhm", 2.5)) * fwhm,
+                "sky_inner_radius_pixels": float(apertures.get("sky_inner_radius_fwhm", 4.0)) * fwhm,
+                "sky_outer_radius_pixels": float(apertures.get("sky_outer_radius_fwhm", 7.0)) * fwhm,
+                "context_data": np.asarray(data[context_slices], dtype=float),
+                "context_mask": np.asarray(masks["combined"][context_slices], dtype=bool),
+                "context_origin": (
+                    int(context_slices[1].start), int(context_slices[0].start)
+                ),
+            }
+        )
+    return {
+        "image_id": image_id,
+        "filename": metadata.get("filename", image_id),
+        "target_coordinate_version": target_solution.get("version"),
+        "fixed_target_ra_deg": float(target_solution["ra_deg"]),
+        "fixed_target_dec_deg": float(target_solution["dec_deg"]),
+        "pixel_scale_arcsec": pixel_scale,
+        "fwhm_pixels": fwhm,
+        "flux_unit": str(flux_unit),
+        "uncertainty_source": uncertainty_source,
+        "measurements": table,
+        "target_diagnostics": target_diagnostics,
+        "target_flags": list(dict.fromkeys(target_flags)),
+        "source_count": len(sources),
+        "method_count": len(set(table["method"])) if len(table) else 0,
+    }
+
+
+def perform_science_photometry(
+    image_records,
+    target_solution,
+    psf_results,
+    measurements=None,
+    alignments=None,
+    settings=None,
+):
+    """Perform science-image photometry for a complete image batch."""
+
+    if settings is None:
+        settings = get_default_settings()
+    if isinstance(psf_results, Mapping):
+        psf_lookup = dict(psf_results)
+    else:
+        psf_lookup = {str(item["image_id"]): item for item in psf_results}
+    alignment_lookup = {
+        str(item["image_id"]): item for item in (alignments or [])
+    }
+    results = []
+    tables = []
+    for index, record in enumerate(image_records):
+        image_id = _image_id(record, index)
+        if image_id not in psf_lookup:
+            raise ValueError("No PSF result is available for {}".format(image_id))
+        image_settings = record.get("settings") or settings
+        alignment = alignment_lookup.get(image_id)
+        wcs = None if alignment is None else alignment.get("wcs")
+        result = perform_science_image_photometry(
+            record,
+            target_solution,
+            psf_lookup[image_id],
+            measurements=measurements,
+            settings=image_settings,
+            wcs=wcs,
+        )
+        results.append(result)
+        tables.append(result["measurements"])
+    combined = (
+        vstack(tables, metadata_conflicts="silent")
+        if tables else Table(masked=True)
+    )
+    return combined, results
+
+
+def save_science_photometry_products(
+    result, output_directory, settings=None, overwrite=None
+):
+    """Save one image's measurement table and target diagnostic cutouts."""
+
+    if settings is None:
+        settings = get_default_settings()
+    apertures = settings.get("apertures", {})
+    if overwrite is None:
+        overwrite = settings.get("output", {}).get("overwrite", False)
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    stem = _safe_stem(result.get("filename") or result.get("image_id"))
+    paths = {}
+    if apertures.get("save_measurement_table", True):
+        path = output_directory / "{}_science_photometry.ecsv".format(stem)
+        result["measurements"].write(
+            path, format="ascii.ecsv", overwrite=bool(overwrite)
+        )
+        paths["measurements"] = str(path)
+    diagnostics = result.get("target_diagnostics")
+    if apertures.get("save_target_cutouts", True) and diagnostics is not None:
+        hdus = [fits.PrimaryHDU()]
+        extension_names = {
+            "data": "DATA",
+            "model": "MODEL",
+            "residual": "RESIDUAL",
+            "mask": "MASK",
+            "context_data": "CONTEXT",
+            "context_mask": "CONTMASK",
+        }
+        for name, extension in extension_names.items():
+            value = diagnostics.get(name)
+            if value is None:
+                continue
+            array = np.asarray(
+                value, dtype=np.uint8 if name.endswith("mask") else np.float32
+            )
+            hdus.append(fits.ImageHDU(array, name=extension))
+        path = output_directory / "{}_target_photometry.fits".format(stem)
+        fits.HDUList(hdus).writeto(path, overwrite=bool(overwrite))
+        paths["target_cutouts"] = str(path)
+    return paths
+
+
 __all__ = [
     "PSF_DOWNSTREAM_STAGES",
     "apply_psf_review",
     "construct_psf",
     "construct_psfs",
+    "perform_science_image_photometry",
+    "perform_science_photometry",
     "plan_psf_rerun",
     "psf_dependency_signature",
     "require_approved_psf",
+    "save_science_photometry_products",
     "save_psf_products",
 ]
