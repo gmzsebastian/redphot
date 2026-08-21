@@ -1,6 +1,10 @@
-numpy
-matplotlib
+numpy>=1.23
+matplotlib>=3.6
+astropy>=5.2
+astroquery>=0.4.6
+photutils>=1.9
+scipy>=1.9
 myst_nb
-sphinx-astropy
 sphinx
+sphinx-astropy
 sphinx_rtd_theme

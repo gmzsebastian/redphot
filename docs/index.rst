@@ -1,37 +1,45 @@
-.. image:: images/redspec_black.png
-   :alt: redspec logo
-   :width: 200px
+RedPhot
+========
+
+.. image:: images/redphot_black.png
+   :alt: RedPhot logo
+   :width: 240px
    :align: center
 
-**RedSpec** is a set of scripts designed to reduce single slit spectroscopic data using PyRAF. The scripts
-are provided on a `GitHub repository <https://github.com/gmzsebastian/redspec>`_ as opposed to an installable package.
+RedPhot is a function-based Python package for robust time-domain optical
+photometry of supernovae. It reads already reduced FITS images, preserves the
+original pixels, performs forced aperture and PSF measurements, optionally
+subtracts templates, and produces traceable light curves and diagnostics.
 
-Before using these functions you must have PyRAF installed. You can find the latest instructions on how to install
-PyRAF on the `PyRAF website <https://iraf.noirlab.edu>`_. We highly recommend reading the `Before you Start <reference.html>`_ page before
-starting to understand the use cases and limitations of the package.
+The package is designed around LCO and KeplerCam data but keeps instrument
+metadata and processing choices configurable. IRAF and PyRAF are not required.
 
-After you have installed PyRAF and familiarized yourself with the package, you can go through each of the tutorials
-to learn how to use the package and reduce your data.
+.. warning::
+
+   Version 0.1 is a development release. The stable-release requirements in
+   :doc:`validation` have not yet been completed on a full real multi-filter
+   supernova batch.
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 2
    :caption: User Guide
 
    installation
    reference
+   configuration
+   outputs
+   instruments
+   troubleshooting
+   validation
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 2
    :caption: Tutorials
 
-   tutorials/prepare_data
-   tutorials/reduce_data
-   tutorials/correct_wavelength
-   tutorials/flux_correction
-   tutorials/plot_data
+   tutorials/running_pipeline
 
-License & Attribution
----------------------
+License
+-------
 
-Copyright Sebastian Gomez and `contributors <https://github.com/gmzsebastian/redspec/graphs/contributors>`_.
-The ``redspec`` package is free software made available under the MIT License.
+Copyright Sebastian Gomez and contributors. RedPhot is distributed under the
+MIT License.

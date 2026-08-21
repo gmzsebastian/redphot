@@ -5,7 +5,7 @@ setup(
     version='0.1.0',
     author='Sebastian Gomez',
     author_email='sebastian.gomez@austin.utexas.edu',
-    description='Functions to reduce photometry.',
+    description='Robust time-domain optical photometry of supernovae.',
     url='https://github.com/gmzsebastian/redphot',
     license='MIT License',
     python_requires='>=3.9',
@@ -22,5 +22,6 @@ setup(
     ],
     extras_require={
         'cosmic_rays': ['astroscrappy>=1.1'],
+        'test': ['pytest>=7'],
     },
 )
