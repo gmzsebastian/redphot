@@ -1097,6 +1097,16 @@ DEFAULT_SETTINGS = {
         "save_all_flagged_measurements": True,
         "save_summary": True,
     },
+    "pipeline": {
+        "continue_on_error": True,
+        "save_state_after_stage": True,
+        "state_filename": "pipeline_state.json",
+        "checkpoint_filename": "pipeline_context.pkl",
+        "automatic_review": "approve_pass_warn",
+        "review_gates": ["usability", "psf"],
+        "stepwise_stop_at_review": True,
+        "save_tracebacks": True,
+    },
     "diagnostics": {
         "enabled": True,
         "show_plots": False,
@@ -1355,6 +1365,7 @@ REQUIRED_SECTIONS = [
     "subtraction",
     "upper_limits",
     "batch_consistency",
+    "pipeline",
     "diagnostics",
     "output",
 ]
@@ -2165,6 +2176,23 @@ def validate_settings(settings):
         raise ValueError("ensemble_correction.minimum_stars must be positive")
     if float(ensemble.get("maximum_absolute_correction_mag", 0.50)) <= 0:
         raise ValueError("ensemble maximum correction must be positive")
+
+    pipeline_settings = settings.get("pipeline", {})
+    if pipeline_settings.get("automatic_review", "approve_pass_warn") not in {
+        "approve_pass", "approve_pass_warn", "none"
+    }:
+        raise ValueError(
+            "pipeline.automatic_review must be approve_pass, "
+            "approve_pass_warn, or none"
+        )
+    review_gates = pipeline_settings.get("review_gates", [])
+    if not isinstance(review_gates, (list, tuple)) or any(
+        not isinstance(name, str) for name in review_gates
+    ):
+        raise TypeError("pipeline.review_gates must be a list of stage names")
+    for name in ("state_filename", "checkpoint_filename"):
+        if not str(pipeline_settings.get(name, "")).strip():
+            raise ValueError("pipeline.{} cannot be empty".format(name))
 
     output_settings = settings.get("output", {})
     output_profile = str(output_settings.get("profile", "standard")).lower()
