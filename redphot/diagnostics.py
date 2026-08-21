@@ -2185,7 +2185,9 @@ def plot_batch_consistency_diagnostics(products, output_path=None, show=False):
         methods_axis.invert_yaxis()
         methods_axis.set_xlabel("MJD")
         methods_axis.set_ylabel("magnitude")
-        methods_axis.legend(fontsize=7, ncol=2)
+        handles, labels = methods_axis.get_legend_handles_labels()
+        if handles:
+            methods_axis.legend(handles, labels, fontsize=7, ncol=2)
     else:
         methods_axis.text(0.5, 0.5, "No target measurements", ha="center", va="center")
     methods_axis.grid(alpha=0.2)

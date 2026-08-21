@@ -1121,13 +1121,57 @@ DEFAULT_SETTINGS = {
     "output": {
         "directory": "redphot_output",
         "overwrite": False,
-        "save_intermediate_fits": True,
-        "save_masks": True,
-        "save_background": True,
+        # ``minimal`` writes only the four final ECSV tables, configuration,
+        # and log. ``standard`` also writes PDF reports and compact final FITS
+        # products. ``full`` writes every supplied derivative. ``custom`` uses
+        # the product switches below without applying a profile preset.
+        "profile": "standard",
+        "products": {
+            "image_pdfs": True,
+            "batch_pdf": True,
+            "images_table": True,
+            "sources_table": True,
+            "photometry_table": True,
+            "lightcurve_table": True,
+            "resolved_config": True,
+            "run_log": True,
+            "manifest": True,
+            "processed_image": False,
+            "cleaned_image": False,
+            "fringe_corrected_image": False,
+            "source_mask": False,
+            "cosmic_ray_mask": False,
+            "trail_mask": False,
+            "saturation_mask": False,
+            "background_mask": False,
+            "background_model": False,
+            "background_rms": False,
+            "background_subtracted": False,
+            "psf_model": True,
+            "psf_cutouts": False,
+            "psf_residuals": False,
+            "downloaded_template": False,
+            "aligned_template": False,
+            "difference_image": True,
+            "difference_mask": False,
+            "subtraction_kernel": False,
+        },
+        # Per-product changes applied after a named profile. This is the
+        # simplest way to request, for example, standard output without PDFs.
+        "product_overrides": {},
+        "image_pdf_stages": "completed",
+        "selected_stage_names": [],
+        "fits_dtype": "float32",
+        "fits_compression": "none",
+        "include_checksums": True,
+        "write_manifest": True,
+        "save_intermediate_fits": False,
+        "save_masks": False,
+        "save_background": False,
         "save_cleaned_image": False,
-        "save_fringe_corrected_image": True,
+        "save_fringe_corrected_image": False,
         "save_psf": True,
-        "save_templates": True,
+        "save_templates": False,
         "save_difference": True,
         "table_format": "ascii.ecsv",
         "image_format": "fits",
@@ -2121,6 +2165,47 @@ def validate_settings(settings):
         raise ValueError("ensemble_correction.minimum_stars must be positive")
     if float(ensemble.get("maximum_absolute_correction_mag", 0.50)) <= 0:
         raise ValueError("ensemble maximum correction must be positive")
+
+    output_settings = settings.get("output", {})
+    output_profile = str(output_settings.get("profile", "standard")).lower()
+    if output_profile not in {"minimal", "standard", "full", "custom"}:
+        raise ValueError(
+            "output.profile must be minimal, standard, full, or custom"
+        )
+    output_products = output_settings.get("products", {})
+    if not isinstance(output_products, Mapping):
+        raise TypeError("output.products must be a mapping of product names to booleans")
+    invalid_product_values = [
+        name for name, value in output_products.items()
+        if not isinstance(value, bool)
+    ]
+    if invalid_product_values:
+        raise TypeError(
+            "output.products values must be booleans: "
+            + ", ".join(sorted(invalid_product_values))
+        )
+    product_overrides = output_settings.get("product_overrides", {})
+    if not isinstance(product_overrides, Mapping):
+        raise TypeError("output.product_overrides must be a mapping")
+    if any(not isinstance(value, bool) for value in product_overrides.values()):
+        raise TypeError("output.product_overrides values must be booleans")
+    if output_settings.get("image_pdf_stages", "completed") not in {
+        "completed", "selected", "summary_only"
+    }:
+        raise ValueError(
+            "output.image_pdf_stages must be completed, selected, or summary_only"
+        )
+    selected_stage_names = output_settings.get("selected_stage_names", [])
+    if not isinstance(selected_stage_names, (list, tuple)) or any(
+        not isinstance(name, str) for name in selected_stage_names
+    ):
+        raise TypeError("output.selected_stage_names must be a list of strings")
+    if output_settings.get("fits_dtype", "float32") not in {
+        "preserve", "float32", "float64"
+    }:
+        raise ValueError("output.fits_dtype must be preserve, float32, or float64")
+    if output_settings.get("fits_compression", "none") not in {"none", "gzip"}:
+        raise ValueError("output.fits_compression must be none or gzip")
 
 
 def resolve_settings(instrument_name=None, run_settings=None, filter_name=None, filter_settings=None,
