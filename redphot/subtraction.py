@@ -642,8 +642,34 @@ def choose_hotpants_parameters(science_record, template, aligned_template,
         arcsec = _finite_float((template.get("metadata") or {}).get("fwhm_arcsec"))
         scale = _pixel_scale_arcsec(aligned_template.get("wcs"))
         template_fwhm = arcsec / scale if arcsec is not None and scale else science_fwhm
+    science_fwhm = max(float(science_fwhm), 0.5)
+    template_fwhm = max(float(template_fwhm), 0.5)
     broader = max(science_fwhm, template_fwhm)
-    kernel_radius = max(5, int(np.ceil(2.5 * broader)))
+    science_sigma = science_fwhm / 2.354820045
+    template_sigma = template_fwhm / 2.354820045
+    matching_sigma = float(
+        np.sqrt(abs(science_sigma ** 2 - template_sigma ** 2))
+    )
+    # Hotpants recommends centering its Gaussian basis on the Gaussian width
+    # needed to match the two PSFs, with narrower and broader companions.  A
+    # small floor keeps nearly equal-seeing images numerically well behaved.
+    kernel_sigma = max(0.5, matching_sigma)
+    gaussian_components = [
+        (6, 0.5 * kernel_sigma),
+        (4, kernel_sigma),
+        (2, 2.0 * kernel_sigma),
+    ]
+    configured_components = configured.get("gaussian_components", "auto")
+    if configured_components != "auto":
+        gaussian_components = [
+            (int(degree), float(sigma))
+            for degree, sigma in configured_components
+        ]
+    kernel_radius = max(
+        5,
+        int(np.ceil(2.5 * broader)),
+        int(np.ceil(4.0 * max(sigma for _, sigma in gaussian_components))),
+    )
     stamp_grid = max(3, min(12, int(np.sqrt(science.size) / max(20 * broader, 1))))
     science_saturation = _finite_float((science_record.get("metadata") or {}).get("saturation"))
     template_saturation = _finite_float((template.get("metadata") or {}).get("saturation"))
@@ -651,6 +677,7 @@ def choose_hotpants_parameters(science_record, template, aligned_template,
         "convolve": "template" if template_fwhm <= science_fwhm else "science",
         "science_fwhm_pixels": science_fwhm,
         "template_fwhm_pixels": template_fwhm,
+        "matching_sigma_pixels": matching_sigma,
         "science_background": science_background,
         "template_background": template_background,
         "science_rms": science_rms,
@@ -666,7 +693,7 @@ def choose_hotpants_parameters(science_record, template, aligned_template,
         "stamps_per_cell": 3,
         "kernel_order": 1,
         "background_order": 1,
-        "gaussian_components": [(6, 0.7), (4, 1.5), (2, 3.0)],
+        "gaussian_components": gaussian_components,
     }
     aliases = {
         "kernel_order": "kernel_order",

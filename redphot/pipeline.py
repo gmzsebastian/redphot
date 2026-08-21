@@ -23,8 +23,8 @@ from astropy.table import MaskedColumn, Table, vstack
 from .config import (
     get_default_settings,
     merge_settings,
+    normalize_instrument_name,
     resolve_settings,
-    validate_settings,
 )
 
 
@@ -1031,7 +1031,7 @@ def _stage_definitions():
          "settings": ["subtraction", "apertures", "upper_limits"]},
         {"name": "batch_consistency", "scope": "batch",
          "requires": ["difference_photometry"], "settings": ["batch_consistency"]},
-        {"name": "outputs", "scope": "batch", "requires": ["batch_consistency"],
+        {"name": "outputs", "scope": "batch", "requires": [],
          "settings": ["diagnostics", "output"]},
     ]
 
@@ -1083,13 +1083,22 @@ def initialize_pipeline(
     target=None,
     image_overrides=None,
     run_directory=None,
+    filter_settings=None,
 ):
-    """Create serializable state and in-memory context for a new run."""
+    """Create serializable state and in-memory context for a new run.
+
+    Instrument defaults are applied before run settings. Filter defaults and
+    user ``filter_settings`` are applied after each FITS header reveals its
+    filter, then that image's overrides are applied last.
+    """
 
     from .image import discover_fits_files
 
-    base_settings = merge_settings(get_default_settings(), settings or {})
-    validate_settings(base_settings)
+    run_settings = deepcopy(settings or {})
+    base_settings = resolve_settings(
+        instrument_name=instrument_name,
+        run_settings=run_settings,
+    )
     files = discover_fits_files(paths, settings=base_settings)
     if not files:
         raise FileNotFoundError("No readable FITS inputs were discovered")
@@ -1108,11 +1117,16 @@ def initialize_pipeline(
         "run_directory": str(run_directory),
         "stage_order": pipeline_stage_names(),
         "settings": _json_value(base_settings),
+        "run_settings": _json_value(run_settings),
+        "instrument_name": instrument_name,
+        "filter_settings": _json_value(filter_settings or {}),
         "batch_stages": {}, "images": {}, "events": [],
     }
     context = {
         "settings": base_settings, "target": target, "images": {},
-        "shared": {},
+        "shared": {}, "run_settings": run_settings,
+        "instrument_name": instrument_name,
+        "filter_settings": deepcopy(filter_settings or {}),
     }
     context["_state"] = state
     for image_id, path in zip(identifiers, files):
@@ -1121,7 +1135,7 @@ def initialize_pipeline(
         )
         image_settings = resolve_settings(
             instrument_name=instrument_name,
-            run_settings=base_settings,
+            run_settings=run_settings,
             image_name=Path(path).name,
             image_overrides={Path(path).name: by_image} if by_image else None,
         )
@@ -1184,8 +1198,15 @@ def load_pipeline_state(run_directory, settings=None):
         with checkpoint_path.open("rb") as handle:
             context = pickle.load(handle)
     else:
-        context = {"settings": merge_settings(get_default_settings(), state.get("settings", {})),
-                   "target": None, "shared": {}, "images": {}}
+        context = {
+            "settings": merge_settings(get_default_settings(), state.get("settings", {})),
+            "target": None,
+            "shared": {},
+            "images": {},
+            "run_settings": deepcopy(state.get("run_settings", state.get("settings", {}))),
+            "instrument_name": state.get("instrument_name"),
+            "filter_settings": deepcopy(state.get("filter_settings", {})),
+        }
         for image_id, image in state["images"].items():
             image_settings = merge_settings(
                 context["settings"], image.get("overrides", {})
@@ -1536,11 +1557,12 @@ def run_pipeline_through(state, context, through_stage=None, stage_functions=Non
 
 def run_one_image(path, settings=None, instrument_name=None, target=None,
                   image_overrides=None, run_directory=None, through_stage=None,
-                  stage_functions=None, mode="automatic"):
+                  stage_functions=None, mode="automatic", filter_settings=None):
     """Initialize and process one image with the standard controller."""
 
     state, context = initialize_pipeline(
-        [path], settings, instrument_name, target, image_overrides, run_directory
+        [path], settings, instrument_name, target, image_overrides, run_directory,
+        filter_settings,
     )
     return run_pipeline_through(
         state, context, through_stage, stage_functions, mode
@@ -1549,11 +1571,12 @@ def run_one_image(path, settings=None, instrument_name=None, target=None,
 
 def run_batch(paths, settings=None, instrument_name=None, target=None,
               image_overrides=None, run_directory=None, through_stage=None,
-              stage_functions=None, mode="automatic"):
+              stage_functions=None, mode="automatic", filter_settings=None):
     """Initialize and process a FITS batch while containing image failures."""
 
     state, context = initialize_pipeline(
-        paths, settings, instrument_name, target, image_overrides, run_directory
+        paths, settings, instrument_name, target, image_overrides, run_directory,
+        filter_settings,
     )
     return run_pipeline_through(
         state, context, through_stage, stage_functions, mode
@@ -1786,6 +1809,24 @@ def _working_ccd(context, image_id):
     return working if working is not None else image["record"].get("ccd")
 
 
+def _metadata_instrument_profile(metadata):
+    """Infer a supported instrument profile from normalized metadata."""
+
+    for name in ("instrument", "detector", "telescope", "site"):
+        value = (metadata or {}).get(name)
+        profile = normalize_instrument_name(value)
+        if profile in {"lco", "keplercam"}:
+            return profile
+        text = "" if value is None else str(value).strip().lower()
+        if name == "site" and text in {"lsc", "elp", "cpt", "coj", "tfn"}:
+            return "lco"
+        if name in {"instrument", "detector"} and text.startswith(
+            ("fa", "fl", "ep", "sq")
+        ):
+            return "lco"
+    return None
+
+
 def _run_read(context, image_id, settings):
     from .image import read_fits_image
 
@@ -1794,8 +1835,29 @@ def _run_read(context, image_id, settings):
         target=context.get("target"),
     )
     image = context["images"][image_id]
+    instrument_name = context.get("instrument_name")
+    if instrument_name is None:
+        instrument_name = _metadata_instrument_profile(metadata)
+    image_overrides = context["_state"]["images"][image_id].get("overrides", {})
+    resolved = resolve_settings(
+        instrument_name=instrument_name,
+        run_settings=context.get("run_settings", context.get("settings", {})),
+        filter_name=metadata.get("filter"),
+        filter_settings=context.get("filter_settings"),
+        image_name=Path(image["path"]).name,
+        image_overrides=(
+            {Path(image["path"]).name: image_overrides}
+            if image_overrides else None
+        ),
+    )
+    image["settings"] = resolved
     image["working_ccd"] = ccd
-    image["record"].update({"ccd": ccd, "metadata": metadata, "shape": ccd.shape})
+    image["record"].update({
+        "ccd": ccd,
+        "metadata": metadata,
+        "shape": ccd.shape,
+        "settings": resolved,
+    })
     return {"ccd": ccd, "metadata": metadata,
             "status": metadata.get("metadata_status", "PASS")}
 
@@ -2137,8 +2199,244 @@ def _output_derivatives(context):
     return values
 
 
+def _simple_stage_diagnostic(record, stage_name, stage_result, status, error=None):
+    """Create a lightweight image-and-summary page for a pipeline stage."""
+
+    import matplotlib.pyplot as plt
+
+    data = None
+    if stage_name == "read" and isinstance(stage_result, Mapping):
+        value = stage_result.get("ccd")
+        if value is not None:
+            data = np.asarray(getattr(value, "data", value), dtype=float)
+    if data is None:
+        value = record.get("ccd")
+        if value is not None:
+            data = np.asarray(getattr(value, "data", value), dtype=float)
+
+    overlay = None
+    if isinstance(stage_result, Mapping):
+        if stage_name == "masks":
+            overlay = (stage_result.get("components") or {}).get("combined")
+        elif stage_name == "cosmic_rays":
+            products = stage_result.get("products") or {}
+            overlay = products.get("cosmic_mask", products.get("cosmic_ray_mask"))
+        elif stage_name == "fringe":
+            overlay = (stage_result.get("products") or {}).get("fringe_model")
+
+    figure, axes = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
+    axes[0].set_title("{} image context".format(stage_name.replace("_", " ").title()))
+    if data is None or data.ndim != 2 or not np.isfinite(data).any():
+        axes[0].text(0.5, 0.5, "No image array available", ha="center", va="center")
+        axes[0].set_axis_off()
+    else:
+        finite = data[np.isfinite(data)]
+        low, high = np.percentile(finite, [1.0, 99.5])
+        if not np.isfinite(high) or high <= low:
+            high = low + 1.0
+        axes[0].imshow(data, origin="lower", cmap="gray", vmin=low, vmax=high)
+        if overlay is not None and np.shape(overlay) == data.shape:
+            mask = np.asarray(overlay, dtype=bool)
+            if np.any(mask):
+                axes[0].imshow(
+                    np.ma.masked_where(~mask, mask), origin="lower", cmap="Reds",
+                    alpha=0.45, interpolation="nearest",
+                )
+        axes[0].set_xlabel("x [pixel]")
+        axes[0].set_ylabel("y [pixel]")
+
+    flags = []
+    details = None
+    if isinstance(stage_result, Mapping):
+        flags = stage_result.get("flags", [])
+        details = stage_result.get("info")
+        if isinstance(details, Mapping):
+            flags = flags or details.get("flags", [])
+    metadata = record.get("metadata", {})
+    lines = [
+        "Stage: {}".format(stage_name),
+        "Status: {}".format(status),
+        "Image: {}".format(record.get("image_id", metadata.get("filename", "unknown"))),
+        "Object: {}".format(metadata.get("object", "unknown")),
+        "Filter: {}".format(metadata.get("filter", "unknown")),
+        "MJD midpoint: {}".format(metadata.get("mjd_mid", "unknown")),
+        "Shape: {}".format(None if data is None else data.shape),
+        "Flags: {}".format(", ".join(str(value) for value in flags) or "none"),
+    ]
+    if isinstance(details, Mapping):
+        for name in ("skipped", "mode", "applied", "quality_status", "error"):
+            if details.get(name) is not None:
+                lines.append("{}: {}".format(name, details[name]))
+    if error:
+        lines.extend(["", "ERROR", str(error)])
+    axes[1].set_axis_off()
+    axes[1].text(
+        0.02, 0.98, "\n".join(lines), va="top", ha="left",
+        family="monospace", fontsize=10, wrap=True,
+    )
+    figure.suptitle("RedPhot stage diagnostic", fontsize=15)
+    return figure
+
+
+def _diagnostic_stage_figures(context, settings):
+    """Build ordered per-image diagnostic figures from completed products."""
+
+    from .diagnostics import (
+        plot_alignment_target_diagnostics,
+        plot_astrometry_diagnostics,
+        plot_background_diagnostics,
+        plot_calibration_diagnostics,
+        plot_difference_photometry_diagnostics,
+        plot_image_quality_diagnostics,
+        plot_image_usability_diagnostics,
+        plot_psf_diagnostics,
+        plot_science_photometry_diagnostics,
+        plot_star_selection_diagnostics,
+        plot_subtraction_diagnostics,
+    )
+
+    configured = settings.get("diagnostics", {})
+    if not configured.get("enabled", True):
+        return {}
+    state = context["_state"]
+    shared = context.get("shared", {})
+    values = {}
+
+    selection = shared.get("star_selection", {})
+    usability = shared.get("usability", {})
+    alignment = shared.get("alignment", {})
+    usability_lookup = {
+        str(item.get("image_id")): item for item in usability.get("decisions", [])
+    }
+    selection_lookup = {
+        str(item.get("image_id")): item for item in selection.get("summaries", [])
+    }
+
+    for image_id, image in context["images"].items():
+        record = image["record"]
+        items = []
+        for stage_name in pipeline_stage_names():
+            definition = next(
+                item for item in _stage_definitions() if item["name"] == stage_name
+            )
+            entry = (
+                state["images"][image_id].get("stages", {}).get(stage_name)
+                if definition["scope"] == "image"
+                else state.get("batch_stages", {}).get(stage_name)
+            )
+            if not entry:
+                continue
+            status = str(entry.get("status", "COMPLETED")).upper()
+            if status in {"STALE", "SKIPPED"} and not entry.get("blocked", False):
+                continue
+            plot_switches = {
+                "read": "plot_original_image",
+                "masks": "plot_masks",
+                "cosmic_rays": "plot_masks",
+                "background": "plot_background",
+                "astrometry": "plot_astrometry",
+                "star_selection": "plot_comparison_stars",
+                "psf": "plot_psf",
+                "science_photometry": "plot_target",
+                "calibration": "plot_calibration",
+                "subtraction": "plot_subtraction",
+                "difference_photometry": "plot_upper_limits",
+            }
+            switch = plot_switches.get(stage_name)
+            if switch is not None and not configured.get(switch, True):
+                if status == "FAIL" or stage_name == record.get("failed_stage"):
+                    break
+                continue
+            result = (
+                image.get("products", {}).get(stage_name)
+                if definition["scope"] == "image"
+                else shared.get(stage_name)
+            )
+            error = entry.get("error")
+            try:
+                figure = None
+                if stage_name == "background" and configured.get("plot_background", True):
+                    products = (result or {}).get("products", {})
+                    corrected = products.get("background_subtracted")
+                    model = products.get("background")
+                    background_input = (
+                        np.asarray(corrected) + np.asarray(model)
+                        if corrected is not None and model is not None else record.get("ccd")
+                    )
+                    figure = plot_background_diagnostics(
+                        background_input, products, (result or {}).get("info", {}),
+                        record.get("metadata"),
+                    )
+                elif stage_name == "source_quality":
+                    figure = plot_image_quality_diagnostics(
+                        record.get("ccd"), (result or {}).get("sources"),
+                        (result or {}).get("segmentation"), (result or {}).get("info", {}),
+                        record.get("metadata"),
+                    )
+                elif stage_name == "astrometry" and configured.get("plot_astrometry", True):
+                    figure = plot_astrometry_diagnostics(
+                        record.get("ccd"), (result or {}).get("catalog"),
+                        (result or {}).get("matches"), (result or {}).get("info", {}),
+                        record.get("metadata"),
+                    )
+                elif stage_name == "star_selection" and configured.get(
+                    "plot_comparison_stars", True
+                ):
+                    figure = plot_star_selection_diagnostics(
+                        record.get("ccd"), selection.get("measurements"), image_id,
+                        selection_lookup.get(image_id), record.get("metadata"),
+                    )
+                elif stage_name == "usability":
+                    figure = plot_image_usability_diagnostics(
+                        record.get("ccd"), usability_lookup.get(image_id, {}),
+                        usability.get("star_residuals"), record.get("metadata"),
+                    )
+                elif stage_name == "alignment":
+                    figure = plot_alignment_target_diagnostics(
+                        alignment.get("stacks", {}), alignment.get("target_solution", {}),
+                        alignment.get("target_candidates"), alignment.get("projections"),
+                    )
+                elif stage_name == "psf" and configured.get("plot_psf", True):
+                    figure = plot_psf_diagnostics(result or {})
+                elif stage_name == "science_photometry" and configured.get(
+                    "plot_target", True
+                ):
+                    figure = plot_science_photometry_diagnostics(result or {})
+                elif stage_name == "calibration" and configured.get(
+                    "plot_calibration", True
+                ):
+                    figure = plot_calibration_diagnostics(result or {})
+                elif stage_name == "subtraction" and configured.get(
+                    "plot_subtraction", True
+                ):
+                    figure = plot_subtraction_diagnostics(result or {}, record)
+                elif stage_name == "difference_photometry" and configured.get(
+                    "plot_upper_limits", True
+                ):
+                    figure = plot_difference_photometry_diagnostics(result or {})
+                if figure is None:
+                    figure = _simple_stage_diagnostic(
+                        record, stage_name, result, status, error
+                    )
+            except Exception as plot_error:
+                figure = _simple_stage_diagnostic(
+                    record, stage_name, result, status,
+                    error or "Diagnostic plotting failed: {}".format(plot_error),
+                )
+            items.append({
+                "name": stage_name,
+                "figure": figure,
+                "status": status,
+                "close_after": True,
+            })
+            if status == "FAIL" or stage_name == record.get("failed_stage"):
+                break
+        values[image_id] = items
+    return values
+
+
 def _run_outputs(context, image_id, settings):
-    from .output import assemble_output_products
+    from .output import assemble_output_products, output_product_enabled
 
     state = context["_state"]
     shared = context["shared"]
@@ -2154,6 +2452,8 @@ def _run_outputs(context, image_id, settings):
         run_image = state["images"][identifier]
         record["status"] = run_image.get("status")
         record["failed_stage"] = run_image.get("failed_stage")
+        failed_entry = run_image.get("stages", {}).get(record["failed_stage"], {})
+        record["failure_error"] = failed_entry.get("error")
         record["review_decisions"] = deepcopy(run_image.get("review_decisions", {}))
         if run_image.get("review_decisions"):
             record.setdefault("decision", {})["user_decision"] = ";".join(
@@ -2161,10 +2461,14 @@ def _run_outputs(context, image_id, settings):
                 for stage, value in run_image["review_decisions"].items()
             )
         all_records.append(record)
+    diagnostic_stages = (
+        _diagnostic_stage_figures(context, settings)
+        if output_product_enabled(settings, "image_pdfs") else {}
+    )
     return assemble_output_products(
         all_records, sources=selection.get("master"),
         batch_products=shared.get("batch_consistency"),
-        diagnostic_stages=shared.get("diagnostic_stages"),
+        diagnostic_stages=diagnostic_stages,
         derivatives=_output_derivatives(context), settings=settings,
         output_directory=output_root, run_events=state.get("events"),
     )

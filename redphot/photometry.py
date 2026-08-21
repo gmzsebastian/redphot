@@ -3020,10 +3020,6 @@ def calibrate_photometry(
             if any(str(value) != "PASS" for value in zeropoints["status"])
             else "PASS"
         ),
-        "artificial_star_injection_enabled": bool(
-            settings.get("upper_limits", {}).get("injection_recovery", False)
-        ),
-        "artificial_star_injection_implemented": False,
     }
 
 
@@ -3065,10 +3061,6 @@ def save_calibration_products(
             "status": products.get("status"),
             "catalogs_available": products.get("catalogs_available", []),
             "unstable_stars": products.get("unstable_stars", []),
-            "artificial_star_injection_enabled": products.get(
-                "artificial_star_injection_enabled", False
-            ),
-            "artificial_star_injection_implemented": False,
         }
         path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
         paths["summary"] = str(path)

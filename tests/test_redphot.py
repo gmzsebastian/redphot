@@ -34,11 +34,12 @@ from redphot.pipeline import (
     pipeline_stage_names,
     rerun_image,
     review_image,
+    run_pipeline_stage,
     run_pipeline_through,
     set_image_overrides,
     skip_pipeline_stage,
 )
-from redphot.subtraction import evaluate_subtraction
+from redphot.subtraction import choose_hotpants_parameters, evaluate_subtraction
 
 
 DATA = Path(__file__).parent / "data"
@@ -357,3 +358,65 @@ def test_output_profiles_and_traceable_core_products(tmp_path):
 
 def test_default_configuration_is_valid():
     validate_settings(get_default_settings())
+
+
+def test_pipeline_applies_instrument_filter_and_image_precedence(tmp_path):
+    first = tmp_path / "first.fits"
+    second = tmp_path / "second.fits"
+    _write_lco(first)
+    _write_lco(second)
+    state, context = initialize_pipeline(
+        [first, second],
+        instrument_name="LCO",
+        filter_settings={"r": {"background": {"box_size": [77, 77]}}},
+        image_overrides={
+            first.name: {"background": {"box_size": [99, 99]}},
+        },
+        run_directory=tmp_path / "precedence",
+    )
+    assert context["images"][second.name]["settings"]["crop"]["size_arcmin"] == 15.0
+    run_pipeline_stage(state, context, "read", save=False)
+    assert context["images"][first.name]["settings"]["background"]["box_size"] == [99, 99]
+    assert context["images"][second.name]["settings"]["background"]["box_size"] == [77, 77]
+
+
+def test_unimplemented_options_are_rejected_instead_of_silently_ignored():
+    cases = (
+        ("apertures", "perform_optimal", True),
+        ("psf", "spatial_order", 1),
+        ("calibration", "apply_color_term", True),
+        ("upper_limits", "injection_recovery", True),
+    )
+    for section, name, value in cases:
+        settings = get_default_settings()
+        settings[section][name] = value
+        with pytest.raises(ValueError):
+            validate_settings(settings)
+
+
+def test_hotpants_kernel_tracks_the_measured_seeing():
+    settings = get_default_settings()
+    science = {
+        "image_id": "science",
+        "data": np.ones((128, 128), dtype=float),
+        "quality": {"fwhm_pixels": 5.0},
+        "metadata": {"saturation": 50000.0},
+    }
+    template = {
+        "metadata": {"fwhm_pixels": 3.0, "saturation": 50000.0}
+    }
+    aligned = {
+        "data": np.ones((128, 128), dtype=float),
+        "mask": np.zeros((128, 128), dtype=bool),
+        "wcs": None,
+    }
+
+    parameters = choose_hotpants_parameters(
+        science, template, aligned, settings
+    )
+    expected = np.sqrt((5.0 / 2.354820045) ** 2 - (3.0 / 2.354820045) ** 2)
+    assert parameters["convolve"] == "template"
+    assert parameters["matching_sigma_pixels"] == pytest.approx(expected)
+    assert parameters["gaussian_components"][1][1] == pytest.approx(expected)
+    assert parameters["gaussian_components"][0][1] == pytest.approx(0.5 * expected)
+    assert parameters["gaussian_components"][2][1] == pytest.approx(2.0 * expected)

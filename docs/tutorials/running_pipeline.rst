@@ -26,6 +26,30 @@ Minimal automatic batch
        mode="automatic",
    )
 
+Read and inspect one FITS file
+------------------------------
+
+Use the lower-level functions when inspecting ingestion before starting a
+run. The filter is read from the FITS metadata; a ``filter_name`` argument is
+only needed when deliberately overriding or testing configuration resolution.
+
+.. code-block:: python
+
+   from redphot.config import resolve_settings
+   from redphot.image import read_fits_image
+
+   filename = "AT_2024rmj_r_FLWO_2024.1012.fits"
+   settings = resolve_settings(instrument_name="KeplerCam", image_name=filename)
+   ccd, metadata = read_fits_image(filename, settings=settings)
+
+   print(ccd.shape, metadata["data_hdu"])
+   print(metadata["filter"], metadata["mjd_mid"])
+   print(metadata["metadata_status"], metadata["quality_flags"])
+
+For a mixed-filter pipeline run, pass user filter overrides through
+``filter_settings`` on ``run_batch``; the controller applies them after reading
+and normalizing each header filter.
+
 Stepwise review
 ---------------
 

@@ -826,7 +826,6 @@ DEFAULT_SETTINGS = {
         "normalization_radius_fwhm": 2.5,
         "sigma_clip": 3.0,
         "maximum_iterations": 3,
-        "spatial_order": 0,
         "minimum_spatial_stars": 20,
         "minimum_spatial_cells": 6,
         "spatial_grid": [3, 3],
@@ -854,7 +853,6 @@ DEFAULT_SETTINGS = {
         "perform_small_aperture": True,
         "perform_large_aperture": True,
         "perform_psf": True,
-        "perform_optimal": False,
         "require_approved_psf": True,
         "small_radius_fwhm": 1.0,
         "large_radius_fwhm": 2.5,
@@ -870,7 +868,6 @@ DEFAULT_SETTINGS = {
         "add_poisson_noise_when_needed": True,
         "minimum_uncertainty": 1.0e-6,
         "diagnostic_cutout_radius_fwhm": 5.0,
-        "apply_aperture_correction": True,
         "fixed_target_position": True,
         "local_background": True,
         "save_measurement_table": True,
@@ -913,10 +910,6 @@ DEFAULT_SETTINGS = {
         "reference_aperture_method": "large_aperture",
         "minimum_aperture_correction_stars": 3,
         "aperture_correction_sigma_clip": 3.0,
-        "calculate_color_term": False,
-        "apply_color_term": False,
-        "apply_atmospheric_extinction": False,
-        "apply_galactic_extinction": False,
         "zeropoint_scatter_warn_mag": 0.10,
         "zeropoint_scatter_fail_mag": 0.30,
         "trend_slope_warn_mag": 0.05,
@@ -975,6 +968,7 @@ DEFAULT_SETTINGS = {
             "stamp_count": "auto",
             "stamp_grid": "auto",
             "kernel_radius": "auto",
+            "gaussian_components": "auto",
             "lower_threshold": "auto",
             "upper_threshold": "auto",
             "extra_arguments": [],
@@ -1043,9 +1037,6 @@ DEFAULT_SETTINGS = {
         "empty_aperture_random_seed": 12345,
         "exclude_sources": True,
         "exclude_masked_regions": True,
-        "injection_recovery": False,
-        "number_injected_sources": 100,
-        "minimum_recovery_fraction": 0.50,
         "save_limit_table": True,
         "calculate_on_science": True,
         "calculate_on_difference": True,
@@ -1842,6 +1833,11 @@ def validate_settings(settings):
         raise ValueError("apertures.local_background_sigma_clip must be positive")
     if float(aperture_settings.get("minimum_uncertainty", 1.0e-6)) <= 0:
         raise ValueError("apertures.minimum_uncertainty must be positive")
+    if aperture_settings.get("perform_optimal", False):
+        raise ValueError(
+            "apertures.perform_optimal is not implemented; use small_aperture, "
+            "large_aperture, or PSF photometry"
+        )
 
     psf_settings = settings["psf"]
     if psf_settings.get("model", "empirical") not in {"empirical", "moffat", "gaussian"}:
@@ -1872,8 +1868,10 @@ def validate_settings(settings):
     spatial_grid = psf_settings.get("spatial_grid", [3, 3])
     if len(spatial_grid) != 2 or any(int(value) <= 0 for value in spatial_grid):
         raise ValueError("psf.spatial_grid must contain two positive integers")
-    if int(psf_settings.get("spatial_order", 0)) < 0:
-        raise ValueError("psf.spatial_order cannot be negative")
+    if int(psf_settings.get("spatial_order", 0)) != 0:
+        raise ValueError(
+            "Spatially varying PSFs are not implemented; psf.spatial_order must be 0"
+        )
     if int(psf_settings.get("model_version", 1)) <= 0:
         raise ValueError("psf.model_version must be positive")
     psf_statuses = set(psf_settings.get("approved_statuses", ["PASS", "WARN"]))
@@ -1905,6 +1903,22 @@ def validate_settings(settings):
         raise ValueError("calibration.reference_aperture_method is not recognized")
     if float(calibration_settings.get("detection_sigma", 3.0)) <= 0:
         raise ValueError("calibration.detection_sigma must be positive")
+    unsupported_calibration = (
+        "calculate_color_term",
+        "apply_color_term",
+        "apply_atmospheric_extinction",
+        "apply_galactic_extinction",
+    )
+    requested_calibration = [
+        name for name in unsupported_calibration
+        if calibration_settings.get(name, False)
+    ]
+    if requested_calibration:
+        raise ValueError(
+            "Unsupported calibration options requested: {}".format(
+                ", ".join(requested_calibration)
+            )
+        )
 
     subtraction_settings = settings["subtraction"]
     subtraction_method = subtraction_settings["method"]
@@ -1959,6 +1973,18 @@ def validate_settings(settings):
         raise ValueError(
             "subtraction.hotpants.stamp_grid must contain two positive integers"
         )
+    gaussian_components = hotpants_settings.get("gaussian_components", "auto")
+    if gaussian_components != "auto":
+        if not gaussian_components or any(
+            len(component) != 2
+            or int(component[0]) < 0
+            or float(component[1]) <= 0
+            for component in gaussian_components
+        ):
+            raise ValueError(
+                "subtraction.hotpants.gaussian_components must be 'auto' or "
+                "a sequence of (degree, positive sigma_pixels) pairs"
+            )
     difference_settings = subtraction_settings.get("photometry", {})
     if int(difference_settings.get("minimum_empty_apertures", 20)) < 1:
         raise ValueError(
@@ -1994,6 +2020,12 @@ def validate_settings(settings):
             raise ValueError(
                 "subtraction.photometry.{} contains an unknown method".format(name)
             )
+
+    if settings["upper_limits"].get("injection_recovery", False):
+        raise ValueError(
+            "upper_limits.injection_recovery is not implemented; use analytic "
+            "or empty-aperture limits"
+        )
 
     target_ra = settings["target_position"]["ra"]
     target_dec = settings["target_position"]["dec"]

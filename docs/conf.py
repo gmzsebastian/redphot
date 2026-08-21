@@ -1,9 +1,3 @@
-# Configuration file for the Sphinx documentation builder.
-#
-# This file only contains a selection of the most common options. For a full
-# list see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
-
 import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -15,12 +9,6 @@ except PackageNotFoundError:
 
 __version__ = release
 
-# -- Path setup --------------------------------------------------------------
-
-# If extensions (or modules to document with autodoc) are in another directory,
-# add these directories to sys.path here. If the directory is relative to the
-# documentation root, use os.path.abspath to make it absolute, like shown here.
-# sys.path.insert(0, os.path.abspath('.'))
 sys.path.insert(0, os.path.abspath('../'))
 
 # -- Project information -----------------------------------------------------
@@ -36,22 +24,11 @@ release = __version__
 
 # -- General configuration ---------------------------------------------------
 
-# Add any Sphinx extension module names here, as strings. They can be
-# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
-# ones.
 extensions = [
     "sphinx.ext.autodoc",
-    "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
     "sphinx.ext.mathjax",
-    "myst_nb",
-    "IPython.sphinxext.ipython_console_highlighting",
-    ]
-
-myst_enable_extensions = ["dollarmath", "colon_fence"]
-
-# Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
+]
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -60,7 +37,6 @@ exclude_patterns = [
     '_build',
     'Thumbs.db',
     '.DS_Store',
-    'tutorials/reduce_data.rst',
 ]
 
 
@@ -71,20 +47,11 @@ exclude_patterns = [
 #
 html_theme = 'sphinx_rtd_theme'
 
-# Add any paths that contain custom static files (such as style sheets) here,
-# relative to this directory. They are copied after the builtin static files,
-# so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['images']
-
-
 # -- Extension configuration -------------------------------------------------
 
 # Napoleon settings to support Google and NumPy style docstrings
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True
-
-# Todo settings
-todo_include_todos = True
 
 # Additional options for LaTeX output, e.g., for PDF generation.
 latex_elements = {
@@ -94,14 +61,6 @@ latex_elements = {
     ''',
 }
 
-# Intersphinx configuration
-intersphinx_mapping = {}
-
-# Disable execution for MyST-NB (if applicable)
-nb_execution_mode = 'off'
-
 # Add a logo to the sidebar
 html_logo = 'images/redphot_small.png'
-
-# Ensure the static path is defined correctly for custom assets
-html_static_path = ['images']
+html_favicon = 'images/redphot_small.png'

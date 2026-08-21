@@ -5186,8 +5186,9 @@ def assess_image_usability(image_records, measurements, settings=None,
     Notes
     -----
     The quick limits are background-limited estimates. Final calibrated upper
-    limits, empty-aperture measurements, and injection recovery remain later
-    photometry products. Input images are never changed or deleted.
+    limits and empty-aperture measurements are produced by the later
+    calibration stage. Artificial-star injection/recovery is not implemented.
+    Input images are never changed or deleted.
     """
 
     if settings is None:

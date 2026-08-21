@@ -1747,9 +1747,6 @@ def plot_calibration_diagnostics(products, output_path=None, show=False):
         "Classifications: {}".format(classification_counts or "none"),
         "Unstable stars: {}".format(len(products.get("unstable_stars", []))),
         "Empty-aperture rows: {}".format(0 if limits is None else len(limits)),
-        "Injection/recovery: later" if not products.get(
-            "artificial_star_injection_implemented", False
-        ) else "Injection/recovery: enabled",
     ]
     if products.get("unstable_stars"):
         summary.extend(["", "Rejected unstable stars:"])

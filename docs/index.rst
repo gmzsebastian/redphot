@@ -25,18 +25,15 @@ metadata and processing choices configurable. IRAF and PyRAF are not required.
    :caption: User Guide
 
    installation
+   algorithms
+   tutorials/running_pipeline
    reference
    configuration
+   api
    outputs
    instruments
    troubleshooting
    validation
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Tutorials
-
-   tutorials/running_pipeline
 
 License
 -------

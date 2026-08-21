@@ -27,6 +27,10 @@ python -m pip install -e '.[cosmic_rays]'
 Hotpants is an external executable and is required only when Hotpants image
 subtraction is enabled. IRAF and PyRAF are not dependencies.
 
+Complete installation instructions, including CFITSIO and Hotpants builds for
+Linux and macOS, are in
+[`docs/installation.rst`](docs/installation.rst).
+
 ## Minimal batch
 
 ```python
@@ -98,7 +102,8 @@ derivative. Individual products can be changed with `output.product_overrides`.
 }}
 ```
 
-See the documentation for configuration precedence, output schemas,
+See the documentation for worked examples, the equations and algorithms,
+configuration precedence, the complete function API, output schemas,
 instrument behavior, troubleshooting, and release validation.
 
 ## Release status

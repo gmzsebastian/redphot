@@ -427,9 +427,10 @@ def _failure_page(record):
 
     figure = plt.figure(figsize=(8.5, 11))
     figure.suptitle("Processing stopped", fontsize=16, color="tab:red", y=0.9)
-    text = "Failed stage: {}\n\nStatus: {}\n\nFlags / reasons:\n{}".format(
+    text = "Failed stage: {}\n\nStatus: {}\n\nFlags / reasons:\n{}\n\nError:\n{}".format(
         record.get("failed_stage") or "unknown", _record_status(record),
         _record_flags(record) or "No reason recorded",
+        record.get("failure_error") or "No exception text recorded",
     )
     figure.text(0.1, 0.8, text, va="top", family="monospace", fontsize=11, wrap=True)
     return figure
@@ -504,19 +505,24 @@ def make_image_diagnostic_pdf(record, stages, output_path, preferred_rows=None,
             failed_stage = str(record.get("failed_stage") or "")
             for item in items:
                 status = str(item.get("status", "COMPLETED")).upper()
-                if str(item.get("name", "")) == failed_stage or status in {
+                failed_item = str(item.get("name", "")) == failed_stage or status in {
                     "FAIL", "FAILED", "ERROR"
+                }
+                if status not in {
+                    "COMPLETE", "COMPLETED", "PASS", "WARN", "FAIL", "FAILED", "ERROR"
                 }:
-                    break
-                if status not in {"COMPLETE", "COMPLETED", "PASS", "WARN"}:
                     continue
                 if mode == "selected" and str(item.get("name")) not in selected:
+                    if failed_item:
+                        break
                     continue
                 figure, temporary = _stage_figure(item)
                 if figure is not None:
                     pdf.savefig(figure, bbox_inches="tight")
-                    if temporary:
+                    if temporary or item.get("close_after", False):
                         plt.close(figure)
+                if failed_item:
+                    break
         if record.get("failed_stage") or _record_status(record) == "FAIL":
             failure = _failure_page(record)
             pdf.savefig(failure, bbox_inches="tight")

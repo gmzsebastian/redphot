@@ -18,6 +18,7 @@ setup(
         'astropy>=5.2',
         'astroquery>=0.4.6',
         'photutils>=1.9',
+        'scikit-image>=0.24',
         'scipy>=1.9',
     ],
     extras_require={
