@@ -7,6 +7,7 @@ the release-validation observations listed in ``docs/validation.rst``.
 
 from hashlib import sha256
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pytest
@@ -39,7 +40,12 @@ from redphot.pipeline import (
     set_image_overrides,
     skip_pipeline_stage,
 )
-from redphot.subtraction import choose_hotpants_parameters, evaluate_subtraction
+from redphot.catalogs import plate_solve_with_astrometry_net
+from redphot.subtraction import (
+    _run_hotpants,
+    choose_hotpants_parameters,
+    evaluate_subtraction,
+)
 
 
 DATA = Path(__file__).parent / "data"
@@ -420,3 +426,83 @@ def test_hotpants_kernel_tracks_the_measured_seeing():
     assert parameters["gaussian_components"][1][1] == pytest.approx(expected)
     assert parameters["gaussian_components"][0][1] == pytest.approx(0.5 * expected)
     assert parameters["gaussian_components"][2][1] == pytest.approx(2.0 * expected)
+
+
+def _image_with_nonfinite_pixels(shape=(64, 64)):
+    rng = np.random.default_rng(3)
+    data = rng.normal(100.0, 5.0, shape)
+    data[10, 12] = np.inf
+    data[20, 30] = -np.inf
+    data[40, 5] = np.nan
+    return data
+
+
+def _argument(command, flag):
+    return command[command.index(flag) + 1]
+
+
+def test_plate_solve_input_is_finite_float32_and_science_is_unchanged(monkeypatch):
+    """Regression: CFITSIO overflowed on inf pixels from zero-valued flats."""
+
+    data = _image_with_nonfinite_pixels()
+    ccd = CCDData(data.copy(), unit="adu", wcs=WCS(_wcs_header(data.shape)))
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        with fits.open(command[-1]) as hdulist:
+            seen["bitpix"] = hdulist[0].header["BITPIX"]
+            seen["finite"] = bool(np.isfinite(hdulist[0].data).all())
+        fits.PrimaryHDU(np.zeros((2, 2), dtype=np.float32),
+                        _wcs_header(data.shape)).writeto(_argument(command, "--new-fits"))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("redphot.catalogs.shutil.which", lambda command: "/fake/solve-field")
+    monkeypatch.setattr("redphot.catalogs.subprocess.run", fake_run)
+
+    solved = plate_solve_with_astrometry_net(ccd, {"pixel_scale": 0.4})
+
+    assert solved.has_celestial
+    assert seen == {"bitpix": -32, "finite": True}
+    np.testing.assert_array_equal(ccd.data, data)
+
+
+def test_hotpants_inputs_are_finite_and_nonfinite_pixels_are_masked(monkeypatch):
+    settings = get_default_settings()
+    science = _image_with_nonfinite_pixels()
+    template = np.full(science.shape, 100.0)
+    template[50, 50] = np.nan
+    parameters = choose_hotpants_parameters(
+        {"image_id": "science", "data": science, "quality": {"fwhm_pixels": 5.0},
+         "metadata": {"saturation": 50000.0}},
+        {"metadata": {"fwhm_pixels": 3.0, "saturation": 50000.0}},
+        {"data": template, "mask": np.zeros(science.shape, dtype=bool), "wcs": None},
+        settings,
+    )
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        science_input = fits.getdata(_argument(command, "-inim"))
+        template_input = fits.getdata(_argument(command, "-tmplim"))
+        seen["finite"] = bool(np.isfinite(science_input).all()
+                              and np.isfinite(template_input).all())
+        seen["science_mask"] = fits.getdata(_argument(command, "-imi")).astype(bool)
+        seen["template_mask"] = fits.getdata(_argument(command, "-tmi")).astype(bool)
+        fits.PrimaryHDU(science_input - template_input).writeto(_argument(command, "-outim"))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("redphot.subtraction.shutil.which", lambda command: "/fake/hotpants")
+    monkeypatch.setattr("redphot.subtraction.subprocess.run", fake_run)
+
+    difference, _ = _run_hotpants(
+        science, template, _wcs_header(science.shape), parameters,
+        settings["subtraction"],
+        science_mask=np.zeros(science.shape, dtype=bool),
+    )
+
+    assert seen["finite"]
+    assert seen["science_mask"][10, 12] and seen["science_mask"][40, 5]
+    assert seen["template_mask"][50, 50]
+    assert seen["science_mask"].sum() == 3 and seen["template_mask"].sum() == 1
+    for y, x in [(10, 12), (20, 30), (40, 5), (50, 50)]:
+        assert np.isnan(difference[y, x])
+    assert np.isfinite(difference).sum() == science.size - 4

@@ -907,6 +907,39 @@ def _target_projection_record(wcs, target, shape):
     }
 
 
+def finite_image_for_external_tool(data, dtype=np.float32):
+    """Return a copy of an image that CFITSIO-based external tools can read.
+
+    Astrometry.net and Hotpants read pixels through CFITSIO, which aborts with
+    a numerical-overflow error on ``inf`` (common where a flat field is zero)
+    and lets ``NaN`` propagate into source extraction and kernel fits.
+    Non-finite pixels, and values outside the range of ``dtype``, are replaced
+    by the median of the remaining pixels in the returned copy only. The input
+    array is never changed.
+
+    Returns
+    -------
+    clean : numpy.ndarray
+        Copy of ``data`` converted to ``dtype`` with only finite values.
+    replaced : numpy.ndarray of bool
+        Pixels that were replaced.
+
+    Raises
+    ------
+    ValueError
+        The image has no finite pixels.
+    """
+
+    array = np.array(data, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        replaced = ~np.isfinite(array) | (np.abs(array) > np.finfo(dtype).max)
+    if replaced.all():
+        raise ValueError("Image has no finite pixels to pass to an external tool")
+    if replaced.any():
+        array[replaced] = np.median(array[~replaced])
+    return array.astype(dtype), replaced
+
+
 def plate_solve_with_astrometry_net(ccd, metadata=None, settings=None):
     """Run the local Astrometry.net ``solve-field`` command as a fallback.
 
@@ -914,12 +947,16 @@ def plate_solve_with_astrometry_net(ccd, metadata=None, settings=None):
     based input formats are not uniformly supported by external solvers. The
     temporary directory is removed automatically. Only the solved WCS is
     returned; neither the input FITS file nor the in-memory science pixels are
-    changed.
+    changed. Non-finite pixels are replaced by the image median in the
+    temporary copy so that CFITSIO can read it (see
+    ``finite_image_for_external_tool``).
 
     Raises
     ------
     FileNotFoundError
         The configured ``solve-field`` executable is unavailable.
+    ValueError
+        The image has no finite pixels.
     RuntimeError
         The solver exits unsuccessfully or does not create a celestial WCS.
     subprocess.TimeoutExpired
@@ -946,8 +983,9 @@ def plate_solve_with_astrometry_net(ccd, metadata=None, settings=None):
         input_wcs = getattr(ccd, "wcs", None)
         if input_wcs is not None:
             header.update(input_wcs.to_header(relax=True))
+        solver_data, _ = finite_image_for_external_tool(ccd.data)
         fits.PrimaryHDU(
-            data=np.asarray(ccd.data),
+            data=solver_data,
             header=header,
         ).writeto(input_path, overwrite=True)
 

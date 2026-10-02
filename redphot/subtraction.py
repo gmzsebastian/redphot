@@ -24,6 +24,7 @@ from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy import ndimage
 
+from .catalogs import finite_image_for_external_tool
 from .config import get_default_settings, merge_settings, normalize_filter_name
 
 
@@ -855,7 +856,12 @@ def _hotpants_command(executable, science_path, template_path, output_path,
 
 def _run_hotpants(science, aligned_template, header, parameters, settings,
                   science_mask=None, template_mask=None):
-    """Execute Hotpants in a temporary directory and validate its FITS output."""
+    """Execute Hotpants in a temporary directory and validate its FITS output.
+
+    Non-finite science or template pixels are replaced by the image median in
+    the temporary inputs, added to the Hotpants masks, and set to NaN in the
+    returned difference image.
+    """
 
     executable = settings.get("hotpants_executable", "hotpants")
     resolved = shutil.which(executable)
@@ -868,8 +874,20 @@ def _run_hotpants(science, aligned_template, header, parameters, settings,
         science_mask_path = directory / "science_mask.fits"
         template_mask_path = directory / "template_mask.fits"
         output_path = directory / "difference.fits"
-        fits.PrimaryHDU(np.asarray(science, dtype=np.float32), header).writeto(science_path)
-        fits.PrimaryHDU(np.asarray(aligned_template, dtype=np.float32), header).writeto(template_path)
+        science_data, science_bad = finite_image_for_external_tool(science)
+        template_data, template_bad = finite_image_for_external_tool(aligned_template)
+        if science_bad.any():
+            science_mask = (
+                science_bad if science_mask is None
+                else np.asarray(science_mask, dtype=bool) | science_bad
+            )
+        if template_bad.any():
+            template_mask = (
+                template_bad if template_mask is None
+                else np.asarray(template_mask, dtype=bool) | template_bad
+            )
+        fits.PrimaryHDU(science_data, header).writeto(science_path)
+        fits.PrimaryHDU(template_data, header).writeto(template_path)
         if science_mask is not None:
             fits.PrimaryHDU(np.asarray(science_mask, dtype=np.uint8)).writeto(
                 science_mask_path
@@ -906,6 +924,7 @@ def _run_hotpants(science, aligned_template, header, parameters, settings,
         difference = np.asarray(difference, dtype=float)
         if difference.shape != science.shape or not np.isfinite(difference).any():
             raise RuntimeError("Hotpants produced an invalid difference image")
+        difference[science_bad | template_bad] = np.nan
         log["kernel_header"] = {
             key: output_header[key]
             for key in output_header
