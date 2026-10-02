@@ -81,6 +81,10 @@ review_image(
 state, context = run_pipeline_through(state, context, mode="stepwise")
 ```
 
+Every stage writes plots and a `summary.csv` to
+`<run_directory>/diagnostics/<NN>_<stage>/` as soon as it runs, so each step can
+be checked before continuing (see `docs/outputs.rst`).
+
 Runs can be resumed with `resume_pipeline("AT2024rmj_review")`. Configuration
 changes made with `set_image_overrides` mark only affected and downstream
 products stale.

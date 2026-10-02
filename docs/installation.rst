@@ -3,7 +3,7 @@
 Installation
 ============
 
-RedPhot requires Python 3.9 or newer. A clean virtual environment is strongly
+RedPhot requires Python 3.11 or newer and Photutils 3.0 or newer. A clean virtual environment is strongly
 recommended, particularly when NumPy, Photutils, or scikit-image are already
 installed in a system or Anaconda environment with incompatible binary builds.
 

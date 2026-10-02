@@ -69,6 +69,13 @@ Diagnostics
    :members:
    :member-order: bysource
 
+Per-stage diagnostic files
+--------------------------
+
+.. automodule:: redphot.stage_reports
+   :members:
+   :member-order: bysource
+
 Output products
 ---------------
 

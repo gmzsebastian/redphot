@@ -8,7 +8,7 @@ setup(
     description='Robust time-domain optical photometry of supernovae.',
     url='https://github.com/gmzsebastian/redphot',
     license='MIT License',
-    python_requires='>=3.9',
+    python_requires='>=3.11',
     packages=['redphot'],
     include_package_data=True,
     package_data={'redphot': ['ref_data/*']},
@@ -17,7 +17,7 @@ setup(
         'matplotlib>=3.6',
         'astropy>=5.2',
         'astroquery>=0.4.6',
-        'photutils>=1.9',
+        'photutils>=3.0',  # SourceCatalog.x_centroid / n_pixels API
         'scikit-image>=0.24',
         'scipy>=1.9',
     ],

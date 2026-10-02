@@ -1225,7 +1225,7 @@ def header_section_region(header, shape, settings):
     return None, {"keyword": None, "bounds": None, "applied": False}
 
 
-def detect_empirical_edges(data, base_valid, settings):
+def detect_empirical_edges(data, base_valid, settings, section=None):
     """
     Trim contiguous unusable rows and columns inward from each border.
 
@@ -1235,12 +1235,18 @@ def detect_empirical_edges(data, base_valid, settings):
     that departs strongly from the robust global median (extreme border glow or
     unexposed regions).
 
+    Rows and columns that lie entirely outside ``section`` (for example the
+    overscan outside ``DATASEC``) were already excluded by the header and are
+    skipped, not reported as bad edges; the scan starts at the first line inside
+    the section, and only pixels inside the section are tested.
+
     Returns
     -------
     edge_invalid : numpy.ndarray
         Boolean mask that is ``True`` on trimmed border pixels.
     info : dict
-        Number of rows/columns trimmed on each side and the grow width.
+        Number of additional rows/columns trimmed on each side, the number of
+        border lines already outside the section, and the grow width.
     """
 
     crop_settings = settings.get("crop", {})
@@ -1283,30 +1289,58 @@ def detect_empirical_edges(data, base_valid, settings):
             return True
         return False
 
-    def count_bad(lines, limit):
+    inside = (
+        np.ones(data.shape, dtype=bool) if section is None
+        else np.asarray(section, dtype=bool)
+    )
+
+    def count_bad(lines, limit, total):
+        """Return (lines outside the section, bad lines after them)."""
+
+        outside = 0
+        while outside < total and not np.any(lines(outside)[1]):
+            outside += 1
         count = 0
-        for step in range(limit):
-            if line_is_bad(lines(step)):
-                count = step + 1
+        for step in range(outside, min(outside + limit, total)):
+            values, keep = lines(step)
+            if line_is_bad(values[keep]):
+                count = step - outside + 1
             else:
                 break
-        return count
+        return outside, count
 
     max_rows = max(1, int(scan_fraction * ny))
     max_cols = max(1, int(scan_fraction * nx))
 
-    info["top"] = count_bad(lambda step: data[step, :], max_rows)
-    info["bottom"] = count_bad(lambda step: data[ny - 1 - step, :], max_rows)
-    info["left"] = count_bad(lambda step: data[:, step], max_cols)
-    info["right"] = count_bad(lambda step: data[:, nx - 1 - step], max_cols)
+    sides = {
+        "top": (lambda step: (data[step, :], inside[step, :]), max_rows, ny),
+        "bottom": (
+            lambda step: (data[ny - 1 - step, :], inside[ny - 1 - step, :]),
+            max_rows, ny,
+        ),
+        "left": (lambda step: (data[:, step], inside[:, step]), max_cols, nx),
+        "right": (
+            lambda step: (data[:, nx - 1 - step], inside[:, nx - 1 - step]),
+            max_cols, nx,
+        ),
+    }
+    offsets = {}
+    for side, (lines, limit, total) in sides.items():
+        offsets[side], info[side] = count_bad(lines, limit, total)
+        info["{}_outside_section".format(side)] = offsets[side]
 
     grow = int(crop_settings.get("edge_grow_pixels", 2))
     info["grow_pixels"] = grow
 
-    top = min(info["top"] + grow, ny) if info["top"] else 0
-    bottom = min(info["bottom"] + grow, ny) if info["bottom"] else 0
-    left = min(info["left"] + grow, nx) if info["left"] else 0
-    right = min(info["right"] + grow, nx) if info["right"] else 0
+    def extent(side, total):
+        if not info[side]:
+            return 0
+        return min(offsets[side] + info[side] + grow, total)
+
+    top = extent("top", ny)
+    bottom = extent("bottom", ny)
+    left = extent("left", nx)
+    right = extent("right", nx)
 
     if top:
         edge_invalid[:top, :] = True
@@ -1390,7 +1424,9 @@ def build_valid_region(ccd, metadata=None, settings=None):
         info["header_section"] = section_info
         if section_valid is not None:
             valid &= section_valid
-        edge_invalid, edge_info = detect_empirical_edges(data, valid, settings)
+        edge_invalid, edge_info = detect_empirical_edges(
+            data, valid, settings, section=section_valid
+        )
         info["empirical_edges"] = edge_info
         valid &= ~edge_invalid
 

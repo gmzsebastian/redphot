@@ -77,6 +77,26 @@ Approve or reject the PSF in the same way when the second review gate is
 reached. Rejected images are retained but blocked from downstream science
 measurements.
 
+Diagnostics while you go
+------------------------
+
+Every stage writes plots and a ``summary.csv`` to
+``<run_directory>/diagnostics/<NN>_<stage>/`` as soon as it runs (see
+:doc:`../outputs`), so a stepwise run can be judged stage by stage before
+continuing. Keep the run directory on a local disk: the checkpoint
+(``pipeline_context.pkl``) holds the image arrays of every stage and is
+rewritten after each one.
+
+Photometric reference catalogs
+------------------------------
+
+Astrometry uses Gaia. During star selection, each filter's calibration catalog
+(``catalogs.photometry_catalog_by_filter``; PS1 for griz) is queried once,
+cached next to the Gaia cache, and matched to the Gaia sources by position
+(``catalogs.photometric_match_arcsec``). Use an absolute
+``catalogs.cache_directory`` so the cache does not depend on the working
+directory.
+
 Override and rerun one image
 ----------------------------
 
@@ -96,6 +116,19 @@ Override and rerun one image
        through_stage="psf",
        mode="stepwise",
    )
+
+A rerun always starts from the image that entered the stage (for background,
+the output of the fringe stage), so repeating a stage never compounds its
+correction. To change a setting for every image, including settings read by
+batch stages, use :func:`redphot.pipeline.set_run_overrides`; per-image
+overrides keep precedence:
+
+.. code-block:: python
+
+   from redphot.pipeline import set_run_overrides
+
+   set_run_overrides(state, context, {"catalogs": {"comparison_stars": {"minimum_snr": 20}}})
+   state, context = run_pipeline_through(state, context, mode="stepwise")
 
 Resume
 ------

@@ -21,7 +21,7 @@ from astropy.table import MaskedColumn, Table, unique, vstack
 from astropy.time import Time
 from astropy.wcs import WCS
 
-from .config import get_default_settings
+from .config import get_default_settings, normalize_filter_name
 
 
 CATALOG_ALIASES = {
@@ -1663,6 +1663,171 @@ def _measurement_table(rows):
     return table
 
 
+def _routed_photometry_catalog(filter_name, settings):
+    """Return the photometric catalog configured for one normalized filter."""
+
+    calibration = settings.get("calibration", {}).get("catalog", "auto")
+    if calibration not in (None, "auto"):
+        return normalize_catalog_name(calibration)
+    catalog_settings = settings.get("catalogs", {})
+    routed = catalog_settings.get("photometry_catalog_by_filter", {}).get(filter_name)
+    if routed is None:
+        routed = catalog_settings.get("photometry_catalog")
+    routed = normalize_catalog_name(routed)
+    return None if routed in (None, "auto") else routed
+
+
+def attach_photometric_references(image_records, settings=None, target=None,
+                                  supplied=None):
+    """Attach routed photometric-catalog magnitudes to the astrometric catalogs.
+
+    Astrometry uses one catalog (normally Gaia), while each filter is calibrated
+    against the catalog routed by ``catalogs.photometry_catalog_by_filter``
+    (PS1 for griz by default).  Every routed catalog is queried once (through
+    the normal cache), cross-matched by position to the astrometric catalog,
+    and returned with the astrometric ``source_id`` so calibration can look
+    sources up by the identifiers used in the measurement tables.  Missing band
+    magnitudes in each image catalog are filled from the same match, so
+    comparison stars are selected in the band of the image.
+
+    Parameters
+    ----------
+    image_records : sequence of mapping
+        Records with ``catalog`` (from astrometry) and ``metadata``.
+    settings : mapping, optional
+        Resolved run settings.
+    target : astropy.coordinates.SkyCoord, optional
+        Query center; the astrometric catalog center is used otherwise.
+    supplied : mapping, optional
+        Catalog name to already-loaded table, used instead of querying.
+
+    Returns
+    -------
+    references : dict
+        Catalog name to cross-matched table keyed by astrometric ``source_id``.
+    info : dict
+        Per-catalog query, cache, and match statistics or errors.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    catalog_settings = settings.get("catalogs", {})
+    tolerance = float(catalog_settings.get("photometric_match_arcsec", 1.0))
+    records = [record for record in image_records if record.get("catalog") is not None]
+    info = {"catalogs": {}, "match_arcsec": tolerance}
+    if not records:
+        return {}, info
+
+    astrometric_name = normalize_catalog_name(
+        records[0]["catalog"].meta.get("catalog_name", "gaia")
+    )
+    wanted = {}
+    for record in records:
+        band = normalize_filter_name((record.get("metadata") or {}).get("filter"))
+        routed = _routed_photometry_catalog(band, settings)
+        if routed is not None and routed != astrometric_name:
+            wanted.setdefault(routed, set()).add(band)
+
+    # One reference list of astrometric sources across all images.
+    astrometric = vstack(
+        [Table(record["catalog"], masked=True)["source_id", "ra", "dec"]
+         for record in records],
+        metadata_conflicts="silent",
+    )
+    astrometric = unique(astrometric, keys="source_id")
+    if not len(astrometric):
+        return {}, info
+    astrometric_coordinates = SkyCoord(
+        np.asarray(astrometric["ra"], dtype=float) * u.deg,
+        np.asarray(astrometric["dec"], dtype=float) * u.deg,
+    )
+    if target is None:
+        target = SkyCoord(
+            float(np.nanmedian(astrometric_coordinates.ra.deg)) * u.deg,
+            float(np.nanmedian(astrometric_coordinates.dec.deg)) * u.deg,
+        )
+    metadata = records[0].get("metadata") or {}
+    references = {}
+    for name, bands in sorted(wanted.items()):
+        entry = {"bands": sorted(bands), "error": None}
+        info["catalogs"][name] = entry
+        try:
+            if supplied and name in supplied:
+                reference = Table(supplied[name], masked=True, copy=True)
+                entry["loaded_from"] = "supplied"
+            else:
+                reference, query_info = query_catalog(
+                    object_name=metadata.get("object"),
+                    catalog_name=name,
+                    center=target,
+                    metadata=metadata,
+                    settings=settings,
+                )
+                entry["loaded_from"] = (
+                    "cache" if query_info.get("loaded_from_cache") else "query"
+                )
+                entry["cache_path"] = query_info.get("cache_path")
+        except Exception as error:  # recorded; calibration reports the gap
+            entry["error"] = "{}: {}".format(type(error).__name__, error)
+            continue
+        entry["reference_rows"] = len(reference)
+        if not len(reference):
+            entry["matched"] = 0
+            continue
+        reference_coordinates = SkyCoord(
+            np.asarray(reference["ra"], dtype=float) * u.deg,
+            np.asarray(reference["dec"], dtype=float) * u.deg,
+        )
+        index, separation, _ = astrometric_coordinates.match_to_catalog_sky(
+            reference_coordinates
+        )
+        good = separation.arcsec <= tolerance
+        matched = Table(reference[index[good]], masked=True, copy=True)
+        matched["reference_source_id"] = matched["source_id"].astype(str)
+        matched["source_id"] = np.asarray(astrometric["source_id"][good], dtype=str)
+        matched["ra"] = np.asarray(astrometric["ra"][good], dtype=float) * u.deg
+        matched["dec"] = np.asarray(astrometric["dec"][good], dtype=float) * u.deg
+        matched["reference_separation_arcsec"] = separation.arcsec[good] * u.arcsec
+        matched.meta.update(reference.meta)
+        matched.meta["catalog_name"] = name
+        matched.meta["normalized"] = True
+        matched.meta["matched_to"] = astrometric_name
+        references[name] = matched
+        entry["matched"] = int(np.count_nonzero(good))
+
+    # Fill band magnitudes in the per-image astrometric catalogs.
+    for name, matched in references.items():
+        lookup = {str(value): row for row, value in enumerate(matched["source_id"])}
+        bands = info["catalogs"][name]["bands"]
+        for record in records:
+            catalog = record["catalog"]
+            if not isinstance(catalog, Table) or "source_id" not in catalog.colnames:
+                continue
+            rows = [lookup.get(str(value)) for value in catalog["source_id"]]
+            for band in bands:
+                for prefix in ("mag_", "magerr_"):
+                    column = prefix + band
+                    if column not in matched.colnames:
+                        continue
+                    values = np.ma.asarray(matched[column], dtype=float).filled(np.nan)
+                    filled = np.array(
+                        [np.nan if row is None else values[row] for row in rows],
+                        dtype=float,
+                    )
+                    if column in catalog.colnames:
+                        current = np.ma.asarray(catalog[column], dtype=float).filled(np.nan)
+                        filled = np.where(np.isfinite(current), current, filled)
+                    unit = u.mag
+                    catalog[column] = MaskedColumn(
+                        filled, mask=~np.isfinite(filled), unit=unit
+                    )
+            sources = list(catalog.meta.get("photometry_sources", []))
+            if name not in sources:
+                sources.append(name)
+            catalog.meta["photometry_sources"] = sources
+    return references, info
+
+
 def build_master_source_table(image_records, settings=None):
     """Build persistent master and per-image source tables.
 
@@ -2420,6 +2585,7 @@ def save_star_selection_tables(
 
 
 __all__ = [
+    "attach_photometric_references",
     "CATALOG_ALIASES",
     "ROLE_NAMES",
     "build_master_source_table",

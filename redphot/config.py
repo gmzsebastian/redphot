@@ -566,6 +566,9 @@ DEFAULT_SETTINGS = {
         "row_limit": -1,
         "use_object_name": True,
         "search_radius_arcmin": 10.0,
+        # Positional tolerance for attaching photometric-catalog magnitudes
+        # (e.g. PS1) to astrometric-catalog sources (e.g. Gaia).
+        "photometric_match_arcsec": 1.0,
         "astrometry_catalog": "gaia",
         "catalog_ids": {
             "gaia": "I/355/gaiadr3",
@@ -1101,7 +1104,10 @@ DEFAULT_SETTINGS = {
     "diagnostics": {
         "enabled": True,
         "show_plots": False,
+        # Write PNG figures, overview.png and summary.csv for every stage into
+        # <run_directory>/diagnostics/<NN>_<stage>/ as soon as it runs.
         "save_stage_plots": True,
+        "stage_plot_dpi": 110,
         "make_image_pdf": True,
         "make_batch_pdf": True,
         "include_failed_images": True,

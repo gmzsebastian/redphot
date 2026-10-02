@@ -362,78 +362,74 @@ def build_sources_table(sources, config_digest=None, run_id=None):
 
 
 def _summary_page(record, preferred_rows=None):
-    """Create the first page of one image report."""
+    """Create the first page of one image report (observation and final result)."""
 
-    import matplotlib.pyplot as plt
+    from .diagnostics import (
+        _fmt, _image_subtitle, _new_figure, diagnostic_style, metric_panel,
+    )
 
-    metadata = record.get("metadata", {})
-    decision = record.get("decision", {})
-    quality = record.get("quality", {})
+    metadata = record.get("metadata", {}) or {}
+    decision = record.get("decision", {}) or {}
     image_id = _record_id(record, 0)
-    lines = [
-        "Input: {}".format(_record_path(record) or "unknown"),
-        "Object: {}".format(metadata.get("object", "unknown")),
-        "MJD: {}    Filter: {}".format(
-            metadata.get("mjd_mid", metadata.get("mjd", "unknown")),
-            metadata.get("filter", "unknown"),
-        ),
-        "Telescope / site / instrument: {} / {} / {}".format(
-            metadata.get("telescope", "unknown"), metadata.get("site", "unknown"),
-            metadata.get("instrument", "unknown"),
-        ),
-        "Exposure: {} s    Data HDU: {}".format(
-            metadata.get("exposure_time", "unknown"), metadata.get("data_hdu", "unknown")
-        ),
-        "",
-        "QUALITY",
-        "Status: {}".format(_record_status(record)),
-        "Failed stage: {}".format(record.get("failed_stage") or "none"),
-        "Flags: {}".format(_record_flags(record) or "none"),
-        "User decision: {}".format(
-            decision.get("manual_decision", decision.get("user_decision", "none"))
-        ),
-        "3-sigma / 5-sigma depth: {} / {} mag".format(
-            decision.get("depth_3sigma_mag", quality.get("depth_3sigma_mag", "unknown")),
-            decision.get("depth_5sigma_mag", quality.get("depth_5sigma_mag", "unknown")),
-        ),
-        "",
-        "FINAL MEASUREMENTS",
-    ]
-    rows = preferred_rows or []
-    if len(rows):
-        for row in rows:
+    status = _record_status(record)
+    with diagnostic_style():
+        figure, grid = _new_figure(
+            "Image report  ·  {}".format(image_id), _image_subtitle(metadata), status,
+            size=(11, 8.5), rows=1, columns=2,
+        )
+        observation = [
+            ("Object", metadata.get("object") or "—", None),
+            ("Input file", str(_record_path(record) or "—").split("/")[-1], None),
+            ("Filter", metadata.get("filter") or "—", None),
+            ("MJD (mid)", _fmt(metadata.get("mjd_mid", metadata.get("mjd")), "{:.5f}"), None),
+            ("Exposure", _fmt(metadata.get("exposure_time"), "{:g}", "s"), None),
+            ("Airmass", _fmt(metadata.get("airmass"), "{:.2f}"), None),
+            ("Telescope / instrument", "{} / {}".format(metadata.get("telescope", "—"),
+                                                       metadata.get("instrument", "—")), None),
+            ("Data HDU", str(metadata.get("data_hdu", "—")), None),
+        ]
+        metric_panel(figure.add_subplot(grid[0, 0]), observation, "Observation")
+        depths = decision.get("global_depths_mag") or {}
+        result = [
+            ("Status", status, status),
+            ("Failed stage", record.get("failed_stage") or "none",
+             "FAIL" if record.get("failed_stage") else None),
+            ("Review decisions", ", ".join(
+                "{} {}".format(stage, (value or {}).get("decision", "")).lower()
+                for stage, value in (record.get("review_decisions") or {}).items()) or "none", None),
+            ("Quick 5σ depth", _fmt(depths.get("5sigma"), "{:.2f}", "mag"), None),
+        ]
+        for row in (preferred_rows or []):
             values = {name: row[name] for name in row.colnames}
-            lines.append(
-                "{} {}: mag={} +/- {}, flux={} +/- {}, classification={}".format(
-                    values.get("image_kind", "unknown"), values.get("method", "unknown"),
-                    values.get("magnitude", values.get("calibrated_magnitude", "masked")),
-                    values.get("magnitude_uncertainty", "masked"), values.get("flux", "masked"),
-                    values.get("flux_uncertainty", "masked"), values.get("classification", "unknown"),
-                )
-            )
-            lines.append("Preferred reason: {}".format(values.get("selection_reason", "configured order")))
-    else:
-        lines.append("No final measurement available (image may have failed earlier).")
-
-    figure = plt.figure(figsize=(8.5, 11))
-    figure.suptitle("redphot image report — {}".format(image_id), fontsize=15, y=0.97)
-    figure.text(0.07, 0.93, "\n".join(str(line) for line in lines), va="top",
-                ha="left", family="monospace", fontsize=9, wrap=True)
+            magnitude = values.get("magnitude", values.get("calibrated_magnitude"))
+            result.append((
+                "Final {} {}".format(values.get("image_kind", ""), values.get("method", "")).strip(),
+                "{} ± {} mag".format(_fmt(magnitude, "{:.3f}"),
+                                     _fmt(values.get("magnitude_uncertainty"), "{:.3f}")),
+                None,
+                "S/N {}  ·  {}".format(_fmt(values.get("snr"), "{:.1f}"),
+                                       values.get("classification", "")),
+            ))
+        if not preferred_rows or not len(preferred_rows):
+            result.append(("Final measurement", "none (image may have stopped earlier)", None))
+        flags = [flag for flag in str(_record_flags(record) or "").replace(",", ";").split(";")
+                 if flag.strip()]
+        metric_panel(figure.add_subplot(grid[0, 1]), result, "Result", flags=flags[:12])
     return figure
 
 
 def _failure_page(record):
-    import matplotlib.pyplot as plt
+    from .diagnostics import plot_stage_status, _image_subtitle
 
-    figure = plt.figure(figsize=(8.5, 11))
-    figure.suptitle("Processing stopped", fontsize=16, color="tab:red", y=0.9)
-    text = "Failed stage: {}\n\nStatus: {}\n\nFlags / reasons:\n{}\n\nError:\n{}".format(
-        record.get("failed_stage") or "unknown", _record_status(record),
-        _record_flags(record) or "No reason recorded",
-        record.get("failure_error") or "No exception text recorded",
+    return plot_stage_status(
+        "Processing stopped", _record_status(record), _record_id(record, 0),
+        _image_subtitle(record.get("metadata") or {}),
+        "Failed stage: {}\n\nFlags / reasons: {}\n\n{}".format(
+            record.get("failed_stage") or "unknown",
+            _record_flags(record) or "none recorded",
+            record.get("failure_error") or "No exception text recorded.",
+        ),
     )
-    figure.text(0.1, 0.8, text, va="top", family="monospace", fontsize=11, wrap=True)
-    return figure
 
 
 def _normalize_stage_items(stages):
@@ -463,6 +459,11 @@ def _normalize_stage_items(stages):
 
 def _stage_figure(item):
     figure = item.get("figure")
+    if callable(figure) and not hasattr(figure, "savefig"):
+        figure = figure()
+        if figure is None:
+            return None, False
+        return figure, True
     if figure is not None and hasattr(figure, "savefig"):
         return figure, False
     path = item.get("path")
@@ -476,10 +477,11 @@ def _stage_figure(item):
     import matplotlib.image as mpimg
     import matplotlib.pyplot as plt
 
-    rendered = plt.figure(figsize=(11, 8.5))
-    axis = rendered.add_subplot(111)
-    axis.imshow(mpimg.imread(path))
-    axis.set_title(str(item.get("name", path.stem)))
+    pixels = mpimg.imread(path)
+    height, width = pixels.shape[:2]
+    rendered = plt.figure(figsize=(11.0, 11.0 * height / max(width, 1)))
+    axis = rendered.add_axes([0, 0, 1, 1])
+    axis.imshow(pixels)
     axis.set_axis_off()
     return rendered, True
 
@@ -509,7 +511,8 @@ def make_image_diagnostic_pdf(record, stages, output_path, preferred_rows=None,
                     "FAIL", "FAILED", "ERROR"
                 }
                 if status not in {
-                    "COMPLETE", "COMPLETED", "PASS", "WARN", "FAIL", "FAILED", "ERROR"
+                    "COMPLETE", "COMPLETED", "PASS", "WARN", "FAIL", "FAILED", "ERROR",
+                    "APPROVED", "REJECTED", "SKIPPED",
                 }:
                     continue
                 if mode == "selected" and str(item.get("name")) not in selected:

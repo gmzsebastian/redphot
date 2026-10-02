@@ -289,6 +289,42 @@ def _normalize_model(model):
     return model / total
 
 
+def model_fwhm_pixels(model):
+    """FWHM in native pixels of a PSF image, from an elliptical Gaussian fit.
+
+    The geometric mean of the two fitted axes is returned. This measures the
+    PSF itself; segmentation-moment widths of individual stars include more of
+    the wings for brighter stars and overestimate the FWHM.
+    """
+
+    import warnings
+
+    from astropy.modeling import fitting, models
+
+    data = np.asarray(model, dtype=float)
+    if data.ndim != 2 or not np.any(np.isfinite(data)):
+        return None
+    data = np.nan_to_num(data, nan=0.0)
+    peak = float(np.max(data))
+    if peak <= 0:
+        return None
+    y_peak, x_peak = np.unravel_index(np.argmax(data), data.shape)
+    yy, xx = np.indices(data.shape, dtype=float)
+    guess = models.Gaussian2D(peak, x_peak, y_peak, 1.5, 1.5)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted = fitting.LevMarLSQFitter()(guess, xx, yy, data)
+    except Exception:
+        return None
+    width = 2.0 * np.sqrt(2.0 * np.log(2.0)) * np.sqrt(
+        abs(float(fitted.x_stddev.value)) * abs(float(fitted.y_stddev.value))
+    )
+    if not np.isfinite(width) or width <= 0 or width > max(data.shape):
+        return None
+    return float(width)
+
+
 def _empirical_model(stars, oversampling, sigma):
     """Build a subpixel-aligned, sigma-clipped empirical effective PSF."""
 
@@ -806,7 +842,12 @@ def construct_psf(image_record, measurements, settings=None, manual_review=None)
         [star["ellipticity"] for star in stars if star["ellipticity"] is not None],
         dtype=float,
     )
-    result["fwhm_pixels"] = float(np.median(fwhm_values)) if fwhm_values.size else None
+    # Width of the PSF model itself; the median segmentation width of the PSF
+    # stars is kept for reference but overestimates the FWHM of bright stars.
+    star_fwhm = float(np.median(fwhm_values)) if fwhm_values.size else None
+    measured_fwhm = model_fwhm_pixels(native) if native is not None else None
+    result["star_fwhm_pixels"] = star_fwhm
+    result["fwhm_pixels"] = measured_fwhm if measured_fwhm is not None else star_fwhm
     result["ellipticity"] = (
         float(np.median(ellipticities)) if ellipticities.size else None
     )
@@ -3878,6 +3919,7 @@ __all__ = [
     "plan_psf_rerun",
     "psf_dependency_signature",
     "require_approved_psf",
+    "model_fwhm_pixels",
     "route_calibration_catalog",
     "save_calibration_products",
     "save_difference_photometry_products",

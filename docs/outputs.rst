@@ -38,6 +38,31 @@ and independent astrometry, PSF, calibration, ensemble, and QC roles.
 preserving its source measurement ID, method, image layer, host-light state,
 classification, inclusion decision, flags, and traceability fields.
 
+
+Per-stage diagnostics
+---------------------
+
+As soon as each stage runs, RedPhot writes figures and a table into
+``<run_directory>/diagnostics/<NN>_<stage>/`` (for example
+``06_background``):
+
+* ``<image>.png`` -- one figure per image for image stages, and for star
+  selection, usability and calibration. Each figure states what a good result
+  looks like ("Check: ...") and lists the measured values next to the limits
+  that set PASS/WARN/FAIL.
+* ``batch.png`` -- the run-level figure of a batch stage (alignment,
+  calibration, batch consistency).
+* ``overview.png`` -- every image of the run for that stage, with status
+  colors and the key numbers against their limits.
+* ``summary.csv`` -- one row per image: status, review state, flags, and the
+  same key numbers.
+* ``skipped.png`` -- one card when a stage is disabled for every image.
+
+Figures are only redrawn for the entries a call changed; review decisions
+refresh the affected figure and ``summary.csv``. Disable with
+``{"diagnostics": {"save_stage_plots": False}}``; ``stage_plot_dpi`` sets the
+resolution. The per-image PDF reports reuse these PNGs.
+
 Other products
 --------------
 
