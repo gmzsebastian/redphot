@@ -50,32 +50,36 @@ For a mixed-filter pipeline run, pass user filter overrides through
 ``filter_settings`` on ``run_batch``; the controller applies them after reading
 and normalizing each header filter.
 
-Stepwise review
----------------
+Stepwise runs
+-------------
 
 .. code-block:: python
 
-   from redphot.pipeline import review_image, run_batch, run_pipeline_through
+   from redphot.pipeline import review_image, run_pipeline_stage, run_pipeline_through
 
-   state, context = run_batch(
-       "data/*.fits*",
-       settings=settings,
-       target=target,
-       run_directory="AT2024rmj_review",
-       mode="stepwise",
-   )
+   run_pipeline_stage(state, context, "read")
+   run_pipeline_stage(state, context, "region")
+   # ... look at <run_directory>/diagnostics/ after each stage ...
+
+Nothing waits for an approval. The usability and PSF gates
+(``pipeline.review_gates``) decide automatically after they run: images that
+FAIL are rejected and skipped by later stages, PASS and WARN images continue.
+Rejected images keep everything computed before the rejection. A decision can
+be changed at any time:
+
+.. code-block:: python
 
    review_image(
        state, context,
        "AT_2024rmj_r_FLWO_2024.1012.fits",
-       "usability", "APPROVED",
-       note="Depth and quality diagnostics inspected",
+       "usability", "REJECTED",
+       note="thin clouds in the diagnostics",
    )
-   state, context = run_pipeline_through(state, context, mode="stepwise")
+   state, context = run_pipeline_through(state, context)
 
-Approve or reject the PSF in the same way when the second review gate is
-reached. Rejected images are retained but blocked from downstream science
-measurements.
+While a stage runs, RedPhot prints one line when it starts, one line per image
+(status and time), lines from inside the slow batch steps, and the total time.
+``{"pipeline": {"verbose": False}}`` switches this off.
 
 Diagnostics while you go
 ------------------------
@@ -114,7 +118,6 @@ Override and rerun one image
        "AT_2024rmj_r_FLWO_2024.1012.fits",
        from_stage="background",
        through_stage="psf",
-       mode="stepwise",
    )
 
 A rerun always starts from the image that entered the stage (for background,
@@ -128,7 +131,7 @@ overrides keep precedence:
    from redphot.pipeline import set_run_overrides
 
    set_run_overrides(state, context, {"catalogs": {"comparison_stars": {"minimum_snr": 20}}})
-   state, context = run_pipeline_through(state, context, mode="stepwise")
+   state, context = run_pipeline_through(state, context)
 
 Resume
 ------
@@ -137,7 +140,7 @@ Resume
 
    from redphot.pipeline import resume_pipeline
 
-   state, context = resume_pipeline("AT2024rmj_review", mode="stepwise")
+   state, context = resume_pipeline("AT2024rmj_redphot")
 
 Valid completed products are reused. Changed dependencies are marked stale and
 rebuilt. Original FITS files remain unchanged.

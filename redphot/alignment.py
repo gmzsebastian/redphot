@@ -1420,11 +1420,318 @@ def save_alignment_and_target_products(alignments, residuals, stacks,
     return paths
 
 
+# ---------------------------------------------------------------------------
+# Visual alignment check: the same sources cut out of every image
+# ---------------------------------------------------------------------------
+
+def _star_spread_choice(candidates, count):
+    """Pick ``count`` candidates spread over the field (far from each other)."""
+
+    if len(candidates) <= count:
+        return list(candidates)
+    points = np.array([[item["u"], item["v"]] for item in candidates], dtype=float)
+    # Start from the candidate farthest from the field center, then add the
+    # candidate farthest from everything chosen so far.
+    chosen = [int(np.argmax(np.hypot(points[:, 0], points[:, 1])))]
+    while len(chosen) < count:
+        distance = np.min(
+            np.hypot(points[:, None, 0] - points[None, chosen, 0],
+                     points[:, None, 1] - points[None, chosen, 1]), axis=1)
+        distance[chosen] = -1.0
+        chosen.append(int(np.argmax(distance)))
+    return [candidates[index] for index in chosen]
+
+
+def select_alignment_check_sources(image_records, alignments, measurements, master,
+                                   target_solution=None, settings=None):
+    """Choose the target and a few bright, isolated stars spread over the field.
+
+    Stars must be zeropoint (calibration-role) stars, unsaturated and accepted
+    in most aligned images, with no catalog neighbor nearby. The ones farthest
+    apart are used, so a rotation or scale error shows up as offsets of
+    opposite sign on opposite sides of the field.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    options = settings.get("target_position", {})
+    count = int(options.get("alignment_check_stars", 4))
+    isolation = float(options.get("alignment_check_isolation_arcsec", 12.0))
+    used = [item for item in alignments if item.get("wcs") is not None
+            and item.get("status") != "FAIL"]
+    sources = []
+    if target_solution and _finite_float(target_solution.get("ra_deg")) is not None:
+        sources.append({
+            "name": "target", "kind": "target",
+            "ra_deg": float(target_solution["ra_deg"]),
+            "dec_deg": float(target_solution["dec_deg"]),
+        })
+    if count <= 0 or not used or master is None or measurements is None \
+            or not len(master) or not len(measurements):
+        return sources
+    used_ids = {str(item["image_id"]) for item in used}
+    rows = measurements[np.isin(np.asarray(measurements["image_id"], dtype=str),
+                                list(used_ids))]
+    accepted = np.asarray(rows["image_accepted"], dtype=bool) if "image_accepted" in rows.colnames \
+        else np.ones(len(rows), dtype=bool)
+    if "saturated" in rows.colnames:
+        accepted &= ~np.asarray(rows["saturated"], dtype=bool)
+    snr = np.asarray(rows["snr"], dtype=float) if "snr" in rows.colnames \
+        else np.full(len(rows), np.nan)
+    by_star = {}
+    for identity, ok, value in zip(np.asarray(rows["persistent_id"], dtype=str), accepted, snr):
+        entry = by_star.setdefault(identity, {"accepted": 0, "snr": []})
+        if ok:
+            entry["accepted"] += 1
+            if np.isfinite(value):
+                entry["snr"].append(float(value))
+    needed = max(1, int(np.ceil(0.8 * len(used_ids))))
+    reference = next((item for item in used if item.get("is_reference")), used[0])
+    reference_wcs = reference["wcs"]
+    reference_record = next(
+        (record for index, record in enumerate(image_records)
+         if _image_id(record, index) == reference["image_id"]), None)
+    shape = None
+    if reference_record is not None and reference_record.get("ccd") is not None:
+        shape = np.shape(reference_record["ccd"].data)
+    candidates = []
+    for row in master:
+        identity = str(row["persistent_id"])
+        entry = by_star.get(identity)
+        if entry is None or entry["accepted"] < needed or not entry["snr"]:
+            continue
+        if "role_calibration" in master.colnames and not bool(row["role_calibration"]):
+            continue
+        neighbor = _finite_float(row["nearest_catalog_neighbor_arcsec"]) \
+            if "nearest_catalog_neighbor_arcsec" in master.colnames else None
+        if neighbor is not None and neighbor < isolation:
+            continue
+        ra, dec = _finite_float(row["ra"]), _finite_float(row["dec"])
+        if ra is None or dec is None:
+            continue
+        try:
+            x, y = reference_wcs.world_to_pixel(SkyCoord(ra, dec, unit="deg"))
+        except Exception:
+            continue
+        if shape is not None:
+            u_value = float(x) / max(shape[1] - 1, 1) - 0.5
+            v_value = float(y) / max(shape[0] - 1, 1) - 0.5
+            if abs(u_value) > 0.45 or abs(v_value) > 0.45:
+                continue
+        else:
+            u_value, v_value = float(x), float(y)
+        candidates.append({
+            "name": identity, "kind": "star", "ra_deg": ra, "dec_deg": dec,
+            "snr": float(np.median(entry["snr"])), "u": u_value, "v": v_value,
+        })
+    # Bright enough for a precise centroid, but not the brightest (closest to
+    # saturation): keep the upper-middle part of the S/N distribution.
+    if len(candidates) > 4 * count:
+        values = np.array([item["snr"] for item in candidates])
+        low, high = np.percentile(values, [40, 95])
+        bright = [item for item in candidates if low <= item["snr"] <= high]
+        candidates = bright if len(bright) >= count else candidates
+    for index, item in enumerate(_star_spread_choice(candidates, count), 1):
+        item = dict(item)
+        item["persistent_id"] = item["name"]
+        item["name"] = "star {}".format(index)
+        sources.append(item)
+    return sources
+
+
+def _sky_grid_cutout(data, mask, wcs, center, half_arcsec, step_arcsec):
+    """Sample an image on a north-up grid of arcsec offsets around ``center``.
+
+    Columns run along +RA·cosδ (east), rows along +Dec (north). Masked and
+    off-image samples are NaN; ``masked`` marks masked pixels separately.
+    """
+
+    from astropy.coordinates import SkyOffsetFrame
+    from scipy.ndimage import map_coordinates
+
+    offsets = np.arange(-half_arcsec, half_arcsec + 0.5 * step_arcsec, step_arcsec)
+    lon, lat = np.meshgrid(offsets, offsets)
+    frame = SkyOffsetFrame(origin=center)
+    sky = SkyCoord(lon=lon * u.arcsec, lat=lat * u.arcsec, frame=frame).icrs
+    x, y = wcs.world_to_pixel(sky)
+    data = np.asarray(data, dtype=float)
+    invalid = ~np.isfinite(data)
+    masked_input = np.zeros(data.shape, dtype=bool) if mask is None \
+        else np.asarray(mask, dtype=bool)
+    filled = np.where(invalid | masked_input, 0.0, data)
+    sampled = map_coordinates(filled, [y, x], order=1, mode="constant", cval=np.nan)
+    outside = (x < -0.5) | (y < -0.5) | (x > data.shape[1] - 0.5) | (y > data.shape[0] - 0.5)
+    bad = map_coordinates(invalid.astype(float), [y, x], order=0, mode="constant", cval=1.0) > 0
+    masked = map_coordinates(masked_input.astype(float), [y, x], order=0, mode="constant",
+                             cval=0.0) > 0
+    sampled[outside | bad | masked] = np.nan
+    return sampled, masked & ~outside, offsets
+
+
+def _native_centroid(data, mask, x, y, fwhm):
+    """Background-subtracted 2D-Gaussian centroid near a predicted pixel position."""
+
+    data = np.asarray(data, dtype=float)
+    half = int(max(3, np.ceil(1.5 * fwhm)))
+    ix, iy = int(round(float(x))), int(round(float(y)))
+    x0, x1 = ix - half, ix + half + 1
+    y0, y1 = iy - half, iy + half + 1
+    outer = int(max(half + 3, np.ceil(3.0 * fwhm)))
+    if x0 - outer + half < 0 or y0 - outer + half < 0 or \
+            x1 + outer - half > data.shape[1] or y1 + outer - half > data.shape[0]:
+        return None
+    window = data[y0:y1, x0:x1].copy()
+    bad = ~np.isfinite(window)
+    if mask is not None:
+        bad |= np.asarray(mask, dtype=bool)[y0:y1, x0:x1]
+    if bad.mean() > 0.2:
+        return None
+    ring = data[iy - outer:iy + outer + 1, ix - outer:ix + outer + 1]
+    yy, xx = np.indices(ring.shape)
+    radius = np.hypot(xx - outer, yy - outer)
+    sky_values = ring[(radius > half + 1) & np.isfinite(ring)]
+    if sky_values.size < 20:
+        return None
+    sky, _, noise = sigma_clipped_stats(sky_values, sigma=3.0)
+    window = window - sky
+    peak = float(np.nanmax(np.where(bad, np.nan, window)))
+    if not np.isfinite(peak) or peak <= 0:
+        return None
+    try:
+        from photutils.centroids import centroid_2dg
+
+        cx, cy = centroid_2dg(np.where(bad, 0.0, window), mask=bad)
+    except Exception:
+        weights = np.clip(np.where(bad, 0.0, window), 0, None)
+        if weights.sum() <= 0:
+            return None
+        yy, xx = np.indices(window.shape)
+        cx, cy = (weights * xx).sum() / weights.sum(), (weights * yy).sum() / weights.sum()
+    if not (np.isfinite(cx) and np.isfinite(cy)) or \
+            abs(cx - half) > half or abs(cy - half) > half:
+        return None
+    significance = peak / noise if noise and np.isfinite(noise) and noise > 0 else None
+    return float(x0 + cx), float(y0 + cy), significance
+
+
+def build_alignment_check(image_records, alignments, sources, settings=None):
+    """Cut every check source out of every aligned image on a common sky grid.
+
+    Each cutout is placed with that image's aligned WCS, so a correct
+    alignment puts the source at the center of every cutout. The centroid of
+    the source is measured on the native pixels and reported as an offset
+    (arcsec, east and north) from where the WCS predicts it.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    options = settings.get("target_position", {})
+    minimum_significance = float(options.get("alignment_check_minimum_peak_sigma", 5.0))
+    lookup = {item["image_id"]: item for item in alignments}
+    images = []
+    for index, record in enumerate(image_records):
+        image_id = _image_id(record, index)
+        alignment = lookup.get(image_id)
+        ccd = record.get("ccd")
+        if alignment is None or alignment.get("wcs") is None or ccd is None \
+                or alignment.get("status") == "FAIL":
+            continue
+        metadata = record.get("metadata") or {}
+        fwhm = _finite_float((record.get("quality") or {}).get("fwhm_pixels")) or 3.0
+        scale = _pixel_scale_arcsec(alignment["wcs"]) or 1.0
+        images.append({
+            "image_id": image_id, "record": record, "wcs": alignment["wcs"],
+            "filter": str(metadata.get("filter") or ""),
+            "mjd": _finite_float(metadata.get("mjd_mid", metadata.get("mjd"))),
+            "fwhm_pixels": fwhm, "pixel_scale": scale,
+            "fwhm_arcsec": fwhm * scale, "is_reference": bool(alignment.get("is_reference")),
+        })
+    images.sort(key=lambda item: (np.inf if item["mjd"] is None else item["mjd"],
+                                  item["image_id"]))
+    if not images or not sources:
+        return {"images": [], "sources": list(sources or []), "cutouts": {}}
+    fwhm_arcsec = float(np.median([item["fwhm_arcsec"] for item in images]))
+    scale = float(np.min([item["pixel_scale"] for item in images]))
+    half = float(options.get("alignment_check_half_size_arcsec") or
+                 max(6.0, 3.5 * fwhm_arcsec))
+    step = max(0.1, 0.5 * scale)
+    cutouts = {}
+    for source in sources:
+        center = SkyCoord(source["ra_deg"], source["dec_deg"], unit="deg")
+        frame_offsets = []
+        planes = []
+        for image in images:
+            ccd = image["record"]["ccd"]
+            data = np.asarray(ccd.data, dtype=float)
+            mask = getattr(ccd, "mask", None)
+            sampled, masked, offsets = _sky_grid_cutout(
+                data, mask, image["wcs"], center, half, step)
+            entry = {"data": sampled, "masked": masked, "dx_arcsec": None,
+                     "dy_arcsec": None, "significance": None, "reliable": False}
+            try:
+                x, y = image["wcs"].world_to_pixel(center)
+                inside = 0 <= x < data.shape[1] and 0 <= y < data.shape[0]
+            except Exception:
+                inside = False
+            if inside:
+                measured = _native_centroid(data, mask, x, y, image["fwhm_pixels"])
+                if measured is not None:
+                    mx, my, significance = measured
+                    measured_sky = image["wcs"].pixel_to_world(mx, my).icrs
+                    sky = SkyCoord(measured_sky.ra, measured_sky.dec, frame="icrs")
+                    east, north = center.spherical_offsets_to(sky)
+                    entry.update({
+                        "dx_arcsec": float(east.to_value(u.arcsec)),
+                        "dy_arcsec": float(north.to_value(u.arcsec)),
+                        "significance": significance,
+                        "reliable": bool(significance is not None
+                                         and significance >= minimum_significance),
+                    })
+            frame_offsets.append(entry)
+            planes.append(sampled)
+        stack = []
+        for plane in planes:
+            values = plane[np.isfinite(plane)]
+            if values.size < 10:
+                continue
+            level = float(np.median(values))
+            peak = float(np.nanpercentile(plane - level, 99.5))
+            if peak > 0:
+                stack.append((plane - level) / peak)
+        total = np.nansum(stack, axis=0) if stack else None
+        reliable = [entry for entry in frame_offsets if entry["reliable"]]
+        dx = np.array([entry["dx_arcsec"] for entry in reliable], dtype=float)
+        dy = np.array([entry["dy_arcsec"] for entry in reliable], dtype=float)
+        summary = {
+            "count": int(len(reliable)),
+            "mean_dx_arcsec": float(np.mean(dx)) if dx.size else None,
+            "mean_dy_arcsec": float(np.mean(dy)) if dy.size else None,
+            "rms_arcsec": float(np.sqrt(np.mean((dx - dx.mean()) ** 2 + (dy - dy.mean()) ** 2)))
+            if dx.size >= 2 else None,
+            "max_offset_arcsec": float(np.max(np.hypot(dx, dy))) if dx.size else None,
+        }
+        cutouts[source["name"]] = {"source": source, "frames": frame_offsets,
+                                   "sum": total, "summary": summary}
+    return {
+        "images": [{key: value for key, value in image.items() if key != "record"}
+                   for image in images],
+        "sources": list(sources),
+        "cutouts": cutouts,
+        "half_size_arcsec": half,
+        "step_arcsec": step,
+        "offsets_arcsec": np.arange(-half, half + 0.5 * step, step),
+        "fwhm_arcsec": fwhm_arcsec,
+        "minimum_peak_sigma": minimum_significance,
+    }
+
+
 __all__ = [
     "alignment_table",
+    "build_alignment_check",
     "build_detection_stacks",
     "determine_fixed_target_position",
     "refine_relative_alignment",
     "save_alignment_and_target_products",
+    "select_alignment_check_sources",
     "validate_fixed_target_projection",
 ]

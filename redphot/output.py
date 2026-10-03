@@ -47,16 +47,22 @@ FITS_PRODUCTS = (
     "subtraction_kernel",
 )
 
+# Products written outside the per-derivative FITS folder: the final
+# light-curve figure, one processed multi-extension FITS file per image, and
+# the same images resampled onto the alignment reference grid.
+SPECIAL_PRODUCTS = ("lightcurve_plot", "processed_image", "registered_image")
+
 _SMALL_PRODUCTS = {
     "images_table", "sources_table", "photometry_table", "lightcurve_table",
-    "resolved_config", "run_log", "manifest",
+    "resolved_config", "run_log", "manifest", "lightcurve_plot",
 }
 
 _STANDARD_PRODUCTS = _SMALL_PRODUCTS | {
     "image_pdfs", "batch_pdf", "psf_model", "difference_image",
+    "processed_image", "registered_image",
 }
 
-_ALL_PRODUCTS = _STANDARD_PRODUCTS | set(FITS_PRODUCTS)
+_ALL_PRODUCTS = _STANDARD_PRODUCTS | set(FITS_PRODUCTS) | set(SPECIAL_PRODUCTS)
 
 
 def _safe_name(value):
@@ -587,7 +593,8 @@ def save_fits_derivatives(image_records, derivatives, output_directory, settings
         record = record_lookup.get(str(image_id), {"image_id": str(image_id), "metadata": {}})
         for product_name, value in products.items():
             name = str(product_name)
-            if name not in FITS_PRODUCTS or not policy["products"].get(name, False):
+            if name not in FITS_PRODUCTS or name in SPECIAL_PRODUCTS \
+                    or not policy["products"].get(name, False):
                 continue
             data, supplied_header = _derivative_data(value)
             if data is None:
@@ -610,6 +617,132 @@ def save_fits_derivatives(image_records, derivatives, output_directory, settings
             fits.writeto(path, array, header=header, overwrite=policy["overwrite"],
                          checksum=policy["include_checksums"])
             paths.append((name, str(path), str(image_id)))
+    return paths
+
+
+# Bits of the MASK extension of processed images (0 = pixel used).
+MASK_BITS = {
+    "nonfinite": 1,
+    "input": 2,
+    "saturation": 4,
+    "bad_lines": 8,
+    "amplifier": 16,
+    "trails": 32,
+    "manual": 64,
+    "cosmic_rays": 128,
+}
+
+_MASK_BIT_TEXT = {
+    "nonfinite": "non-finite value",
+    "input": "input mask / unusable region (outside DATASEC, trimmed edge)",
+    "saturation": "saturated star (grown core, bleeds)",
+    "bad_lines": "bad row or column",
+    "amplifier": "amplifier seam",
+    "trails": "satellite or aircraft trail",
+    "manual": "manual mask region",
+    "cosmic_rays": "cosmic ray",
+}
+
+
+def save_processed_images(items, output_directory, policy=None, config_digest=None,
+                          run_id=None):
+    """Write one processed multi-extension FITS file per image (and its registered copy).
+
+    Each item (built by the pipeline) carries the processed science array, its
+    header (aligned WCS and processing keywords), the mask components, and
+    the background model and RMS. The files are::
+
+        processed/<image>_processed.fits
+            [0] processed image: cut to the usable area, fringe-corrected,
+                background-subtracted, on its native pixels with the aligned WCS
+            [MASK] bit mask (header lists the bits; 0 = pixel used)
+            [BKG], [BKGRMS] subtracted background model and its RMS
+            [ERR] 1σ uncertainty, when the image has one
+        registered/<image>_registered.fits
+            the processed image resampled onto the alignment reference grid
+            (masked pixels NaN), for blinking epochs; photometry is always
+            measured on the native pixels, never on these.
+    """
+
+    policy = policy or resolve_output_policy()
+    output = Path(output_directory)
+    entries = []
+    dtype = policy.get("fits_dtype", "float32")
+    cast = (lambda array: np.asarray(array)) if dtype == "preserve" else \
+        (lambda array: np.asarray(array, dtype=dtype))
+    for item in items or []:
+        image_id = str(item["image_id"])
+        stem = _safe_name(image_id.rsplit(".fits", 1)[0] if ".fits" in image_id else image_id)
+        if policy["products"].get("processed_image", False) and item.get("data") is not None:
+            folder = output / "processed"
+            folder.mkdir(parents=True, exist_ok=True)
+            header = item["header"].copy()
+            header["RDPID"] = (str(run_id)[:68], "redphot run identifier")
+            header["RDPCONF"] = (str(config_digest)[:32], "configuration SHA-256 prefix")
+            header["RDPPROD"] = ("processed_image", "redphot product")
+            hdus = [fits.PrimaryHDU(cast(item["data"]), header=header)]
+            components = item.get("mask_components") or {}
+            bits = np.zeros(np.shape(item["data"]), dtype=np.uint8)
+            mask_header = fits.Header()
+            mask_header["EXTNAME"] = "MASK"
+            mask_header["BUNIT"] = "bitmask"
+            for name, bit in MASK_BITS.items():
+                component = components.get(name)
+                if component is not None and np.shape(component) == bits.shape:
+                    bits[np.asarray(component, dtype=bool)] |= bit
+                mask_header["MASKB{}".format(int(np.log2(bit)))] = (
+                    "{} = {}".format(bit, name), _MASK_BIT_TEXT[name][:46])
+            mask_header["MASKFRAC"] = (float(np.mean(bits > 0)), "fraction of pixels masked")
+            mask_header.add_comment("0 = pixel used; any other value = excluded (OR of bits)")
+            hdus.append(fits.ImageHDU(bits, header=mask_header))
+            for name, key in (("BKG", "background"), ("BKGRMS", "background_rms"),
+                              ("ERR", "uncertainty")):
+                if item.get(key) is not None and np.shape(item[key]) == np.shape(item["data"]):
+                    extension = fits.Header()
+                    extension["EXTNAME"] = name
+                    hdus.append(fits.ImageHDU(cast(item[key]), header=extension))
+            path = folder / "{}_processed.fits".format(stem)
+            fits.HDUList(hdus).writeto(path, overwrite=policy.get("overwrite", False),
+                                       checksum=policy.get("include_checksums", True))
+            entries.append(("processed_image", str(path), image_id))
+        registered = item.get("registered")
+        if policy["products"].get("registered_image", False) and registered is not None:
+            folder = output / "registered"
+            folder.mkdir(parents=True, exist_ok=True)
+            header = registered["header"].copy()
+            header["RDPID"] = (str(run_id)[:68], "redphot run identifier")
+            header["RDPCONF"] = (str(config_digest)[:32], "configuration SHA-256 prefix")
+            header["RDPPROD"] = ("registered_image", "redphot product")
+            path = folder / "{}_registered.fits".format(stem)
+            fits.PrimaryHDU(cast(registered["data"]), header=header).writeto(
+                path, overwrite=policy.get("overwrite", False),
+                checksum=policy.get("include_checksums", True))
+            entries.append(("registered_image", str(path), image_id))
+    return entries
+
+
+def save_light_curve_plot(batch_products, output_directory, object_name, settings=None,
+                          overwrite=False):
+    """Write the final light curve with every photometry method (PNG and PDF)."""
+
+    import matplotlib.pyplot as plt
+    from .diagnostics import plot_final_light_curve
+
+    batch_products = batch_products or {}
+    figure = plot_final_light_curve(
+        batch_products.get("measurements"), batch_products.get("preferred_light_curve"),
+        object_name=object_name, settings=settings,
+    )
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for suffix, dpi in ((".png", 150), (".pdf", None)):
+        path = output / "{}_lightcurve{}".format(_safe_name(object_name), suffix)
+        if path.exists() and not overwrite:
+            raise FileExistsError(str(path))
+        figure.savefig(path, dpi=dpi, bbox_inches="tight")
+        paths.append(str(path))
+    plt.close(figure)
     return paths
 
 
@@ -700,6 +833,7 @@ def assemble_output_products(
     object_name=None,
     profile=None,
     product_overrides=None,
+    processed_images=None,
 ):
     """Assemble final reports, tables, derivatives, configuration, log, and manifest.
 
@@ -753,11 +887,36 @@ def assemble_output_products(
         paths[product] = str(path)
         entries.append((product, str(path), None))
 
+    from .progress import progress
+
+    if policy["products"].get("lightcurve_plot", False) and batch_products:
+        progress("final light curve figure")
+        try:
+            figure_paths = save_light_curve_plot(batch_products, output, name, resolved,
+                                                 policy["overwrite"])
+            paths["lightcurve_plot"] = figure_paths
+            entries.extend(("lightcurve_plot", path, None) for path in figure_paths)
+        except Exception as error:  # a figure must never stop the products
+            paths["lightcurve_plot_error"] = "{}: {}".format(type(error).__name__, error)
+
+    if processed_images and (policy["products"].get("processed_image", False)
+                             or policy["products"].get("registered_image", False)):
+        progress("processed FITS images ({})".format(len(processed_images)))
+        processed_entries = save_processed_images(
+            processed_images, output, policy, digest, run_id)
+        paths["processed_images"] = [path for kind, path, _ in processed_entries
+                                     if kind == "processed_image"]
+        paths["registered_images"] = [path for kind, path, _ in processed_entries
+                                      if kind == "registered_image"]
+        entries.extend(processed_entries)
+
     if policy["products"].get("image_pdfs", False):
         report_directory.mkdir(exist_ok=True)
         image_paths = {}
         for index, record in enumerate(image_records or []):
             image_id = _record_id(record, index)
+            progress("diagnostic report {}/{}: {}".format(index + 1, len(image_records),
+                                                          image_id))
             path = report_directory / "{}_diagnostics.pdf".format(_safe_name(image_id))
             stages = (diagnostic_stages or {}).get(image_id, record.get("diagnostics"))
             make_image_diagnostic_pdf(
@@ -827,6 +986,10 @@ def assemble_output_products(
 
 __all__ = [
     "FITS_PRODUCTS",
+    "MASK_BITS",
+    "SPECIAL_PRODUCTS",
+    "save_light_curve_plot",
+    "save_processed_images",
     "TABLE_PRODUCTS",
     "add_lightcurve_traceability",
     "add_photometry_traceability",

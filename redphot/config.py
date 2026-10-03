@@ -393,6 +393,20 @@ DEFAULT_SETTINGS = {
         "edge_max_constant_fraction": 0.50,
         "edge_sigma": 5.0,
         "edge_grow_pixels": 2,
+        # Border lines whose sky level differs from the band just inside the
+        # edge by more than edge_level_sigma x the pixel noise (readout
+        # ringing, edge ramps) are trimmed too; at most edge_level_max_fraction
+        # of the frame per side.
+        "edge_level_trim": True,
+        "edge_level_sigma": 0.5,
+        # ...and followed inward until the offset is below this.
+        "edge_level_release_sigma": 0.25,
+        "edge_level_max_fraction": 0.08,
+        "edge_level_reference_width": 40,
+        "edge_level_smoothing": 5,
+        # Cut the working image to the bounding box of the usable pixels, so
+        # later stages never see whole dead columns or rows.
+        "trim_to_valid": True,
         "target_edge_distance_fwhm": 5.0,
         "valid_section": None,
         "require_target_inside": True,
@@ -493,6 +507,9 @@ DEFAULT_SETTINGS = {
         "filter_size": [3, 3],
         "enforce_broad_scale": True,
         "minimum_mesh_fwhm": 10.0,
+        # Stretch box_size slightly so a whole number of boxes spans the
+        # frame (no thin, mostly padded boxes along the top/right edges).
+        "fit_box_to_frame": True,
         "sigma_clip": 3.0,
         "maximum_iterations": 10,
         # A box is measured when at most this percentage of its pixels is
@@ -805,6 +822,17 @@ DEFAULT_SETTINGS = {
         "maximum_diagnostic_offset_arcsec": 1.0,
         "save_stack": True,
         "relative_alignment_enabled": True,
+        # Alignment check figure: the target plus this many bright, isolated
+        # zeropoint stars spread over the field, cut out of every image.
+        "alignment_check_stars": 4,
+        "alignment_check_isolation_arcsec": 12.0,
+        "alignment_check_half_size_arcsec": None,
+        "alignment_check_minimum_peak_sigma": 5.0,
+        # Up to this many images the sources run down the rows and the images
+        # across (sum at the right); with more images the figure is turned
+        # (images down the rows, sum at the bottom).
+        "alignment_check_images_across_max": 12,
+        "alignment_check_max_images_shown": 80,
         "relative_alignment_minimum_common_stars": 6,
         "relative_alignment_sigma_clip": 4.0,
         "relative_alignment_maximum_iterations": 3,
@@ -968,17 +996,39 @@ DEFAULT_SETTINGS = {
         "fallback_method": None,
         "template_path": None,
         "template_source": "auto",
-        "template_survey_priority": ["ps1", "legacy", "decam"],
-        "survey_names": {
-            "ps1": "PanSTARRS DR1",
-            "legacy": "DESI Legacy Imaging Surveys",
-            "decam": "DECaLS DR5",
+        # Surveys tried in order for a template (the first one that covers the
+        # field in the right band is used). Set template_source to one name
+        # (e.g. "sdss") to use only that survey.
+        "template_survey_priority": ["ps1", "legacy", "sdss"],
+        # How each survey is downloaded. service: "ps1" (STScI PS1 cutouts),
+        # "legacy" (legacysurvey.org viewer; layer ls-dr10 = DECam south +
+        # BASS/MzLS north, ls-dr10-south = DECam only), or "skyview" (NASA
+        # SkyView via astroquery; "survey" is the SkyView name, {filter} is
+        # replaced by the band). "filters" maps redphot filter names to the
+        # survey's bands. Add entries here for other SkyView surveys.
+        "template_surveys": {
+            "ps1": {"service": "ps1", "filters": {"g": "g", "r": "r", "i": "i",
+                                                  "z": "z", "y": "y"},
+                    "pixel_scale_arcsec": 0.25, "maximum_cutout_pixels": 6000},
+            "legacy": {"service": "legacy", "layer": "ls-dr10",
+                       "filters": {"g": "g", "r": "r", "i": "i", "z": "z"},
+                       "pixel_scale_arcsec": 0.262, "maximum_cutout_pixels": 3000},
+            "decam": {"service": "legacy", "layer": "ls-dr10-south",
+                      "filters": {"g": "g", "r": "r", "i": "i", "z": "z"},
+                      "pixel_scale_arcsec": 0.262, "maximum_cutout_pixels": 3000},
+            "sdss": {"service": "skyview", "survey": "SDSS{filter}",
+                     "filters": {"u": "u", "g": "g", "r": "r", "i": "i", "z": "z"},
+                     "pixel_scale_arcsec": 0.396, "maximum_cutout_pixels": 3000},
         },
+        # Older style: bare SkyView survey names keyed by a survey label.
+        "survey_names": {},
         "survey_filter_map": {},
         "download_pixel_scale_arcsec": None,
         "download_timeout_s": 120,
         "maximum_mosaic_pixels": 100000000,
-        "cache_directory": "redphot_cache/templates",
+        # Downloaded templates are cached here (a relative folder is placed
+        # inside the run directory), named by survey, filter, field and size.
+        "cache_directory": "templates",
         "use_cached_templates": True,
         "save_downloaded_templates": True,
         "template_margin_arcmin": 2.0,
@@ -1150,10 +1200,16 @@ DEFAULT_SETTINGS = {
         "save_state_after_stage": True,
         "state_filename": "pipeline_state.json",
         "checkpoint_filename": "pipeline_context.pkl",
+        # Gate stages decide automatically after they run (approve_pass_warn:
+        # PASS/WARN approved, FAIL rejected and skipped by later stages). No
+        # run ever stops to wait for a decision; review_image() can still
+        # change one afterwards.
         "automatic_review": "approve_pass_warn",
         "review_gates": ["usability", "psf"],
-        "stepwise_stop_at_review": True,
         "save_tracebacks": True,
+        # Print progress (one line per stage, per image, and from inside the
+        # slow steps) while a run is going.
+        "verbose": True,
     },
     "diagnostics": {
         "enabled": True,
@@ -1197,7 +1253,15 @@ DEFAULT_SETTINGS = {
             "resolved_config": True,
             "run_log": True,
             "manifest": True,
-            "processed_image": False,
+            # Final light curve with every photometry method (PNG + PDF).
+            "lightcurve_plot": True,
+            # One multi-extension FITS file per image: the processed image
+            # (cut to the usable area, background-subtracted, aligned WCS)
+            # with MASK, BKG and BKGRMS extensions, in products/processed/.
+            "processed_image": True,
+            # The processed images resampled onto the alignment reference
+            # grid, for blinking epochs (products/registered/).
+            "registered_image": True,
             "cleaned_image": False,
             "fringe_corrected_image": False,
             "source_mask": False,
@@ -1224,6 +1288,8 @@ DEFAULT_SETTINGS = {
         "selected_stage_names": [],
         "fits_dtype": "float32",
         "fits_compression": "none",
+        # Interpolation order of the registered (common-grid) images.
+        "registered_order": 1,
         "include_checksums": True,
         "write_manifest": True,
         "save_intermediate_fits": False,

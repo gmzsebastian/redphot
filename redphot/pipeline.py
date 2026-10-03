@@ -26,6 +26,7 @@ from .config import (
     normalize_instrument_name,
     resolve_settings,
 )
+from . import progress as _progress
 
 
 def _finite_float(value, default=None):
@@ -1126,11 +1127,11 @@ def _stage_definitions():
         {"name": "star_selection", "scope": "batch", "requires": ["astrometry"],
          "settings": ["catalogs", "psf"]},
         {"name": "usability", "scope": "batch", "requires": ["star_selection"],
-         "settings": ["image_quality"], "review": True},
+         "settings": ["image_quality"]},
         {"name": "alignment", "scope": "batch", "requires": ["usability"],
          "settings": ["astrometry", "target_position"]},
         {"name": "psf", "scope": "image", "requires": ["alignment"],
-         "settings": ["psf"], "review": True},
+         "settings": ["psf"]},
         {"name": "science_photometry", "scope": "image", "requires": ["psf"],
          "settings": ["apertures", "background", "target_position"]},
         {"name": "calibration", "scope": "batch", "requires": ["science_photometry"],
@@ -1708,6 +1709,28 @@ def _write_stage_diagnostics(state, context, stage_name, before):
         )
 
 
+def _short_error(entry):
+    """Last line of a stage error, for one-line progress messages."""
+
+    text = str((entry or {}).get("error") or "").strip()
+    return text.splitlines()[-1][:110] if text else ""
+
+
+def _image_progress(state, stage_name, identifier, before, number, total, timer):
+    """One progress line for an image after a stage ran (or was reused)."""
+
+    entry = state["images"][identifier].get("stages", {}).get(stage_name) or {}
+    status = entry.get("status") or "?"
+    label = "[{}/{}] {}".format(number, total, identifier)
+    if entry.get("updated") == before.get(identifier):
+        _progress.progress("{}  {} (unchanged, kept)".format(label, status))
+        return
+    detail = ""
+    if status in {"FAIL", "SKIPPED"} or entry.get("blocked"):
+        detail = "  " + _short_error(entry)
+    _progress.progress("{}  {}  {}{}".format(label, status, timer, detail))
+
+
 def run_pipeline_stage(state, context, stage_name, image_id=None,
                        stage_functions=None, mode="automatic", save=True):
     """Run exactly one named stage for one image or the eligible batch.
@@ -1715,8 +1738,15 @@ def run_pipeline_stage(state, context, stage_name, image_id=None,
     When ``diagnostics.save_stage_plots`` is on (the default), the figures and
     ``summary.csv`` of every entry that changed are written to
     ``<run_directory>/diagnostics/<NN>_<stage>/``.
+
+    Stages listed in ``pipeline.review_gates`` (usability and psf by default)
+    decide automatically in every mode: PASS and WARN images are approved,
+    FAIL images are rejected and skipped by later stages. Nothing waits for a
+    manual decision; :func:`review_image` can still change a decision later.
+    ``mode`` is kept for compatibility and no longer changes what a stage does.
     """
 
+    _progress.configure(context["settings"].get("pipeline", {}).get("verbose", True))
     before = _stage_updates(state, stage_name)
     definitions = _stage_lookup(stage_functions)
     if stage_name not in definitions:
@@ -1724,61 +1754,70 @@ def run_pipeline_stage(state, context, stage_name, image_id=None,
     definition = definitions[stage_name]
     if definition["scope"] == "image":
         identifiers = [image_id] if image_id is not None else list(state["images"])
-        for identifier in identifiers:
+        _progress.stage_started(stage_name, len(identifiers), "image")
+        for number, identifier in enumerate(identifiers, 1):
             if identifier not in state["images"]:
                 raise KeyError("Unknown image: {}".format(identifier))
+            timer = _progress.Timer()
             _execute_image_stage(state, context, definition, identifier)
+            _image_progress(state, stage_name, identifier, before, number,
+                            len(identifiers), timer)
     else:
         if image_id is not None:
             raise ValueError("{} is a batch stage".format(stage_name))
+        _progress.stage_started(stage_name, len(state["images"]), "batch")
         _execute_batch_stage(state, context, definition)
+        entry = state.get("batch_stages", {}).get(stage_name) or {}
+        if entry.get("updated") == before.get(None):
+            _progress.progress("{} (unchanged, kept)".format(entry.get("status")))
+        else:
+            detail = _short_error(entry) if entry.get("status") in {"FAIL", "SKIPPED"} else ""
+            _progress.progress("batch status {}{}".format(
+                entry.get("status"), "  " + detail if detail else ""))
     gates = set(context["settings"].get("pipeline", {}).get("review_gates", []))
     if definition.get("review") or stage_name in gates:
-        if mode == "automatic":
-            _automatic_review(
-                state, stage_name,
-                context["settings"]["pipeline"].get("automatic_review", "approve_pass_warn"),
-            )
-        else:
-            for identifier, image in state["images"].items():
-                entry = image.get("stages", {}).get(stage_name)
-                # SKIPPED entries (blocked upstream, image rejected, or stage
-                # disabled) have nothing to review and must not reopen a decision.
-                if entry and entry.get("status") not in {"APPROVED", "REJECTED", "SKIPPED"}:
-                    entry["review_status"] = "PENDING"
-                    image.setdefault("review_decisions", {})[stage_name] = {
-                        "decision": "PENDING", "time": _utc_now(), "note": None,
-                    }
+        _automatic_review(
+            state, stage_name,
+            context["settings"]["pipeline"].get("automatic_review", "approve_pass_warn"),
+        )
+        rejected = [
+            identifier for identifier, image in state["images"].items()
+            if (image.get("stages", {}).get(stage_name) or {}).get("status") == "REJECTED"
+            and (image.get("review_decisions", {}).get(stage_name) or {}).get("note")
+            == "automatic review"
+        ]
+        if rejected:
+            _progress.progress("rejected automatically (FAIL at {}): {}".format(
+                stage_name, ", ".join(rejected)))
+    plot_timer = _progress.Timer()
     _write_stage_diagnostics(state, context, stage_name, before)
+    if stage_name != "outputs" and _stage_updates(state, stage_name) != before:
+        _progress.progress("plots written ({})".format(plot_timer))
     if save and context["settings"]["pipeline"].get("save_state_after_stage", True):
+        save_timer = _progress.Timer()
         save_pipeline_state(state, context)
+        _progress.progress("run state saved ({})".format(save_timer))
+    _progress.stage_finished()
     return state, context
 
 
 def run_pipeline_through(state, context, through_stage=None, stage_functions=None,
                          mode="automatic", save=True):
-    """Run the same ordered functions automatically or pause at review gates."""
+    """Run every stage in order (up to ``through_stage``).
+
+    Review gates decide automatically (see :func:`run_pipeline_stage`), so the
+    run never stops to wait for a decision.
+    """
 
     names = pipeline_stage_names()
     if through_stage is not None:
         if through_stage not in names:
             raise KeyError("Unknown pipeline stage: {}".format(through_stage))
         names = names[:names.index(through_stage) + 1]
-    gates = set(context["settings"]["pipeline"].get("review_gates", []))
     for name in names:
         run_pipeline_stage(
             state, context, name, stage_functions=stage_functions, mode=mode, save=save
         )
-        if (
-            mode == "stepwise"
-            and context["settings"]["pipeline"].get("stepwise_stop_at_review", True)
-            and name in gates
-            and any(
-                image.get("stages", {}).get(name, {}).get("review_status") == "PENDING"
-                for image in state["images"].values()
-            )
-        ):
-            break
     return state, context
 
 
@@ -2127,20 +2166,32 @@ def _run_read(context, image_id, settings):
     )
     image = context["images"][image_id]
     instrument_name = context.get("instrument_name")
+    image_overrides = context["_state"]["images"][image_id].get("overrides", {})
+
+    def resolve(profile, header_metadata):
+        return resolve_settings(
+            instrument_name=profile,
+            run_settings=context.get("run_settings", context.get("settings", {})),
+            filter_name=header_metadata.get("filter"),
+            filter_settings=context.get("filter_settings"),
+            image_name=Path(image["path"]).name,
+            image_overrides=(
+                {Path(image["path"]).name: image_overrides}
+                if image_overrides else None
+            ),
+        )
+
     if instrument_name is None:
         instrument_name = _metadata_instrument_profile(metadata)
-    image_overrides = context["_state"]["images"][image_id].get("overrides", {})
-    resolved = resolve_settings(
-        instrument_name=instrument_name,
-        run_settings=context.get("run_settings", context.get("settings", {})),
-        filter_name=metadata.get("filter"),
-        filter_settings=context.get("filter_settings"),
-        image_name=Path(image["path"]).name,
-        image_overrides=(
-            {Path(image["path"]).name: image_overrides}
-            if image_overrides else None
-        ),
-    )
+        if instrument_name is not None:
+            # The profile was only known after the first read; read again with
+            # it so its keyword aliases and fallback values (saturation, gain,
+            # read noise) apply exactly as when the instrument is given.
+            ccd, metadata = read_fits_image(
+                image["path"], settings=resolve(instrument_name, metadata),
+                target=context.get("target"),
+            )
+    resolved = resolve(instrument_name, metadata)
     image["settings"] = resolved
     image["working_ccd"] = ccd
     image["record"].update({
@@ -2283,14 +2334,18 @@ def _run_star_selection(context, image_id, settings):
 
     records = _records_for_stage(context, "astrometry")
     shared = context.setdefault("shared", {})
+    _progress.progress("photometric reference catalogs for {} images".format(len(records)))
     references, reference_info = attach_photometric_references(
         records, settings, target=context.get("target"),
         supplied=shared.get("calibration_catalogs"),
     )
     shared["photometric_references"] = references
     shared["photometric_reference_info"] = reference_info
+    _progress.progress("matching detections into one source table")
     master, measurements = build_master_source_table(records, settings)
     overrides = context.get("shared", {}).get("star_overrides")
+    _progress.progress("choosing zeropoint, PSF, ensemble and astrometry stars "
+                       "({} sources)".format(len(master)))
     master, measurements, summaries = select_comparison_and_psf_stars(
         master, measurements, settings, overrides
     )
@@ -2312,6 +2367,7 @@ def _run_usability(context, image_id, settings):
     # Compare each image's seeing, shape and sky with the rest of the batch
     # (same filter where possible). The checks go into copies of the quality
     # results, so rerunning this stage never stacks them twice.
+    _progress.progress("comparing seeing, shape and sky across {} images".format(len(records)))
     batch_quality = assess_image_quality_batch(
         [record.get("quality") or {} for record in records],
         settings,
@@ -2323,6 +2379,7 @@ def _run_usability(context, image_id, settings):
     batch_records = [
         dict(record, quality=quality) for record, quality in zip(records, batch_quality)
     ]
+    _progress.progress("quick zeropoints, depth and transparency")
     decisions, residuals = assess_image_usability(
         batch_records, selection["measurements"], settings, manual
     )
@@ -2340,19 +2397,24 @@ def _run_usability(context, image_id, settings):
 
 def _run_alignment(context, image_id, settings):
     from .alignment import (
+        build_alignment_check,
         build_detection_stacks,
         determine_fixed_target_position,
         refine_relative_alignment,
+        select_alignment_check_sources,
         validate_fixed_target_projection,
     )
 
     records = _records_for_stage(context, "usability")
     selection = context["shared"]["star_selection"]
     decisions = context["shared"]["usability"]["decisions"]
+    _progress.progress("aligning {} images to a common reference".format(len(records)))
     alignments, residuals = refine_relative_alignment(
         records, selection["measurements"], decisions, settings
     )
+    _progress.progress("detection stacks")
     stacks = build_detection_stacks(records, alignments, decisions, settings)
+    _progress.progress("fixed target position")
     solution, candidates = determine_fixed_target_position(
         records, alignments, stacks, decisions, settings, prior=context.get("target")
     )
@@ -2362,10 +2424,20 @@ def _run_alignment(context, image_id, settings):
         if identifier in alignment_lookup:
             image["record"]["alignment"] = alignment_lookup[identifier]
             image["record"]["wcs"] = alignment_lookup[identifier].get("wcs")
+    check = None
+    try:
+        _progress.progress("cutting the check sources out of every aligned image")
+        sources = select_alignment_check_sources(
+            records, alignments, selection["measurements"], selection.get("master"),
+            solution, settings,
+        )
+        check = build_alignment_check(records, alignments, sources, settings)
+    except Exception as error:  # the visual check must never stop the run
+        check = {"error": "{}: {}".format(type(error).__name__, error)}
     status = solution.get("status", "PASS")
     return {"alignments": alignments, "residuals": residuals, "stacks": stacks,
             "target_solution": solution, "target_candidates": candidates,
-            "projections": projections, "status": status}
+            "projections": projections, "alignment_check": check, "status": status}
 
 
 def _run_psf(context, image_id, settings):
@@ -2443,8 +2515,14 @@ def _run_templates(context, image_id, settings):
         return {"templates": dict(supplied), "status": "PASS"}
     records = _records_for_stage(context, "science_photometry")
     filters = sorted({str(record.get("metadata", {}).get("filter")) for record in records})
+    cache = Path(settings.get("subtraction", {}).get("cache_directory") or "templates").expanduser()
+    if not cache.is_absolute() and context.get("_state", {}).get("run_directory"):
+        # Downloaded templates live with the run unless an absolute folder is set.
+        settings = merge_settings(settings, {"subtraction": {
+            "cache_directory": str(Path(context["_state"]["run_directory"]) / cache)}})
     templates = {}
     for filter_name in filters:
+        _progress.progress("template for filter {}".format(filter_name))
         templates[filter_name] = acquire_template(
             records, filter_name, settings, template_paths=supplied,
             downloader=context.get("shared", {}).get("template_downloader"),
@@ -2521,6 +2599,175 @@ def _output_derivatives(context):
                          "aligned_template": subtraction.get("aligned_template", {}).get("data")})
         values[image_id] = {name: value for name, value in products.items() if value is not None}
     return values
+
+
+_WCS_KEY_PREFIXES = ("CRPIX", "CRVAL", "CTYPE", "CUNIT", "CDELT", "CROTA", "CD1_", "CD2_",
+                     "PC1_", "PC2_", "PV1_", "PV2_", "A_", "B_", "AP_", "BP_")
+_WCS_KEYS = {"WCSAXES", "LONPOLE", "LATPOLE", "RADESYS", "RADECSYS", "EQUINOX", "EPOCH",
+             "MJDREF", "WCSNAME", "A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER", "IMAGEW",
+             "IMAGEH"}
+
+
+def _processed_header(ccd, wcs, metadata, extra):
+    """Original header with the aligned WCS and redphot processing keywords."""
+
+    from astropy.io import fits
+
+    meta = getattr(ccd, "meta", None)
+    header = meta.copy() if isinstance(meta, fits.Header) else fits.Header()
+    for key in list(header.keys()):
+        if key in _WCS_KEYS or key.startswith(_WCS_KEY_PREFIXES) or key in {
+                "DATASEC", "TRIMSEC", "BIASSEC", "CCDSEC", "DETSEC", "BSCALE", "BZERO",
+                "BLANK", "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND"}:
+            del header[key]
+    if wcs is not None:
+        header.update(wcs.to_header(relax=True))
+    if metadata.get("filter"):
+        header["FILTER"] = (str(metadata["filter"]), "normalized filter (redphot)")
+    if metadata.get("mjd_mid") is not None:
+        header["MJD-MID"] = (float(metadata["mjd_mid"]), "mid-exposure MJD (redphot)")
+    for key, value, comment in extra:
+        if value is None:
+            continue
+        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            continue
+        header[key] = (value, comment)
+    return header
+
+
+def _processed_image_products(context, settings):
+    """Per-image processed arrays, headers and mask components for the outputs.
+
+    The processed image is the working image after the background stage
+    (cut to the usable area, masked, fringe-corrected, background-subtracted)
+    on its native pixels, with the WCS refined by astrometry and relative
+    alignment. When enabled, a copy resampled onto the alignment reference
+    grid is added for visual comparison of epochs.
+    """
+
+    from .alignment import _reproject_derived_array
+
+    state = context["_state"]
+    products = (settings or {}).get("output", {})
+    from .output import output_product_enabled
+
+    want_registered = output_product_enabled(settings, "registered_image")
+    shared = context.get("shared", {})
+    alignment = shared.get("alignment") or {}
+    alignments = {str(item.get("image_id")): item for item in alignment.get("alignments") or []}
+    reference = next((item for item in alignments.values() if item.get("is_reference")), None)
+    reference_grid = None
+    if reference is not None and reference.get("wcs") is not None:
+        reference_image = context["images"].get(str(reference["image_id"]))
+        if reference_image is not None:
+            reference_ccd = (reference_image.get("stage_ccd") or {}).get("background")
+            if reference_ccd is None:
+                reference_ccd = reference_image["record"].get("ccd")
+            if reference_ccd is not None:
+                reference_grid = (reference["wcs"], np.shape(reference_ccd.data),
+                                  str(reference["image_id"]))
+    zeropoints = (shared.get("calibration") or {}).get("zeropoints")
+    items = []
+    for number, (image_id, image) in enumerate(context["images"].items(), 1):
+        if image_id not in state["images"]:
+            continue
+        record = image["record"]
+        ccd = (image.get("stage_ccd") or {}).get("background")
+        if ccd is None:
+            continue
+        _progress.progress("processed image {}/{}: {}".format(
+            number, len(context["images"]), image_id))
+        metadata = record.get("metadata") or {}
+        align = alignments.get(image_id) or {}
+        wcs = align.get("wcs") or record.get("wcs") or getattr(ccd, "wcs", None)
+        wcs = getattr(wcs, "celestial", wcs)
+        background = record.get("background_products") or {}
+        quality = record.get("quality") or {}
+        astrometry = record.get("astrometry") or {}
+        region = record.get("region") or {}
+        crop = region.get("crop") or {}
+        masks = dict(record.get("masks") or {})
+        cosmic = (record.get("cosmic_ray_products") or {}).get("cosmic_mask")
+        if cosmic is not None:
+            masks["cosmic_rays"] = cosmic
+        zeropoint = zeropoint_error = zeropoint_method = catalog = None
+        if zeropoints is not None and len(zeropoints):
+            rows = zeropoints[np.asarray(zeropoints["image_id"], dtype=str) == image_id]
+            for method in ("psf", "large_aperture", "small_aperture"):
+                chosen = rows[np.asarray(rows["method"], dtype=str) == method] if len(rows) else rows
+                if len(chosen):
+                    zeropoint = _finite_float(chosen[0]["zeropoint_mag"])
+                    if "zeropoint_uncertainty_mag" in chosen.colnames:
+                        zeropoint_error = _finite_float(chosen[0]["zeropoint_uncertainty_mag"])
+                    catalog = str(chosen[0]["catalog_name"]) if "catalog_name" in chosen.colnames else None
+                    zeropoint_method = method
+                    break
+        slices = crop.get("slices")
+        section = None
+        if slices:
+            (y0, y1), (x0, x1) = slices
+            section = "[{}:{},{}:{}]".format(x0 + 1, x1, y0 + 1, y1)
+        model = background.get("background")
+        rms = background.get("background_rms")
+        extra = [
+            ("RDPSTAT", str(state["images"][image_id].get("status")), "redphot image status"),
+            ("RDPCUT", section, "part of the input array kept (FITS section)"),
+            ("BKGSUB", bool((record.get("background_info") or {}).get("subtracted")),
+             "broad background subtracted"),
+            ("BKGLEVEL", None if model is None else float(np.nanmedian(model)),
+             "median subtracted background [ADU]"),
+            ("BKGRMS", None if rms is None else float(np.nanmedian(rms)), "median sky RMS"),
+            ("FRINGE", bool((record.get("fringe_info") or {}).get("applied")),
+             "fringe correction applied"),
+            ("FWHM_PX", _finite_float(quality.get("fwhm_pixels")), "seeing FWHM [pixel]"),
+            ("FWHM_AS", _finite_float(quality.get("fwhm_arcsec")), "seeing FWHM [arcsec]"),
+            ("ASTRMS", _finite_float(astrometry.get("refined_rms_arcsec")),
+             "astrometric rms vs catalog [arcsec]"),
+            ("ALIGNREF", None if not align else str(align.get("reference_image_id"))[:68],
+             "relative-alignment reference image"),
+            ("ALIGNRMS", _finite_float(align.get("refined_rms_arcsec")),
+             "relative-alignment rms [arcsec]"),
+            ("ZP", zeropoint, "zeropoint: mag = -2.5 log10(ADU/s) + ZP"),
+            ("ZPERR", zeropoint_error, "zeropoint uncertainty [mag]"),
+            ("ZPMETHOD", zeropoint_method, "photometry method of ZP"),
+            ("ZPCAT", catalog, "calibration catalog"),
+        ]
+        header = _processed_header(ccd, wcs, metadata, extra)
+        header.add_history("redphot: cut to the usable area, masked, cosmic rays and fringe "
+                           "handled as configured, background subtracted; WCS refined by "
+                           "astrometry and relative alignment. Input file unchanged.")
+        uncertainty = getattr(getattr(ccd, "uncertainty", None), "array", None)
+        item = {
+            "image_id": image_id,
+            "data": np.asarray(ccd.data, dtype=float),
+            "header": header,
+            "mask_components": {name: value for name, value in masks.items()
+                                if name in ("nonfinite", "input", "saturation", "bad_lines",
+                                            "amplifier", "trails", "manual", "cosmic_rays")},
+            "background": model,
+            "background_rms": rms,
+            "uncertainty": uncertainty,
+            "registered": None,
+        }
+        combined = getattr(ccd, "mask", None)
+        if want_registered and reference_grid is not None and wcs is not None and \
+                state["images"][image_id].get("status") != "REJECTED":
+            reference_wcs, shape, reference_id = reference_grid
+            try:
+                plane, valid = _reproject_derived_array(
+                    np.asarray(ccd.data, dtype=float), wcs, reference_wcs, shape,
+                    combined, int(products.get("registered_order", 1)), 256)
+                plane[~valid] = np.nan
+                registered_header = _processed_header(ccd, reference_wcs, metadata, extra)
+                registered_header["REGREF"] = (reference_id[:68], "grid of this reference image")
+                registered_header.add_history(
+                    "redphot: processed image resampled onto the alignment reference grid "
+                    "for display only; photometry used the native pixels.")
+                item["registered"] = {"data": plane, "header": registered_header}
+            except Exception as error:
+                item["registered_error"] = "{}: {}".format(type(error).__name__, error)
+        items.append(item)
+    return items
 
 
 def _diagnostic_stage_figures(context, settings):
@@ -2607,12 +2854,20 @@ def _run_outputs(context, image_id, settings):
         _diagnostic_stage_figures(context, settings)
         if output_product_enabled(settings, "image_pdfs") else {}
     )
+    processed = []
+    if output_product_enabled(settings, "processed_image") or \
+            output_product_enabled(settings, "registered_image"):
+        processed = _processed_image_products(context, settings)
+        if not output_product_enabled(settings, "registered_image"):
+            for item in processed:
+                item["registered"] = None
     return assemble_output_products(
         all_records, sources=selection.get("master"),
         batch_products=shared.get("batch_consistency"),
         diagnostic_stages=diagnostic_stages,
         derivatives=_output_derivatives(context), settings=settings,
         output_directory=output_root, run_events=state.get("events"),
+        processed_images=processed,
     )
 
 

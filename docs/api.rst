@@ -82,3 +82,10 @@ Output products
 .. automodule:: redphot.output
    :members:
    :member-order: bysource
+
+Progress messages
+-----------------
+
+.. automodule:: redphot.progress
+   :members:
+   :member-order: bysource

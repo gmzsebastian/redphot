@@ -1233,7 +1233,10 @@ def detect_empirical_edges(data, base_valid, settings, section=None):
     removed. A line is considered bad when it is largely non-finite, dominated
     by a single constant value (such as zeros on a blank edge), or has a median
     that departs strongly from the robust global median (extreme border glow or
-    unexposed regions).
+    unexposed regions). After the bad lines, lines whose sky level differs from
+    the band just inside the edge by more than ``crop.edge_level_sigma`` times
+    the pixel noise (readout ringing, edge ramps) are trimmed as well, because
+    no background mesh can follow structure that narrow.
 
     Rows and columns that lie entirely outside ``section`` (for example the
     overscan outside ``DATASEC``) were already excluded by the header and are
@@ -1312,9 +1315,71 @@ def detect_empirical_edges(data, base_valid, settings, section=None):
     max_rows = max(1, int(scan_fraction * ny))
     max_cols = max(1, int(scan_fraction * nx))
 
+    level_trim = bool(crop_settings.get("edge_level_trim", True))
+    level_sigma = float(crop_settings.get("edge_level_sigma", 0.5))
+    release_sigma = float(crop_settings.get("edge_level_release_sigma", 0.25))
+    level_fraction = float(crop_settings.get("edge_level_max_fraction", 0.08))
+    reference_width = max(5, int(crop_settings.get("edge_level_reference_width", 40)))
+    smoothing = max(1, int(crop_settings.get("edge_level_smoothing", 5)))
+
+    def count_level(lines, start, total):
+        """Border lines whose sky level differs from the band just inside.
+
+        Readout ringing in the first columns or a ramp along the last rows
+        (common in flat-fielded CCD frames) is far narrower than any
+        background mesh, so the background model cannot follow it and leaves
+        a strong residual along that edge. Such lines are trimmed like bad
+        ones. Each line median is compared with the median level of the
+        ``reference_width`` lines that follow the scanned zone, in units of
+        the pixel noise measured in that reference band.
+        """
+
+        depth = max(1, int(level_fraction * total))
+        stop = start + depth + reference_width
+        if not level_trim or level_sigma <= 0 or stop > total:
+            return 0, None
+        medians = np.full(depth + reference_width, np.nan)
+        reference_pixels = []
+        for step in range(depth + reference_width):
+            values, keep = lines(start + step)
+            values = values[keep]
+            values = values[np.isfinite(values)]
+            if values.size:
+                medians[step] = np.median(values)
+                if step >= depth:
+                    reference_pixels.append(values)
+        if not reference_pixels:
+            return 0, None
+        band = np.concatenate(reference_pixels)
+        if band.size < 50:
+            return 0, None
+        reference = float(np.nanmedian(medians[depth:]))
+        center = float(np.median(band))
+        noise = 1.4826 * float(np.median(np.abs(band - center)))
+        if not np.isfinite(noise) or noise <= 0:
+            return 0, None
+        deviation = (medians[:depth] - reference) / noise
+        half = smoothing // 2
+        smoothed = np.array([
+            np.nanmedian(deviation[max(0, index - half):index + half + 1])
+            for index in range(depth)
+        ])
+        # A ramp starts at level_sigma and is followed inward until it has
+        # decayed below release_sigma, so its faint tail is trimmed too.
+        count = 0
+        for value in smoothed:
+            limit = level_sigma if count == 0 else min(level_sigma, release_sigma)
+            if np.isfinite(value) and abs(value) >= limit:
+                count += 1
+            else:
+                break
+        return count, (float(deviation[0]) if np.isfinite(deviation[0]) else None)
+
+    # Row 0 is the bottom of the frame as displayed (FITS/DS9 convention,
+    # origin="lower" in every redphot plot).
     sides = {
-        "top": (lambda step: (data[step, :], inside[step, :]), max_rows, ny),
-        "bottom": (
+        "bottom": (lambda step: (data[step, :], inside[step, :]), max_rows, ny),
+        "top": (
             lambda step: (data[ny - 1 - step, :], inside[ny - 1 - step, :]),
             max_rows, ny,
         ),
@@ -1328,24 +1393,29 @@ def detect_empirical_edges(data, base_valid, settings, section=None):
     for side, (lines, limit, total) in sides.items():
         offsets[side], info[side] = count_bad(lines, limit, total)
         info["{}_outside_section".format(side)] = offsets[side]
+        level, edge_sigma = count_level(lines, offsets[side] + info[side], total)
+        info["{}_level".format(side)] = level
+        info["{}_level_sigma".format(side)] = edge_sigma
 
     grow = int(crop_settings.get("edge_grow_pixels", 2))
     info["grow_pixels"] = grow
+    info["level_sigma_limit"] = level_sigma if level_trim else None
 
     def extent(side, total):
-        if not info[side]:
+        trimmed = info[side] + info["{}_level".format(side)]
+        if not trimmed:
             return 0
-        return min(offsets[side] + info[side] + grow, total)
+        return min(offsets[side] + trimmed + grow, total)
 
     top = extent("top", ny)
     bottom = extent("bottom", ny)
     left = extent("left", nx)
     right = extent("right", nx)
 
-    if top:
-        edge_invalid[:top, :] = True
     if bottom:
-        edge_invalid[ny - bottom:, :] = True
+        edge_invalid[:bottom, :] = True
+    if top:
+        edge_invalid[ny - top:, :] = True
     if left:
         edge_invalid[:, :left] = True
     if right:
@@ -1635,6 +1705,49 @@ def crop_to_processing_region(ccd, metadata=None, settings=None, target=None, va
     return cropped_ccd, cropped_valid, info
 
 
+def _trim_to_valid_region(ccd, valid, crop_info, settings):
+    """Cut the working image down to the bounding box of its usable pixels.
+
+    Columns and rows that are entirely unusable (overscan outside DATASEC,
+    trimmed edges) carry no information, and keeping them makes every later
+    mesh or grid straddle a dead strip: the background boxes along those
+    edges are then mostly masked, get dropped and are extrapolated. Cutting
+    them off makes the working frame start and end on real sky. The WCS,
+    mask, and uncertainty are cut consistently, and ``crop_info['slices']``
+    always gives the working frame's position in the original array.
+    """
+
+    info = dict(crop_info or {})
+    info["trimmed_to_valid"] = False
+    if valid is None or not settings.get("crop", {}).get("trim_to_valid", True):
+        return ccd, valid, info
+    valid = np.asarray(valid, dtype=bool)
+    rows = np.flatnonzero(valid.any(axis=1))
+    columns = np.flatnonzero(valid.any(axis=0))
+    if not rows.size or not columns.size:
+        return ccd, valid, info
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    x0, x1 = int(columns[0]), int(columns[-1]) + 1
+    ny, nx = valid.shape
+    if (y0, y1, x0, x1) == (0, ny, 0, nx):
+        return ccd, valid, info
+    trimmed = ccd[y0:y1, x0:x1]
+    if getattr(trimmed, "mask", None) is None:
+        trimmed.mask = ~valid[y0:y1, x0:x1]
+    previous = info.get("slices")
+    if previous:
+        (py0, _), (px0, _) = previous
+    else:
+        py0 = px0 = 0
+    info.update({
+        "trimmed_to_valid": True,
+        "trim_slices": ((y0, y1), (x0, x1)),
+        "slices": ((py0 + y0, py0 + y1), (px0 + x0, px0 + x1)),
+        "shape": (y1 - y0, x1 - x0),
+    })
+    return trimmed, valid[y0:y1, x0:x1], info
+
+
 def _check_target_region(ccd, metadata, settings, target, valid=None):
     """Check whether the target lies safely inside the usable region."""
 
@@ -1752,6 +1865,9 @@ def define_processing_region(ccd, metadata=None, settings=None, target=None):
 
     working, cropped_valid, crop_info = crop_to_processing_region(
         masked_ccd, metadata, settings, target=target, valid=valid
+    )
+    working, cropped_valid, crop_info = _trim_to_valid_region(
+        working, cropped_valid, crop_info, settings
     )
 
     flags = []
@@ -3767,6 +3883,21 @@ def _effective_background_box(shape, settings):
     else:
         effective = requested
     effective = tuple(min(value, size) for value, size in zip(effective, shape))
+    if background_settings.get("fit_box_to_frame", True):
+        # Photutils pads the image up to a whole number of boxes, and a thin
+        # partial box along the top or right edge is mostly padding: it is
+        # dropped and the model there is extrapolated. Stretching the box
+        # slightly so a whole number of boxes spans the frame avoids that.
+        fitted = []
+        for value, size in zip(effective, shape):
+            count = max(1, int(round(size / float(value))))
+            box = int(np.ceil(size / float(count)))
+            floor = minimum if background_settings.get("enforce_broad_scale", True) else 1
+            while box < floor and count > 1:
+                count -= 1
+                box = int(np.ceil(size / float(count)))
+            fitted.append(min(box, size))
+        effective = tuple(fitted)
     return requested, effective, minimum
 
 

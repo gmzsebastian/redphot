@@ -81,9 +81,22 @@ Processing region and masks
 ---------------------------
 
 Header data sections and empirical row/column statistics define the usable
-detector region. Optional cropping is evaluated in angular units about the
-target or image center and translated through the WCS and pixel scale. The WCS
-is sliced with the array, so sky coordinates remain valid.
+detector region. Border lines are trimmed when they are bad (mostly
+non-finite, constant, or far from the global level) and also when their sky
+level departs from the band just inside the edge: with :math:`m_k` the median
+of the :math:`k`-th line from the edge, :math:`m_{\rm ref}` the median level of
+the ``edge_level_reference_width`` lines beyond the scanned zone and
+:math:`\sigma` the pixel noise there, a ramp starts where the running median
+of :math:`|m_k-m_{\rm ref}|/\sigma` exceeds ``edge_level_sigma`` (0.5) and is
+followed inward until it drops below ``edge_level_release_sigma`` (0.25).
+Readout ringing in the first columns and ramps along the last rows are much
+narrower than any background mesh, so a mesh cannot follow them and leaves a
+strong residual (or an extrapolated spike) along that edge. The working
+frame is then cut to the bounding box of the usable pixels
+(``crop.trim_to_valid``), so no later grid straddles dead overscan strips.
+Optional cropping is evaluated in angular units about the target or image
+center and translated through the WCS and pixel scale. The WCS is sliced with
+the array, so sky coordinates remain valid.
 
 The combined mask is the logical union of non-finite pixels, supplied bad-pixel
 masks, invalid edges, saturation and bleed regions, bad rows or columns,
@@ -150,7 +163,11 @@ An expanded segmentation/source mask is constructed before background
 measurement, with configurable mask growth and explicit target/host
 protection. ``photutils.background.Background2D`` estimates an additive
 large-scale model and a background RMS map from sigma-clipped meshes. Mesh
-size is required to be substantially broader than the stellar PSF. Meshes with
+size is required to be substantially broader than the stellar PSF, and is
+stretched slightly so a whole number of meshes spans the frame
+(``fit_box_to_frame``): Photutils pads the image to whole meshes, and a thin
+partial mesh along the top or right edge is mostly padding, gets dropped, and
+leaves the model there extrapolated. Meshes with
 more than ``exclude_percentile`` percent of their pixels masked are not
 measured but interpolated from the others; the fraction of such meshes is
 reported and ``BACKGROUND_MESHES_EXCLUDED`` is raised when it exceeds
@@ -243,7 +260,8 @@ addition or removal is retained.
 Usability and limiting depth
 ----------------------------
 
-The first review gate combines catalog recovery, recovery of a bright QC
+The first gate (decided automatically: FAIL images are rejected, PASS and
+WARN continue) combines catalog recovery, recovery of a bright QC
 anchor, approximate transparency and scatter, seeing, elongation, background,
 global/local depth, cloud spatial structure, and target-artifact overlap.
 Quick zeropoints use fixed-aperture fluxes (``quick_aperture_fwhm`` × FWHM,
@@ -380,8 +398,16 @@ and an invalid fit a measurement failure; these states are distinct.
 Templates and image subtraction
 --------------------------------
 
-User templates or supported survey tiles must cover the union of science WCS
-footprints plus a margin. Tile mosaics and the aligned template are derived
+User templates or survey tiles must cover the union of science WCS
+footprints plus a margin. Survey templates come from the first survey in
+``subtraction.template_survey_priority`` that covers the field in the band:
+Pan-STARRS1 stacks (STScI ``ps1filenames.py`` finds the skycell of points
+across the field, ``fitscut.cgi`` returns linear-flux cutouts of at most 6000
+pixels), DESI Legacy Surveys coadds (legacysurvey.org ``fits-cutout``, at most
+3000 pixels per side, nanomaggies; pixels without inverse variance are
+masked), or SkyView surveys such as SDSS. Large fields are split into tiles;
+each tile's cutouts are mosaicked onto one tangent-plane grid (no finer than
+half the science pixel scale). Tile mosaics and the aligned template are derived
 products. Template coverage, filter, depth, seeing, saturation, WCS, and
 pre-transient date are checked. The science grid remains fixed and only the
 template is resampled.

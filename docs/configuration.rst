@@ -68,7 +68,10 @@ The main sections are deliberately aligned with the processing order:
 
 ``crop``
    Angular processing size, center choice, valid-data sections, empirical edge
-   detection, edge growth, and target-edge safety margin.
+   detection (bad lines, and edge lines whose sky level differs from the band
+   just inside: ``edge_level_sigma``/``edge_level_release_sigma``), edge
+   growth, cutting the working frame to the usable area (``trim_to_valid``),
+   and target-edge safety margin.
 
 ``masks``
    Input bad pixels, saturation/nonlinearity and halos, bad lines, amplifier
@@ -80,7 +83,8 @@ The main sections are deliberately aligned with the processing order:
    clipping, source masking, and accepted scale range.
 
 ``background``
-   Processing mode, Background2D mesh/filter sizes, estimator, RMS estimator,
+   Processing mode, Background2D mesh/filter sizes (stretched so a whole number
+   of boxes spans the frame: ``fit_box_to_frame``), estimator, RMS estimator,
    clipping, excluded-pixel threshold, mask growth, target/host protection, and
    gradient/source-preservation checks.
 
@@ -118,7 +122,9 @@ The main sections are deliberately aligned with the processing order:
    than silently ignored.
 
 ``subtraction``
-   Template source/path or survey, coverage margin and suitability limits,
+   Template source/path or survey (``template_survey_priority`` and the
+   download recipes in ``template_surveys``: PS1, Legacy Surveys, DECam-only
+   Legacy, SDSS via SkyView), cache folder, coverage margin and suitability limits,
    template resampling, scale/background matching, Hotpants/PyZOGY selection,
    kernel and executable options, subtraction validation, difference
    photometry, and preferred-result rules.
@@ -128,12 +134,14 @@ The main sections are deliberately aligned with the processing order:
    trends, optional simple ensemble offsets, and final-method priority.
 
 ``pipeline``
-   Review gates, automatic/stepwise behavior, state saving, exception
-   containment, and resume policy.
+   Gate stages (decided automatically: FAIL rejected, PASS/WARN approved),
+   progress messages (``verbose``), state saving, exception containment, and
+   resume policy.
 
 ``diagnostics`` and ``output``
    Plot/report switches, output directory/overwrite behavior, storage profile,
-   per-product overrides, tables, derivatives, logs, and manifest checksums.
+   per-product overrides, tables, the light-curve figure, processed and
+   registered FITS images, derivatives, logs, and manifest checksums.
 
 Call ``validate_settings(settings)`` after constructing settings manually.
 ``resolve_settings`` performs validation automatically.

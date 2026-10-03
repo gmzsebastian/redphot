@@ -366,26 +366,32 @@ def _two_image_run(tmp_path, fail_image=False):
     return first.name, second.name, functions, state, context
 
 
-def _pending(state, stage):
+def _decided(state, stage):
+    """Images whose gate decision is still open (there should never be any)."""
+
     return sorted(
         image_id for image_id, image in state["images"].items()
-        if image.get("stages", {}).get(stage, {}).get("review_status") == "PENDING"
+        if image.get("stages", {}).get(stage, {}).get("status") in {"PASS", "WARN"}
     )
 
 
-def test_resume_keeps_rejected_image_history_and_review_decisions(tmp_path):
-    """Regression: resuming erased a rejected image's earlier products and decisions."""
+def test_gates_never_wait_and_keep_manual_decisions(tmp_path):
+    """Gates decide automatically in every mode; manual decisions survive resumes."""
 
     first, second, functions, state, context = _two_image_run(tmp_path)
     run_pipeline_through(state, context, stage_functions=functions, mode="stepwise")
-    assert _pending(state, "usability") == sorted([first, second])
-    review_image(state, context, first, "usability", "APPROVED", "kept")
+    # Nothing waits for approval: both gates decided and the run went to the end.
+    for stage in ("usability", "psf"):
+        assert _decided(state, stage) == []
+        for image_id in (first, second):
+            assert state["images"][image_id]["stages"][stage]["status"] == "APPROVED"
+    assert state["batch_stages"]["outputs"]["status"] == "PASS"
+
+    # A manual rejection still works and is kept when the run is resumed.
     review_image(state, context, second, "usability", "REJECTED", "clouds")
     run_pipeline_through(state, context, stage_functions=functions, mode="stepwise")
-    assert _pending(state, "psf") == [first]
     review_image(state, context, first, "psf", "APPROVED", "PSF inspected")
     run_pipeline_through(state, context, stage_functions=functions, mode="stepwise")
-
     earlier = pipeline_stage_names()[:pipeline_stage_names().index("star_selection")]
     kept = {name: dict(state["images"][second]["stages"][name]) for name in earlier}
     reads = context["shared"]["calls"][second + ":read"]
@@ -400,29 +406,21 @@ def test_resume_keeps_rejected_image_history_and_review_decisions(tmp_path):
         assert rejected["stages"]["usability"]["status"] == "REJECTED"
         assert rejected["review_decisions"]["usability"]["note"] == "clouds"
         assert rejected["stages"]["psf"]["status"] == "SKIPPED"
-        assert "psf" not in rejected["review_decisions"]
         approved = state["images"][first]
         assert approved["stages"]["psf"]["status"] == "APPROVED"
         assert approved["review_decisions"]["psf"]["note"] == "PSF inspected"
-        assert _pending(state, "usability") == [] and _pending(state, "psf") == []
 
 
 def test_gates_do_not_review_images_blocked_upstream(tmp_path):
-    first, second, functions, state, context = _two_image_run(tmp_path, fail_image=True)
-    run_pipeline_through(state, context, stage_functions=functions, mode="stepwise")
-    review_image(state, context, first, "usability", "APPROVED")
-    run_pipeline_through(state, context, stage_functions=functions, mode="stepwise")
-    blocked = state["images"][second]["stages"]["psf"]
-    assert blocked["status"] == "SKIPPED" and blocked["blocked"] is True
-    assert _pending(state, "psf") == [first]
-
-    first, second, functions, state, context = _two_image_run(
-        tmp_path / "automatic", fail_image=True
-    )
-    run_pipeline_through(state, context, stage_functions=functions, mode="automatic")
-    assert state["images"][first]["stages"]["psf"]["status"] == "APPROVED"
-    assert state["images"][second]["stages"]["psf"]["status"] == "SKIPPED"
-    assert "psf" not in state["images"][second]["review_decisions"]
+    for mode in ("stepwise", "automatic"):
+        first, second, functions, state, context = _two_image_run(
+            tmp_path / mode, fail_image=True
+        )
+        run_pipeline_through(state, context, stage_functions=functions, mode=mode)
+        assert state["images"][first]["stages"]["psf"]["status"] == "APPROVED"
+        blocked = state["images"][second]["stages"]["psf"]
+        assert blocked["status"] == "SKIPPED" and blocked["blocked"] is True
+        assert "psf" not in state["images"][second].get("review_decisions", {})
 
 
 def test_output_profiles_and_traceable_core_products(tmp_path):
@@ -771,7 +769,12 @@ def test_every_diagnostic_figure_tolerates_missing_products():
         lambda: plots.plot_star_selection_diagnostics(None, None, "x"),
         lambda: plots.plot_image_usability_diagnostics(None, {}),
         lambda: plots.plot_alignment_target_diagnostics({}, {}),
+        lambda: plots.plot_alignment_check(None),
+        lambda: plots.plot_alignment_check({"images": [], "sources": [], "cutouts": {}}),
         lambda: plots.plot_psf_diagnostics({}),
+        lambda: plots.plot_psf_diagnostics({"model_native": np.zeros((9, 9))}),
+        lambda: plots.plot_final_light_curve(None),
+        lambda: plots.plot_final_light_curve(Table({"source_type": ["star"]})),
         lambda: plots.plot_science_photometry_diagnostics({}),
         lambda: plots.plot_calibration_diagnostics({}),
         lambda: plots.plot_calibration_image_diagnostics({}, "x"),
@@ -1048,3 +1051,251 @@ def test_region_figure_keeps_its_layout_and_marks_unused_lines():
     texts = [child.get_text() for axis in figure.axes for child in axis.texts]
     assert any("columns 0–7 not used" in text for text in texts)
     plt.close(figure)
+
+
+# ---------------------------------------------------------------------------
+# Survey templates (web services replaced by local fakes)
+# ---------------------------------------------------------------------------
+
+def _sky_wcs(ra, dec, scale_arcsec, shape):
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [ra, dec]
+    wcs.wcs.crpix = [(shape[1] + 1) / 2.0, (shape[0] + 1) / 2.0]
+    wcs.wcs.cdelt = [-scale_arcsec / 3600.0, scale_arcsec / 3600.0]
+    return wcs
+
+
+def _science_record(ra=103.596, dec=17.492, shape=(120, 120), scale=1.0):
+    wcs = _sky_wcs(ra, dec, scale, shape)
+    ccd = CCDData(np.zeros(shape), unit="adu", wcs=wcs)
+    return {"image_id": "science.fits", "ccd": ccd, "wcs": wcs,
+            "metadata": {"filter": "r"}}
+
+
+def _fake_survey_image(params, scale, value, cube=False, invvar=False):
+    """A FITS cutout like the services return, centered on the request."""
+
+    ra, dec = float(params["ra"]), float(params["dec"])
+    width = int(params.get("width", params.get("size")))
+    height = int(params.get("height", params.get("size")))
+    wcs = _sky_wcs(ra, dec, scale, (height, width))
+    data = np.full((height, width), value, dtype=np.float32)
+    data[0, 0] = value + 1.0
+    header = wcs.to_header()
+    if cube:
+        data = data[None]
+        header["NAXIS"] = 3
+        header["CTYPE3"] = "BAND"
+    hdus = [fits.PrimaryHDU(data, header=header)]
+    if invvar:
+        hdus.append(fits.ImageHDU(np.ones_like(data)))
+    buffer = __import__("io").BytesIO()
+    fits.HDUList(hdus).writeto(buffer)
+    return buffer.getvalue()
+
+
+def test_template_surveys_ps1_and_legacy_download_tile_and_cache(tmp_path, monkeypatch):
+    from redphot import subtraction
+
+    calls = []
+
+    def fake_get(url, params, timeout):
+        calls.append((url, dict(params)))
+        if url == subtraction.PS1_FILENAMES_URL:
+            assert params["filters"] == "r" and params["type"] == "stack"
+            text = ("projcell subcell ra dec filter mjd type filename shortname\n"
+                    "1785 45 {ra} {dec} r 56000.0 stack "
+                    "/rings.v3.skycell/1785/045/rings.v3.skycell.1785.045.stk.r.unconv.fits "
+                    "rings.v3.skycell.1785.045.stk.r.unconv.fits\n").format(
+                        ra=params["ra"], dec=params["dec"])
+            return text.encode()
+        if url == subtraction.PS1_CUTOUT_URL:
+            assert params["format"] == "fits" and params["red"].endswith(".fits")
+            return _fake_survey_image(params, 0.25, 5.0)
+        if url == subtraction.LEGACY_CUTOUT_URL:
+            assert params["layer"] == "ls-dr10" and params["bands"] == "r"
+            return _fake_survey_image(params, 0.262, 7.0, cube=True, invvar=True)
+        raise AssertionError(url)
+
+    monkeypatch.setattr(subtraction, "_http_get", fake_get)
+    settings = get_default_settings()
+    settings["subtraction"]["cache_directory"] = str(tmp_path / "templates")
+    settings["subtraction"]["template_margin_arcmin"] = 0.5
+    records = [_science_record()]
+
+    template = subtraction.acquire_template(records, "r", settings)
+    assert template["acquisition"]["survey"] == "ps1"
+    assert template["metadata"]["filter"] == "r"
+    assert np.nanmedian(template["data"]) == pytest.approx(5.0)
+    assert np.mean(template["mask"]) < 0.01
+    assert Path(template["cached_path"]).exists()
+    downloads = len(calls)
+    # A second request for the same field reads the cache, not the network.
+    again = subtraction.acquire_template(records, "r", settings)
+    assert again["acquisition"]["from_cache"] and len(calls) == downloads
+
+    # A wide field is cut into tiles no larger than the service allows.
+    settings["subtraction"]["template_source"] = "legacy"
+    settings["subtraction"]["template_surveys"]["legacy"]["maximum_cutout_pixels"] = 200
+    legacy = subtraction.acquire_template(records, "r", settings)
+    assert legacy["acquisition"]["survey"] == "legacy"
+    cutouts = [params for url, params in calls if url == subtraction.LEGACY_CUTOUT_URL]
+    assert len(cutouts) > 1 and max(int(item["width"]) for item in cutouts) <= 200
+    assert np.nanmedian(legacy["data"]) == pytest.approx(7.0)
+
+
+def test_template_survey_without_the_band_falls_through_to_the_next(tmp_path, monkeypatch):
+    from redphot import subtraction
+
+    def fake_get(url, params, timeout):
+        if url == subtraction.LEGACY_CUTOUT_URL:
+            return _fake_survey_image(params, 0.262, 3.0, invvar=True)
+        raise AssertionError("PS1 has no u band and must not be queried")
+
+    monkeypatch.setattr(subtraction, "_http_get", fake_get)
+    settings = get_default_settings()
+    settings["subtraction"]["cache_directory"] = str(tmp_path / "templates")
+    settings["subtraction"]["template_survey_priority"] = ["ps1", "legacy"]
+    settings["subtraction"]["template_surveys"]["legacy"]["filters"]["u"] = "g"
+    record = _science_record()
+    record["metadata"]["filter"] = "u"
+    template = subtraction.acquire_template([record], "u", settings)
+    attempts = template["acquisition"]["attempts"]
+    assert attempts[0]["survey"] == "ps1" and attempts[0]["status"] == "FAIL"
+    assert "no u band" in attempts[0]["error"]
+    assert template["acquisition"]["survey"] == "legacy"
+
+
+# ---------------------------------------------------------------------------
+# Edges, background boxes, processed outputs, alignment check
+# ---------------------------------------------------------------------------
+
+def test_edge_ramps_are_trimmed_and_the_frame_is_cut_to_the_usable_area():
+    from redphot.image import define_processing_region
+
+    rng = np.random.default_rng(7)
+    shape = (300, 320)
+    data = rng.normal(1000.0, 10.0, shape)
+    data[:, :6] = 0.0                       # overscan outside DATASEC
+    data[-25:, :] += np.linspace(0.0, 30.0, 25)[:, None]   # ramp along the top rows
+    header = _wcs_header(shape)
+    header["DATASEC"] = "[7:320,1:300]"
+    ccd = CCDData(data, unit="adu", meta=header, wcs=WCS(header))
+    settings = get_default_settings()
+    working, region, diagnostics = define_processing_region(ccd, {}, settings)
+    edges = region["empirical_edges"]
+    assert edges["top_level"] >= 12 and edges["bottom_level"] == 0
+    assert edges["left_level"] == 0 and edges["right_level"] == 0
+    assert region["crop"]["trimmed_to_valid"]
+    (y0, y1), (x0, x1) = region["crop"]["slices"]
+    assert (y0, x0, x1) == (0, 6, 320) and y1 < 300 - 12
+    assert working.shape == (y1 - y0, x1 - x0)
+    # The WCS follows the cut: the same pixel has the same sky position.
+    original = WCS(header).pixel_to_world(x0 + 10, y0 + 20)
+    assert working.wcs.pixel_to_world(10, 20).separation(original).arcsec < 1e-6
+    assert np.allclose(working.data, data[y0:y1, x0:x1])
+
+    settings["crop"]["trim_to_valid"] = False
+    settings["crop"]["edge_level_trim"] = False
+    untouched, region, _ = define_processing_region(ccd, {}, settings)
+    assert untouched.shape == shape and region["empirical_edges"]["top_level"] == 0
+
+
+def test_background_boxes_span_the_frame_exactly():
+    from redphot.image import _effective_background_box
+
+    settings = get_default_settings()
+    settings["background"]["box_size"] = [64, 64]
+    settings["source_detection"]["fwhm_guess_pixels"] = 3.0
+    for shape in ((1024, 1024), (965, 996), (1025, 1040)):
+        _, (box_y, box_x), _ = _effective_background_box(shape, settings)
+        for size, box in zip(shape, (box_y, box_x)):
+            count = int(np.ceil(size / box))
+            assert abs(box - 64) <= 6
+            # the last (partial) box keeps most of its pixels
+            assert size - (count - 1) * box >= 0.75 * box
+    settings["background"]["fit_box_to_frame"] = False
+    assert _effective_background_box((1025, 1040), settings)[1] == (64, 64)
+
+
+def test_processed_images_carry_mask_bits_background_and_registered_copy(tmp_path):
+    from redphot.output import MASK_BITS, save_processed_images
+
+    shape = (40, 50)
+    header = _wcs_header(shape)
+    saturation = np.zeros(shape, dtype=bool)
+    saturation[5:8, 5:8] = True
+    trails = np.zeros(shape, dtype=bool)
+    trails[20, :] = True
+    item = {
+        "image_id": "one.fits",
+        "data": np.ones(shape),
+        "header": header,
+        "mask_components": {"saturation": saturation, "trails": trails},
+        "background": np.full(shape, 100.0),
+        "background_rms": np.full(shape, 5.0),
+        "uncertainty": None,
+        "registered": {"data": np.full(shape, np.nan), "header": header},
+    }
+    policy = resolve_output_policy(profile="standard")
+    entries = save_processed_images([item], tmp_path, policy, "digest", "run")
+    kinds = {kind for kind, _, _ in entries}
+    assert kinds == {"processed_image", "registered_image"}
+    processed = next(path for kind, path, _ in entries if kind == "processed_image")
+    with fits.open(processed) as hdulist:
+        assert [hdu.name for hdu in hdulist] == ["PRIMARY", "MASK", "BKG", "BKGRMS"]
+        bits = hdulist["MASK"].data
+        assert bits[6, 6] == MASK_BITS["saturation"]
+        assert bits[20, 30] == MASK_BITS["trails"]
+        assert bits[30, 30] == 0
+        assert hdulist[0].header["RDPPROD"] == "processed_image"
+        assert WCS(hdulist[0].header).has_celestial
+    assert policy["products"]["lightcurve_plot"] is True
+    assert resolve_output_policy(profile="minimal")["products"]["processed_image"] is False
+
+
+def test_alignment_check_centers_sources_and_measures_wcs_offsets():
+    from redphot.alignment import build_alignment_check
+
+    shape = (120, 120)
+    header = _wcs_header(shape)
+    yy, xx = np.indices(shape)
+    data = 10.0 + 500.0 * np.exp(-((xx - 70.0) ** 2 + (yy - 50.0) ** 2) / (2 * 1.5 ** 2))
+    wcs = WCS(header)
+    star = wcs.pixel_to_world(70.0, 50.0)
+    shifted = WCS(header)
+    shifted.wcs.crpix = [shifted.wcs.crpix[0] + 2.0, shifted.wcs.crpix[1]]  # 2 px = 0.8″
+    records, alignments = [], []
+    for name, frame_wcs in (("good.fits", wcs), ("shifted.fits", shifted)):
+        ccd = CCDData(data.copy(), unit="adu", wcs=frame_wcs, mask=np.zeros(shape, bool))
+        records.append({"image_id": name, "ccd": ccd, "metadata": {"filter": "r"},
+                        "quality": {"fwhm_pixels": 3.5}})
+        alignments.append({"image_id": name, "wcs": frame_wcs, "status": "PASS",
+                           "is_reference": name == "good.fits"})
+    source = {"name": "star 1", "kind": "star", "ra_deg": float(star.ra.deg),
+              "dec_deg": float(star.dec.deg)}
+    check = build_alignment_check(records, alignments, [source], get_default_settings())
+    frames = check["cutouts"]["star 1"]["frames"]
+    good, moved = frames
+    assert good["reliable"] and np.hypot(good["dx_arcsec"], good["dy_arcsec"]) < 0.05
+    # The shifted WCS predicts the star 2 px off, so the centroid is 0.8″ away.
+    assert np.hypot(moved["dx_arcsec"], moved["dy_arcsec"]) == pytest.approx(0.8, abs=0.08)
+    assert check["cutouts"]["star 1"]["sum"].shape == good["data"].shape
+
+
+def test_profile_found_in_the_header_applies_its_fallback_values(tmp_path):
+    """With instrument_name=None a KeplerCam frame still gets the profile's saturation."""
+
+    path = tmp_path / "kepcam.fits"
+    header = _wcs_header((64, 64))
+    header.update({"DETECTOR": "kepcam", "FILTER": "r", "EXPTIME": 60.0,
+                   "MJD-OBS": 58800.0, "OBJECT": "AT_TEST"})
+    fits.PrimaryHDU(np.full((64, 64), 100.0, dtype=np.float32), header=header).writeto(path)
+    state, context = initialize_pipeline([path], settings=NO_PLOTS, instrument_name=None,
+                                         run_directory=tmp_path / "run")
+    run_pipeline_stage(state, context, "read", save=False)
+    image = context["images"][path.name]
+    assert image["settings"]["instrument"]["profile"] == "keplercam"
+    assert image["record"]["metadata"]["saturation"] == pytest.approx(50000.0)
+    assert image["record"]["metadata"]["gain"] == pytest.approx(4.45)

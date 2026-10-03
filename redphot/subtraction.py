@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 import json
 from pathlib import Path
+import io
 import shutil
 import subprocess
 import tempfile
@@ -268,56 +269,315 @@ def _template_paths_for_filter(template_path, filter_name):
     return list(value)
 
 
-def _default_survey_downloader(footprint, filter_name, survey, settings):
-    """Download survey cutouts through Astroquery SkyView.
+# ---------------------------------------------------------------------------
+# Survey template downloads
+#
+# Each survey in ``subtraction.template_surveys`` names a ``service``:
+#
+# ``ps1``      Pan-STARRS1 3pi stacks from the STScI cutout service
+#              (ps1images.stsci.edu): ps1filenames.py finds the skycell stack of
+#              each position, fitscut.cgi returns linear-flux FITS cutouts (at
+#              most 6000 pixels of 0.25"), padded with blanks off the skycell.
+# ``legacy``   DESI Legacy Imaging Surveys coadds from the legacysurvey.org
+#              viewer (fits-cutout, at most 3000 pixels per side), in
+#              nanomaggies; the ``layer`` picks the release (ls-dr10: DECam
+#              south + BASS/MzLS north; ls-dr10-south: DECam only).
+# ``skyview``  NASA SkyView through astroquery (SDSS u g r i z, 2MASS, ...).
+#
+# Every download is split into tiles no larger than the service allows and
+# mosaicked with ``mosaic_template_tiles``; uncovered pixels are masked.
+# ---------------------------------------------------------------------------
 
-    Survey names are configurable because SkyView holdings can change.  A
-    caller may supply a dedicated downloader function for archive-specific
-    authentication or tile services.
-    """
+PS1_FILENAMES_URL = "https://ps1images.stsci.edu/cgi-bin/ps1filenames.py"
+PS1_CUTOUT_URL = "https://ps1images.stsci.edu/cgi-bin/fitscut.cgi"
+LEGACY_CUTOUT_URL = "https://www.legacysurvey.org/viewer/fits-cutout"
+
+
+def _http_get(url, params, timeout):
+    """GET ``url`` and return the response body (bytes), raising on HTTP errors."""
+
+    try:
+        import requests
+    except ImportError:  # pragma: no cover - requests ships with astroquery
+        from urllib.parse import urlencode
+        from urllib.request import urlopen
+
+        with urlopen("{}?{}".format(url, urlencode(params)), timeout=timeout) as handle:
+            return handle.read()
+    response = requests.get(url, params=params, timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError("{} answered HTTP {}: {}".format(
+            url.split("/")[2], response.status_code, response.text[:200].strip()))
+    return response.content
+
+
+def _survey_definition(survey, settings):
+    """The download recipe of one survey name (see ``subtraction.template_surveys``)."""
+
+    subtraction = settings.get("subtraction", {})
+    surveys = subtraction.get("template_surveys") or {}
+    if survey in surveys:
+        definition = dict(surveys[survey])
+    elif survey in (subtraction.get("survey_names") or {}):
+        # Older configuration: a bare SkyView survey name.
+        definition = {"service": "skyview", "survey": subtraction["survey_names"][survey]}
+    else:
+        raise ValueError(
+            "Unknown template survey {!r}; known surveys: {}".format(
+                survey, ", ".join(sorted(surveys)) or "none"))
+    definition.setdefault("name", survey)
+    return definition
+
+
+def _survey_band(definition, filter_name, settings):
+    """The survey's own band name for a science filter (approximate matches allowed)."""
+
+    subtraction = settings.get("subtraction", {})
+    filters = definition.get("filters")
+    legacy_map = (subtraction.get("survey_filter_map") or {}).get(definition["name"]) or {}
+    if filter_name in legacy_map:
+        return legacy_map[filter_name]
+    if filters is None:
+        return filter_name
+    lookup = dict(filters) if isinstance(filters, Mapping) else {name: name for name in filters}
+    if filter_name in lookup:
+        return lookup[filter_name]
+    if subtraction.get("allow_approximate_filter_match", False):
+        for candidate in subtraction.get("approximate_filter_matches", {}).get(filter_name, []):
+            candidate = normalize_filter_name(candidate)
+            if candidate in lookup:
+                return lookup[candidate]
+    available = list(lookup)
+    raise ValueError("{} has no {} band (it has {})".format(
+        definition["name"], filter_name, ", ".join(available)))
+
+
+def _footprint_tiles(footprint, tile_arcmin, samples=3):
+    """Split a footprint into square tiles; return centers, sizes and sample points."""
+
+    center = footprint["center"]
+    frame = SkyOffsetFrame(origin=center)
+    width, height = float(footprint["width_arcmin"]), float(footprint["height_arcmin"])
+    nx = max(1, int(np.ceil(width / tile_arcmin)))
+    ny = max(1, int(np.ceil(height / tile_arcmin)))
+    tile_w, tile_h = width / nx, height / ny
+    tiles = []
+    for iy in range(ny):
+        for ix in range(nx):
+            lon = -width / 2.0 + (ix + 0.5) * tile_w
+            lat = -height / 2.0 + (iy + 0.5) * tile_h
+            fractions = np.linspace(-0.5, 0.5, samples) if samples > 1 else np.zeros(1)
+            lons = [lon] + [lon + fx * tile_w for fy in fractions for fx in fractions]
+            lats = [lat] + [lat + fy * tile_h for fy in fractions for fx in fractions]
+            sky = SkyCoord(lon=np.array(lons) * u.arcmin, lat=np.array(lats) * u.arcmin,
+                           frame=frame).icrs
+            tiles.append({"center": sky[0], "points": sky[1:],
+                          "width_arcmin": tile_w, "height_arcmin": tile_h})
+    return tiles
+
+
+def _template_record(data, header, filter_name, survey, extra_mask=None, metadata=None):
+    data = np.asarray(data, dtype=float)
+    mask = ~np.isfinite(data)
+    if extra_mask is not None:
+        mask |= np.asarray(extra_mask, dtype=bool)
+    with np.errstate(all="ignore"):
+        wcs = WCS(header).celestial
+    values = {"filter": filter_name, "survey": survey}
+    values.update(metadata or {})
+    return {"data": np.where(mask, np.nan, data), "mask": mask, "wcs": wcs,
+            "header": header.copy(), "metadata": values, "source": survey, "path": None}
+
+
+def _blank_border_zeros(data):
+    """Exact zeros connected to the border (off-survey padding), as a mask."""
+
+    zeros = np.asarray(data) == 0
+    if zeros.mean() < 0.001:
+        return np.zeros(zeros.shape, dtype=bool)
+    labels, count = ndimage.label(zeros)
+    if not count:
+        return zeros
+    border = set(np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0],
+                                           labels[:, -1]]))) - {0}
+    return np.isin(labels, list(border))
+
+
+def _download_ps1(footprint, filter_name, definition, settings):
+    """Pan-STARRS1 stack cutouts covering the footprint (linear flux)."""
+
+    from astropy.table import Table as _Table
+    from .progress import progress
+
+    subtraction = settings.get("subtraction", {})
+    timeout = float(subtraction.get("download_timeout_s", 120))
+    band = _survey_band(definition, filter_name, settings)
+    scale = float(definition.get("pixel_scale_arcsec", 0.25))
+    maximum = int(definition.get("maximum_cutout_pixels", 6000))
+    tile_arcmin = min(float(definition.get("tile_arcmin", 24.0)), maximum * scale / 60.0)
+    tiles = _footprint_tiles(footprint, tile_arcmin)
+    requests_needed = []
+    for tile in tiles:
+        names = {}
+        for point in tile["points"]:
+            body = _http_get(PS1_FILENAMES_URL, {
+                "ra": "{:.6f}".format(point.ra.deg), "dec": "{:.6f}".format(point.dec.deg),
+                "filters": band, "type": definition.get("image_type", "stack"),
+            }, timeout).decode("utf-8", "replace")
+            try:
+                table = _Table.read(body, format="ascii")
+            except Exception:  # header only or an error page: no stack here
+                continue
+            if not len(table) or "filename" not in table.colnames:
+                continue
+            for row in table:
+                names[str(row["filename"])] = _finite_float(row["mjd"]) \
+                    if "mjd" in table.colnames else None
+        if not names:
+            continue
+        size = int(np.ceil(max(tile["width_arcmin"], tile["height_arcmin"]) * 60.0 / scale)) + 8
+        for filename, mjd in names.items():
+            requests_needed.append((tile["center"], min(size, maximum), filename, mjd))
+    if not requests_needed:
+        raise RuntimeError("PS1 has no {} stack at this position (dec < -30?)".format(band))
+    progress("PS1 {}: {} cutout(s) of up to {} px".format(
+        band, len(requests_needed), max(item[1] for item in requests_needed)))
+    records = []
+    for number, (center, size, filename, mjd) in enumerate(requests_needed, 1):
+        progress("  PS1 cutout {}/{}: {}".format(number, len(requests_needed),
+                                                 filename.split("/")[-1]))
+        body = _http_get(PS1_CUTOUT_URL, {
+            "ra": "{:.6f}".format(center.ra.deg), "dec": "{:.6f}".format(center.dec.deg),
+            "size": int(size), "format": "fits", "red": filename,
+        }, timeout)
+        with fits.open(io.BytesIO(body), memmap=False) as hdulist:
+            hdu = next(item for item in hdulist if getattr(item, "data", None) is not None)
+            data = np.asarray(hdu.data, dtype=float)
+            header = hdu.header.copy()
+        # fitscut returns linear flux already (the asinh scaling with
+        # BSOFTEN/BOFFSET applies only to the full skycell files).
+        records.append(_template_record(
+            data, header, normalize_filter_name(band) or filter_name, definition["name"],
+            _blank_border_zeros(data),
+            {"mjd": mjd, "survey_band": band, "survey_file": filename,
+             "fwhm_arcsec": _finite_float(header.get("FWHM_M"))}))
+    return records
+
+
+def _download_legacy(footprint, filter_name, definition, settings):
+    """DESI Legacy Imaging Surveys coadd cutouts covering the footprint."""
+
+    from .progress import progress
+
+    subtraction = settings.get("subtraction", {})
+    timeout = float(subtraction.get("download_timeout_s", 120))
+    band = _survey_band(definition, filter_name, settings)
+    scale = float(definition.get("pixel_scale_arcsec", 0.262))
+    maximum = int(definition.get("maximum_cutout_pixels", 3000))
+    tiles = _footprint_tiles(footprint, maximum * scale / 60.0 * 0.98, samples=1)
+    layer = definition.get("layer", "ls-dr10")
+    progress("Legacy Surveys {} {}: {} cutout(s)".format(layer, band, len(tiles)))
+    records = []
+    for number, tile in enumerate(tiles, 1):
+        width = int(np.ceil(tile["width_arcmin"] * 60.0 / scale)) + 8
+        height = int(np.ceil(tile["height_arcmin"] * 60.0 / scale)) + 8
+        progress("  Legacy cutout {}/{} ({}x{} px)".format(number, len(tiles), width, height))
+        body = _http_get(LEGACY_CUTOUT_URL, {
+            "ra": "{:.6f}".format(tile["center"].ra.deg),
+            "dec": "{:.6f}".format(tile["center"].dec.deg),
+            "layer": layer, "pixscale": scale, "bands": band,
+            "width": min(width, maximum), "height": min(height, maximum), "invvar": "",
+        }, timeout)
+        with fits.open(io.BytesIO(body), memmap=False) as hdulist:
+            images = [item for item in hdulist if getattr(item, "data", None) is not None]
+            data = np.asarray(images[0].data, dtype=float)
+            header = images[0].header.copy()
+            invvar = np.asarray(images[1].data, dtype=float) if len(images) > 1 else None
+        if data.ndim == 3:
+            data = data[0]
+            invvar = invvar[0] if invvar is not None and invvar.ndim == 3 else invvar
+            for key in ("NAXIS3", "CTYPE3", "CRPIX3", "CRVAL3", "CDELT3", "CUNIT3"):
+                header.remove(key, ignore_missing=True)
+            header["NAXIS"] = 2
+        uncovered = (data == 0)
+        if invvar is not None and invvar.shape == data.shape:
+            uncovered |= ~(invvar > 0)
+        if uncovered.all():
+            continue
+        records.append(_template_record(
+            data, header, normalize_filter_name(band) or filter_name, definition["name"],
+            uncovered, {"survey_band": band, "layer": layer, "unit": "nanomaggy"}))
+    if not records:
+        raise RuntimeError("{} has no {} coverage here".format(layer, band))
+    return records
+
+
+def _download_skyview(footprint, filter_name, definition, settings):
+    """Survey mosaics from NASA SkyView (for example SDSS, 2MASS)."""
 
     from astroquery.skyview import SkyView
+    from .progress import progress
 
     subtraction = settings.get("subtraction", {})
     SkyView.TIMEOUT = float(subtraction.get("download_timeout_s", 120))
-    survey_name = subtraction.get("survey_names", {}).get(survey, survey)
-    survey_filter = subtraction.get("survey_filter_map", {}).get(
-        survey, {}
-    ).get(filter_name)
-    if survey_filter:
-        survey_name = survey_name.format(filter=survey_filter)
-    scale = subtraction.get("download_pixel_scale_arcsec")
-    scale = _finite_float(scale, footprint.get("pixel_scale_arcsec")) or 1.0
-    pixels = max(
-        32,
-        int(np.ceil(max(footprint["width_arcmin"], footprint["height_arcmin"]) * 60.0 / scale)),
-    )
-    images = SkyView.get_images(
-        position=footprint["center"],
-        survey=[survey_name],
-        width=footprint["width_arcmin"] * u.arcmin,
-        height=footprint["height_arcmin"] * u.arcmin,
-        pixels=[pixels, pixels],
-    )
+    band = _survey_band(definition, filter_name, settings)
+    survey_name = str(definition.get("survey", "{filter}")).format(filter=band)
+    scale = _finite_float(definition.get("pixel_scale_arcsec"),
+                          footprint.get("pixel_scale_arcsec")) or 1.0
+    maximum = int(definition.get("maximum_cutout_pixels", 3000))
+    tiles = _footprint_tiles(footprint, maximum * scale / 60.0 * 0.98, samples=1)
+    progress("SkyView {}: {} image(s)".format(survey_name, len(tiles)))
     records = []
-    for hdulist in images:
-        hdu = hdulist[0]
-        data = np.asarray(hdu.data, dtype=float)
-        wcs = WCS(hdu.header).celestial
-        records.append(
-            {
-                "data": data,
-                "mask": ~np.isfinite(data),
-                "wcs": wcs,
-                "header": hdu.header.copy(),
-                "metadata": {"filter": filter_name, "survey": survey},
-                "source": survey,
-                "path": None,
-            }
+    for tile in tiles:
+        pixels_x = int(np.ceil(tile["width_arcmin"] * 60.0 / scale))
+        pixels_y = int(np.ceil(tile["height_arcmin"] * 60.0 / scale))
+        images = SkyView.get_images(
+            position=tile["center"], survey=[survey_name],
+            width=tile["width_arcmin"] * u.arcmin, height=tile["height_arcmin"] * u.arcmin,
+            pixels=[max(32, pixels_x), max(32, pixels_y)],
         )
+        for hdulist in images:
+            hdu = hdulist[0]
+            data = np.asarray(hdu.data, dtype=float)
+            records.append(_template_record(
+                data, hdu.header, normalize_filter_name(band) or filter_name,
+                definition["name"], _blank_border_zeros(data),
+                {"survey_band": band, "skyview_survey": survey_name}))
     if not records:
-        raise RuntimeError("Survey returned no template images")
+        raise RuntimeError("SkyView returned no {} image".format(survey_name))
     return records
+
+
+_SURVEY_SERVICES = {
+    "ps1": _download_ps1,
+    "legacy": _download_legacy,
+    "skyview": _download_skyview,
+}
+
+
+def _default_survey_downloader(footprint, filter_name, survey, settings):
+    """Download template tiles of one survey (see ``subtraction.template_surveys``).
+
+    Returns a list of template records (data, mask, WCS, header, metadata)
+    for :func:`mosaic_template_tiles`. A caller may still pass its own
+    ``downloader`` to :func:`acquire_template` (for example for an archive
+    that needs authentication).
+    """
+
+    definition = _survey_definition(survey, settings)
+    service = str(definition.get("service", "skyview")).lower()
+    if service not in _SURVEY_SERVICES:
+        raise ValueError("Unknown template service {!r} for survey {!r}".format(service, survey))
+    return _SURVEY_SERVICES[service](footprint, filter_name, definition, settings)
+
+
+def _template_cache_path(cache, survey, filter_name, footprint):
+    """Cache file of one survey template, unique to the field and its size."""
+
+    center = footprint["center"]
+    return Path(cache) / "{}_{}_{:09.5f}{:+09.5f}_{:.1f}x{:.1f}arcmin_template.fits".format(
+        survey, filter_name, center.ra.deg, center.dec.deg,
+        footprint["width_arcmin"], footprint["height_arcmin"])
 
 
 def _resample_array(data, input_wcs, output_wcs, output_shape, mask=None,
@@ -373,7 +633,13 @@ def mosaic_template_tiles(templates, footprint, settings=None):
     scales = [_pixel_scale_arcsec(item.get("wcs")) for item in templates]
     scales = [value for value in scales if value is not None]
     scale = _finite_float(subtraction.get("download_pixel_scale_arcsec"))
-    scale = scale or (float(np.median(scales)) if scales else footprint.get("pixel_scale_arcsec"))
+    if scale is None:
+        scale = float(np.median(scales)) if scales else footprint.get("pixel_scale_arcsec")
+        science = _finite_float(footprint.get("pixel_scale_arcsec"))
+        if scale is not None and science is not None:
+            # Survey pixels much finer than the science pixels only cost
+            # memory: the template is resampled onto the science grid anyway.
+            scale = max(scale, 0.5 * science)
     if scale is None or scale <= 0:
         raise ValueError("Template mosaic requires a valid pixel scale")
     width = max(2, int(np.ceil(footprint["width_arcmin"] * 60.0 / scale)))
@@ -417,13 +683,22 @@ def mosaic_template_tiles(templates, footprint, settings=None):
 
 def acquire_template(image_records, filter_name=None, settings=None,
                      template_paths=None, downloader=None):
-    """Acquire and mosaic a user or supported-survey template.
+    """Acquire and mosaic a user or survey template for one filter.
+
+    User templates (``subtraction.template_path``) are used first. Otherwise
+    the surveys in ``subtraction.template_survey_priority`` are tried in
+    order (``template_source`` names a single survey instead): a cached
+    download of the same survey, field and size is reused, else the survey
+    is downloaded (see ``subtraction.template_surveys``). A survey that does
+    not cover at least ``minimum_coverage_fraction`` of the field, or has no
+    such band, is skipped with its reason recorded.
 
     The optional ``downloader`` receives ``footprint``, ``filter_name``,
     ``survey``, and ``settings`` and must return one template record or a list
-    of records.  This keeps archive-specific code replaceable while providing
-    SkyView as the built-in network route.
+    of records; it replaces the built-in services.
     """
+
+    from .progress import progress
 
     if settings is None:
         settings = get_default_settings()
@@ -443,51 +718,71 @@ def acquire_template(image_records, filter_name=None, settings=None,
     if configured_path is None:
         configured_path = subtraction.get("template_path")
     paths = _template_paths_for_filter(configured_path, filter_name)
-    tiles = []
-    acquisition = {"filter": filter_name, "attempts": [], "from_cache": False}
-    for path in paths:
-        tiles.append(read_template(path, {"filter": filter_name, "source": "user"}))
-    if not tiles:
+    acquisition = {"filter": filter_name, "attempts": [], "from_cache": False, "survey": None}
+    cache = Path(subtraction.get("cache_directory", "templates")).expanduser()
+    if paths:
+        tiles = [read_template(path, {"filter": filter_name, "source": "user"}) for path in paths]
+        mosaic = mosaic_template_tiles(tiles, footprint, settings)
+        acquisition["survey"] = "user"
+    else:
         source = str(subtraction.get("template_source", "auto")).lower()
         if source == "user":
             raise FileNotFoundError(
                 "subtraction.template_source is 'user' but no template path was supplied"
             )
-        cache = Path(subtraction.get("cache_directory", "redphot_cache/templates")).expanduser()
-        cache_path = cache / "{}_template.fits".format(filter_name)
-        if subtraction.get("use_cached_templates", True) and cache_path.exists():
-            tiles = [read_template(cache_path, {"filter": filter_name, "source": "cache"})]
-            acquisition["from_cache"] = True
-        else:
-            fetch = downloader or _default_survey_downloader
-            errors = []
-            surveys = subtraction.get("template_survey_priority", [])
-            if source not in {"auto", "survey"}:
-                surveys = [source]
-            for survey in surveys:
-                try:
+        surveys = list(subtraction.get("template_survey_priority", []))
+        if source not in {"auto", "survey"}:
+            surveys = [source]
+        minimum = float(subtraction.get("minimum_coverage_fraction", 0.99))
+        fetch = downloader or _default_survey_downloader
+        errors = []
+        mosaic = None
+        for survey in surveys:
+            cache_path = _template_cache_path(cache, survey, filter_name, footprint)
+            try:
+                if subtraction.get("use_cached_templates", True) and cache_path.exists():
+                    progress("{} {} template from cache: {}".format(survey, filter_name,
+                                                                    cache_path.name))
+                    tiles = [read_template(cache_path, {"filter": filter_name,
+                                                        "source": survey})]
+                    from_cache = True
+                else:
+                    progress("downloading the {} {} template ({:.1f}′ × {:.1f}′)".format(
+                        survey, filter_name, footprint["width_arcmin"],
+                        footprint["height_arcmin"]))
                     result = fetch(footprint, filter_name, survey, settings)
                     tiles = result if isinstance(result, list) else [result]
-                    acquisition["attempts"].append({"survey": survey, "status": "PASS"})
-                    break
-                except Exception as error:
-                    errors.append("{}: {}".format(survey, error))
-                    acquisition["attempts"].append(
-                        {"survey": survey, "status": "FAIL", "error": str(error)}
-                    )
-            if not tiles:
-                raise RuntimeError("Template acquisition failed: {}".format("; ".join(errors)))
-    mosaic = mosaic_template_tiles(tiles, footprint, settings)
+                    from_cache = False
+                candidate = mosaic_template_tiles(tiles, footprint, settings)
+                coverage = float(np.mean(~np.asarray(candidate["mask"], dtype=bool)))
+                if coverage < minimum:
+                    raise RuntimeError("covers {:.1%} of the field (< {:.0%})".format(
+                        coverage, minimum))
+            except Exception as error:
+                errors.append("{}: {}".format(survey, error))
+                acquisition["attempts"].append(
+                    {"survey": survey, "status": "FAIL", "error": str(error)})
+                progress("{} template not used: {}".format(survey, error))
+                continue
+            acquisition["attempts"].append({"survey": survey, "status": "PASS",
+                                            "coverage_fraction": coverage})
+            acquisition["survey"] = survey
+            acquisition["from_cache"] = from_cache
+            mosaic = candidate
+            if not from_cache and subtraction.get("save_downloaded_templates", True):
+                cache.mkdir(parents=True, exist_ok=True)
+                header = mosaic["wcs"].to_header()
+                header["FILTER"] = filter_name
+                header["SURVEY"] = survey
+                fits.PrimaryHDU(mosaic["data"], header).writeto(cache_path, overwrite=True)
+                mosaic["cached_path"] = str(cache_path)
+            break
+        if mosaic is None:
+            raise RuntimeError("Template acquisition failed: {}".format(
+                "; ".join(errors) or "no template survey configured"))
     mosaic["acquisition"] = acquisition
     mosaic["requested_footprint"] = footprint
-    if not paths and subtraction.get("save_downloaded_templates", True):
-        cache = Path(subtraction.get("cache_directory", "redphot_cache/templates")).expanduser()
-        cache.mkdir(parents=True, exist_ok=True)
-        cache_path = cache / "{}_template.fits".format(filter_name)
-        fits.PrimaryHDU(mosaic["data"], mosaic["wcs"].to_header()).writeto(
-            cache_path, overwrite=True
-        )
-        mosaic["cached_path"] = str(cache_path)
+    mosaic.setdefault("metadata", {})["survey"] = acquisition["survey"]
     return mosaic
 
 

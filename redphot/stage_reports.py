@@ -6,7 +6,9 @@ Each time a stage runs, :func:`write_stage_diagnostics` writes into
 * ``<image>.png`` -- one figure per image for image-level stages (and for the
   batch stages that have a per-image view: star selection, usability, and
   calibration);
-* ``batch.png`` -- the run-level figure of a batch stage;
+* ``batch.png`` -- the run-level figure of a batch stage (for alignment, the
+  cutout check of the same sources in every image; the target-position
+  figure is ``target_position.png``);
 * ``overview.png`` -- the stage across all images (status and key numbers);
 * ``summary.csv`` -- one row per image with the status, flags, and the same
   key numbers, readable in any spreadsheet.
@@ -172,7 +174,7 @@ def metric_specs(stage, settings):
         ],
         "region": [
             {"key": "usable_percent", "label": "Usable frame", "unit": "%", "spec": "{:.1f}"},
-            {"key": "extra_edge_lines", "label": "Extra edge lines trimmed", "spec": "{:.0f}"},
+            {"key": "extra_edge_lines", "label": "Edge lines trimmed", "spec": "{:.0f}"},
             {"key": "target_edge_px", "label": "Target to edge", "unit": "px", "spec": "{:.0f}"},
         ],
         "masks": [
@@ -228,6 +230,8 @@ def metric_specs(stage, settings):
             {"key": "relative_rms_arcsec", "label": "Alignment RMS", "unit": "arcsec",
              "spec": "{:.3f}"},
             {"key": "shift_px", "label": "Shift to reference", "unit": "px", "spec": "{:.2f}"},
+            {"key": "check_offset_arcsec", "label": "Check-star offset", "unit": "arcsec",
+             "spec": "{:.2f}"},
         ],
         "psf": [
             {"key": "fwhm_px", "label": "PSF FWHM", "unit": "px", "spec": "{:.2f}"},
@@ -279,8 +283,11 @@ def _image_metrics(stage, context, image_id):
         edges = region.get("empirical_edges") or {}
         fraction = _finite(region.get("valid_fraction_full"))
         values["usable_percent"] = None if fraction is None else 100 * fraction
-        values["extra_edge_lines"] = sum(int(edges.get(side) or 0)
-                                         for side in ("top", "bottom", "left", "right"))
+        values["extra_edge_lines"] = sum(
+            int(edges.get(side) or 0) + int(edges.get(side + "_level") or 0)
+            for side in ("top", "bottom", "left", "right"))
+        values["working_frame"] = "x".join(
+            str(value) for value in reversed((region.get("crop") or {}).get("shape") or ()))
         values["target_edge_px"] = region.get("target_edge_distance_pixels")
     elif stage == "masks":
         info = product.get("info") or {}
@@ -347,6 +354,19 @@ def _image_metrics(stage, context, image_id):
                 if _finite(x) is not None and _finite(y) is not None:
                     values["shift_px"] = float(np.hypot(x, y))
                 values["common_stars"] = item.get("common_star_count")
+        check = _shared(context, "alignment").get("alignment_check") or {}
+        images = [str(item.get("image_id")) for item in check.get("images") or []]
+        if str(image_id) in images:
+            index = images.index(str(image_id))
+            offsets = []
+            for product in (check.get("cutouts") or {}).values():
+                if (product.get("source") or {}).get("kind") != "star":
+                    continue
+                frame = product["frames"][index]
+                if frame.get("reliable") and frame.get("dx_arcsec") is not None:
+                    offsets.append(float(np.hypot(frame["dx_arcsec"], frame["dy_arcsec"])))
+            if offsets:
+                values["check_offset_arcsec"] = float(np.median(offsets))
     elif stage == "psf":
         values["fwhm_px"] = product.get("fwhm_pixels")
         values["stars_used"] = product.get("star_count_used")
@@ -599,9 +619,8 @@ def stage_figure(state, context, stage, image_id=None):
         if image_id is not None:
             return None
         shared = _shared(context, stage)
-        return plots.plot_alignment_target_diagnostics(
-            shared.get("stacks"), shared.get("target_solution"), shared.get("target_candidates"),
-            shared.get("projections"), status=status)
+        return plots.plot_alignment_check(shared.get("alignment_check"), status=status,
+                                          settings=settings)
     if stage == "psf":
         return plots.plot_psf_diagnostics(product, metadata=metadata, status=status)
     if stage == "science_photometry":
@@ -609,8 +628,12 @@ def stage_figure(state, context, stage, image_id=None):
     if stage == "calibration":
         shared = _shared(context, stage)
         if image_id is None:
-            return plots.plot_calibration_diagnostics(shared, status=status)
-        return plots.plot_calibration_image_diagnostics(shared, image_id, metadata, status=status)
+            return plots.plot_calibration_diagnostics(shared, status=status, settings=settings)
+        science = context["images"][image_id].get("products", {}).get("science_photometry") or {}
+        apertures = dict(science.get("target_diagnostics") or {})
+        apertures.setdefault("fwhm_pixels", science.get("fwhm_pixels"))
+        return plots.plot_calibration_image_diagnostics(shared, image_id, metadata, status=status,
+                                                        apertures=apertures)
     if stage in ("subtraction", "difference_photometry", "templates"):
         if status == "SKIPPED" or (product or {}).get("skipped"):
             return None
@@ -624,6 +647,25 @@ def stage_figure(state, context, stage, image_id=None):
     if stage == "batch_consistency":
         return plots.plot_batch_consistency_diagnostics(_shared(context, stage), status=status)
     return None
+
+
+def extra_batch_figures(state, context, stage):
+    """Additional run-level figures of a batch stage, as ``{file stem: figure maker}``."""
+
+    from . import diagnostics as plots
+
+    if stage == "alignment":
+        shared = _shared(context, stage)
+        entry = _entry(state, stage) or {}
+
+        def target_position():
+            return plots.plot_alignment_target_diagnostics(
+                shared.get("stacks"), shared.get("target_solution"),
+                shared.get("target_candidates"), shared.get("projections"),
+                status=entry.get("status"))
+
+        return {"target_position": target_position}
+    return {}
 
 
 def _save(figure, path, dpi):
@@ -674,8 +716,15 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
     plt.ioff()
     try:
         if not is_batch or stage in PER_IMAGE_BATCH_STAGES:
+            from .progress import progress
+
             skipped = []
-            for image_id in targets:
+            step = max(5, int(np.ceil(len(targets) / 10.0)))
+            if len(targets) > 1:
+                progress("drawing figures for {} images".format(len(targets)))
+            for number, image_id in enumerate(targets, 1):
+                if len(targets) >= 20 and number % step == 0 and number < len(targets):
+                    progress("  figures {}/{}".format(number, len(targets)))
                 entry = _entry(state, stage, image_id)
                 if not entry:
                     continue
@@ -720,6 +769,17 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
                 except Exception as problem:
                     plt.close("all")
                     entry["diagnostic_error"] = "{}: {}".format(type(problem).__name__, problem)
+                if entry.get("status") not in ("FAIL", "SKIPPED"):
+                    for stem, maker in extra_batch_figures(state, context, stage).items():
+                        try:
+                            figure = maker()
+                            if figure is not None:
+                                written[stem] = _save(figure, directory / "{}.png".format(stem),
+                                                      dpi)
+                        except Exception as problem:
+                            plt.close("all")
+                            entry["diagnostic_error"] = "{}: {}".format(
+                                type(problem).__name__, problem)
         specs = metric_specs(stage, context.get("settings") or {})
         has_numbers = any(_finite(row.get(spec["key"])) is not None
                           for spec in specs for row in rows)

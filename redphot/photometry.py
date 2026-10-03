@@ -1188,6 +1188,12 @@ def _local_background(data, standard_deviation, mask, x, y, fwhm, settings):
         maxiters=int(apertures.get("local_background_maximum_iterations", 5)),
         masked=True,
     )
+    # Annulus pixels rejected by the sigma clip (other sources, hot pixels),
+    # in the coordinates of ``slices``; kept for the diagnostic plots.
+    rejected = np.zeros(local.shape, dtype=bool)
+    rejected[valid] = np.ma.getmaskarray(clipped)
+    result["clipped"] = rejected
+    result["clipped_count"] = int(np.count_nonzero(rejected))
     kept = np.asarray(clipped.compressed(), dtype=float)
     if kept.size < minimum:
         result["pixel_count"] = int(kept.size)
@@ -1711,6 +1717,7 @@ def perform_science_image_photometry(
     sources = _science_sources(image_id, measurements, target_solution, wcs)
     rows = []
     target_diagnostics = None
+    target_background = None
     target_flags = []
     for source in sources:
         background = _local_background(
@@ -1722,6 +1729,8 @@ def perform_science_image_photometry(
             fwhm,
             settings,
         )
+        if source["source_type"] == "target":
+            target_background = background
         source_measurements = []
         if apertures.get("perform_small_aperture", True):
             source_measurements.append(
@@ -1846,8 +1855,28 @@ def perform_science_image_photometry(
             1,
             method="center",
         )
+        sky_clipped = np.zeros(
+            (context_slices[0].stop - context_slices[0].start,
+             context_slices[1].stop - context_slices[1].start), dtype=bool)
+        clipped = (target_background or {}).get("clipped")
+        if clipped is not None and np.size(clipped):
+            sky_slices = target_background["slices"]
+            y0 = max(sky_slices[0].start, context_slices[0].start)
+            y1 = min(sky_slices[0].stop, context_slices[0].stop)
+            x0 = max(sky_slices[1].start, context_slices[1].start)
+            x1 = min(sky_slices[1].stop, context_slices[1].stop)
+            if y1 > y0 and x1 > x0:
+                sky_clipped[y0 - context_slices[0].start:y1 - context_slices[0].start,
+                            x0 - context_slices[1].start:x1 - context_slices[1].start] = clipped[
+                    y0 - sky_slices[0].start:y1 - sky_slices[0].start,
+                    x0 - sky_slices[1].start:x1 - sky_slices[1].start]
         target_diagnostics.update(
             {
+                "context_sky_clipped": sky_clipped,
+                "sky_clipped_count": int(np.count_nonzero(sky_clipped)),
+                "sky_pixel_count": (target_background or {}).get("pixel_count"),
+                "sky_sigma_clip": float(apertures.get("local_background_sigma_clip", 3.0)),
+                "fwhm_pixels": fwhm,
                 "small_radius_pixels": float(apertures.get("small_radius_fwhm", 1.0)) * fwhm,
                 "large_radius_pixels": float(apertures.get("large_radius_fwhm", 2.5)) * fwhm,
                 "sky_inner_radius_pixels": float(apertures.get("sky_inner_radius_fwhm", 4.0)) * fwhm,
@@ -1952,13 +1981,14 @@ def save_science_photometry_products(
             "mask": "MASK",
             "context_data": "CONTEXT",
             "context_mask": "CONTMASK",
+            "context_sky_clipped": "SKYCLIP",
         }
         for name, extension in extension_names.items():
             value = diagnostics.get(name)
             if value is None:
                 continue
             array = np.asarray(
-                value, dtype=np.uint8 if name.endswith("mask") else np.float32
+                value, dtype=np.uint8 if name.endswith(("mask", "clipped")) else np.float32
             )
             hdus.append(fits.ImageHDU(array, name=extension))
         path = output_directory / "{}_target_photometry.fits".format(stem)
@@ -2973,6 +3003,10 @@ def calibrate_photometry(
     measurements = Table(measurements, masked=True, copy=True)
     catalog_collection = _catalog_collection(catalogs)
     records = _calibration_records(measurements, catalog_collection, settings)
+    from .progress import progress
+
+    progress("zeropoints for {} image/method combinations".format(
+        len({(str(record.get("image_id")), str(record.get("method"))) for record in records})))
     first_solutions = _solve_all_zeropoints(records, settings)
     unstable = _unstable_calibration_stars(records, settings)
     if unstable:
@@ -3013,6 +3047,7 @@ def calibrate_photometry(
             },
         )
     trends = _calibration_trends(records, settings)
+    progress("limiting magnitudes from empty apertures")
     limits = _limit_products(
         measurements,
         zeropoints,

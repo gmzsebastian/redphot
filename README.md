@@ -56,44 +56,53 @@ state, context = run_batch(
 )
 ```
 
-## Stepwise review
+## Stepwise runs
+
+Stages can also be run one at a time (`run_pipeline_stage`) to look at each
+stage's plots before going on. Nothing ever waits for an approval: at the
+usability and PSF gates, images that FAIL are rejected automatically and
+skipped by later stages, while PASS and WARN images continue. Any decision can
+still be changed by hand:
 
 ```python
-from redphot.pipeline import review_image, run_batch, run_pipeline_through
+from redphot.pipeline import review_image, run_pipeline_through
 
-state, context = run_batch(
-    "data/*.fits*",
-    settings=settings,
-    target=target,
-    run_directory="AT2024rmj_review",
-    mode="stepwise",
-)
-
-review_image(
-    state,
-    context,
-    "AT_2024rmj_r_FLWO_2024.1012.fits",
-    "usability",
-    "APPROVED",
-    note="Quality and depth diagnostics inspected",
-)
-
-state, context = run_pipeline_through(state, context, mode="stepwise")
+review_image(state, context, "AT_2024rmj_r_FLWO_2024.1012.fits", "usability",
+             "REJECTED", note="clouds")
+state, context = run_pipeline_through(state, context)
 ```
+
+Long stages print progress (one line per image and from inside the slow
+steps); switch it off with `{"pipeline": {"verbose": False}}`.
 
 Every stage writes plots and a `summary.csv` to
 `<run_directory>/diagnostics/<NN>_<stage>/` as soon as it runs, so each step can
 be checked before continuing (see `docs/outputs.rst`).
 
-Runs can be resumed with `resume_pipeline("AT2024rmj_review")`. Configuration
+Runs can be resumed with `resume_pipeline("AT2024rmj_redphot")`. Configuration
 changes made with `set_image_overrides` mark only affected and downstream
 products stale.
 
 ## Output size
 
-`minimal` saves core tables, configuration, log, and manifest. `standard` also
-saves reports, PSF models, and difference images. `full` saves every supplied
-derivative. Individual products can be changed with `output.product_overrides`.
+`minimal` saves core tables, the final light-curve figure
+(`<object>_lightcurve.png/.pdf`, every photometry method), configuration, log,
+and manifest. `standard` also saves reports, PSF models, difference images,
+one processed FITS file per image (`processed/`: cut to the usable area,
+background-subtracted, aligned WCS, with MASK, BKG and BKGRMS extensions) and
+the same images resampled onto one common grid (`registered/`). `full` saves
+every supplied derivative. Individual products can be changed with
+`output.product_overrides`.
+
+## Templates
+
+With subtraction enabled, templates come from a user file
+(`subtraction.template_path`) or are downloaded from the first survey in
+`subtraction.template_survey_priority` that covers the field in that band:
+Pan-STARRS1 (STScI cutout service), the DESI Legacy Surveys (`legacy`, or
+`decam` for DECam-only data), or SDSS (through SkyView). Each survey's recipe
+is in `subtraction.template_surveys`; set `template_source` to one survey name
+to use only that one. Downloads are cached per survey, field and size.
 
 ```python
 {"output": {
