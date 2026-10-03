@@ -618,6 +618,207 @@ def test_hotpants_inputs_are_finite_and_nonfinite_pixels_are_masked(monkeypatch)
     assert np.isfinite(difference).sum() == science.size - 4
 
 
+def _star_field(shape, positions, fwhm, fluxes, rng, noise=5.0, shift=(0.0, 0.0),
+                rotation_degrees=0.0):
+    """Gaussian stars plus noise; the field can be rotated and shifted."""
+
+    yy, xx = np.indices(shape)
+    sigma = fwhm / 2.354820045
+    data = rng.normal(0.0, noise, shape)
+    center_y, center_x = (shape[0] - 1) / 2.0, (shape[1] - 1) / 2.0
+    angle = np.radians(rotation_degrees)
+    for (x, y), flux in zip(positions, fluxes):
+        moved_x = center_x + np.cos(angle) * (x - center_x) - np.sin(angle) * (y - center_y) + shift[0]
+        moved_y = center_y + np.sin(angle) * (x - center_x) + np.cos(angle) * (y - center_y) + shift[1]
+        data += flux / (2 * np.pi * sigma ** 2) * np.exp(
+            -((xx - moved_x) ** 2 + (yy - moved_y) ** 2) / (2 * sigma ** 2))
+    return data
+
+
+def _star_positions(shape, count, rng, border=15):
+    return [(float(x), float(y)) for x, y in zip(
+        rng.uniform(border, shape[1] - border, count), rng.uniform(border, shape[0] - border, count))]
+
+
+def test_subtraction_quality_stars_come_from_star_selection(monkeypatch):
+    """Regression: the pipeline passed no stars, so every subtraction failed its checks."""
+
+    from redphot import pipeline
+    from redphot.subtraction import _quality_positions
+
+    stars = Table({
+        "image_id": ["a", "a", "a", "b"],
+        "persistent_id": ["gaia:1", "gaia:2", "gaia:3", "gaia:4"],
+        "x": [10.0, 20.0, 30.0, 40.0],
+        "y": [11.0, 21.0, 31.0, 41.0],
+        "role_qc_anchor": [True, False, False, True],
+        "role_calibration": [False, True, False, True],
+        "role_psf": [False, False, False, False],
+    })
+    # Only image "a" rows with a QC, calibration or PSF role.
+    assert _quality_positions({"image_id": "a"}, stars) == [
+        (10.0, 11.0, "gaia:1"), (20.0, 21.0, "gaia:2")]
+
+    seen = {}
+
+    def fake_subtraction(record, template, settings, quality_stars, runner):
+        seen["stars"] = quality_stars
+        return {"image_id": "a", "status": "PASS"}
+
+    monkeypatch.setattr("redphot.subtraction.perform_image_subtraction", fake_subtraction)
+    context = {
+        "images": {"a": {"record": {"image_id": "a", "metadata": {"filter": "r"}}}},
+        "shared": {"templates": {"templates": {"r": {"data": np.zeros((4, 4))}}},
+                   "star_selection": {"measurements": stars}},
+    }
+    pipeline._run_subtraction(context, "a", {"subtraction": {"enabled": True}})
+    assert seen["stars"] is stars
+
+
+def test_hotpants_difference_is_on_the_science_system_and_unsubtracted_pixels_are_nan(
+        monkeypatch):
+    settings = get_default_settings()
+    science = np.full((32, 32), 10.0)
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["normalize"] = _argument(command, "-n")
+        fits.PrimaryHDU(np.zeros(science.shape, dtype=np.float32)).writeto(
+            _argument(command, "-outim"))
+        flags = np.zeros(science.shape, dtype=np.int32)
+        flags[5, 6] = 0x8000          # Hotpants: no valid difference here
+        flags[7, 8] = 0x40            # "OK" convolution flag only: keep
+        fits.PrimaryHDU(flags).writeto(_argument(command, "-omi"))
+        return subprocess.CompletedProcess(command, 0, "1 stamps built", "")
+
+    monkeypatch.setattr("redphot.subtraction.shutil.which", lambda command: "/fake/hotpants")
+    monkeypatch.setattr("redphot.subtraction.subprocess.run", fake_run)
+    parameters = choose_hotpants_parameters(
+        {"image_id": "science", "data": science, "quality": {"fwhm_pixels": 3.0},
+         "metadata": {"saturation": 50000.0}},
+        {"metadata": {"fwhm_pixels": 2.0, "saturation": 50000.0}},
+        {"data": science.copy(), "mask": np.zeros(science.shape, dtype=bool), "wcs": None},
+        settings,
+    )
+    difference, log = _run_hotpants(science, science.copy(), _wcs_header(science.shape),
+                                    parameters, settings["subtraction"])
+    assert seen["normalize"] == "i"
+    assert np.isnan(difference[5, 6]) and difference[7, 8] == 0.0
+    assert np.isfinite(difference).sum() == science.size - 1
+
+
+def test_unknown_saturation_keeps_bright_stars_for_hotpants():
+    """Regression: sky + 500 sigma flagged the bright LDSS3 stars, leaving ~8 stamps."""
+
+    rng = np.random.default_rng(5)
+    science = rng.normal(0.0, 10.0, (64, 64))
+    science[30, 30] = 40000.0
+    template = rng.normal(0.0, 2.0, (64, 64))
+    template[30, 30] = 9000.0
+    parameters = choose_hotpants_parameters(
+        {"image_id": "science", "data": science, "quality": {"fwhm_pixels": 3.0},
+         "metadata": {}},
+        {"metadata": {}},
+        {"data": template, "mask": np.zeros(template.shape, dtype=bool), "wcs": None},
+        get_default_settings(),
+    )
+    assert parameters["science_upper"] == pytest.approx(20000.0)
+    assert parameters["template_upper"] == pytest.approx(4500.0)
+    assert parameters["science_lower"] == pytest.approx(-100.0, rel=0.2)
+    assert parameters["background_order"] == 0
+
+
+def test_template_registration_follows_a_rotated_and_shifted_template():
+    """The template is moved onto the science stars when the WCSs disagree."""
+
+    from redphot.subtraction import align_template_to_science, register_template_to_science
+
+    rng = np.random.default_rng(11)
+    shape = (200, 200)
+    positions = _star_positions(shape, 70, rng)
+    fluxes = rng.uniform(2e4, 1e5, len(positions))
+    science = _star_field(shape, positions, 3.0, fluxes, rng)
+    # The template's stars sit 0.6, -0.4 px and 0.8 degrees away (up to ~1.6 px).
+    template_data = _star_field(shape, positions, 2.2, 0.5 * fluxes, rng, noise=2.0,
+                                shift=(0.6, -0.4), rotation_degrees=0.8)
+    wcs = WCS(_wcs_header(shape))
+    record = {"image_id": "science", "ccd": CCDData(science, unit=u.adu, wcs=wcs),
+              "wcs": wcs, "quality": {"fwhm_pixels": 3.0}}
+    template = {"data": template_data, "mask": np.zeros(shape, dtype=bool), "wcs": wcs,
+                "metadata": {"filter": "r"}}
+    stars = Table({"image_id": ["science"] * len(positions),
+                   "x": [x for x, _ in positions], "y": [y for _, y in positions]})
+    settings = get_default_settings()
+    aligned = align_template_to_science(record, template, settings)
+    aligned, registration, error = register_template_to_science(
+        record, template, aligned, stars, settings)
+    assert error is None
+    assert registration["shift_scatter_pixels"] > 0.3          # before: rotation
+    assert registration["applied_offset"]
+    assert abs(registration["residual_dx"]) < 0.05 and abs(registration["residual_dy"]) < 0.05
+    assert registration["residual_scatter_pixels"] < 0.08
+    assert registration["science_fwhm_pixels"] == pytest.approx(3.0, rel=0.05)
+    assert registration["template_fwhm_pixels"] == pytest.approx(2.2, rel=0.05)
+
+
+def test_subtraction_dipole_and_noise_checks():
+    rng = np.random.default_rng(21)
+    shape = (160, 160)
+    positions = _star_positions(shape, 25, rng)
+    fluxes = rng.uniform(5e4, 2e5, len(positions))
+    stars_only = _star_field(shape, positions, 3.0, fluxes, rng, noise=0.0)
+    shifted = _star_field(shape, positions, 3.0, fluxes, rng, noise=0.0, shift=(0.6, 0.0))
+    noise_science = rng.normal(0.0, 5.0, shape)
+    noise_template = rng.normal(0.0, 3.0, shape)
+    science = stars_only + noise_science
+    record = {"image_id": "science", "ccd": CCDData(science, unit=u.adu),
+              "quality": {"fwhm_pixels": 3.0}}
+    stars = Table({"image_id": ["science"] * len(positions),
+                   "x": [x for x, _ in positions], "y": [y for _, y in positions]})
+    aligned = {"data": 100.0 + noise_template / 0.5, "mask": np.zeros(shape, dtype=bool)}
+
+    # Well subtracted: only the noise of both images remains.
+    good = evaluate_subtraction(record, aligned, noise_science - noise_template,
+                                quality_stars=stars, template_scale=0.5)
+    assert good["status"] == "PASS"
+    assert good["noise_ratio"] == pytest.approx(1.0, abs=0.3)
+    assert good["median_dipole_fraction"] < 0.02
+
+    # A template 0.6 px off leaves dipoles: first moment = 0.6 px = 0.2 FWHM.
+    bad = evaluate_subtraction(record, aligned, stars_only - shifted + noise_science,
+                               quality_stars=stars, template_scale=0.5)
+    assert bad["median_dipole_fraction"] == pytest.approx(0.2, rel=0.15)
+
+    # No quality stars: a clear flag, not "residual high".
+    none = evaluate_subtraction(record, aligned, noise_science, quality_stars=stars[:0])
+    assert none["flags"] == ["SUBTRACTION_TOO_FEW_STARS"]
+
+
+def test_failed_subtraction_draws_its_figure_not_a_blank_card(monkeypatch):
+    """Regression: a subtraction that failed its checks showed "No reason recorded."."""
+
+    from redphot import diagnostics
+    from redphot.stage_reports import stage_figure
+
+    drawn = {}
+    monkeypatch.setattr(diagnostics, "plot_subtraction_diagnostics",
+                        lambda product, record, metadata=None, status=None:
+                        drawn.setdefault("status", status) or "figure")
+    monkeypatch.setattr(diagnostics, "plot_stage_status",
+                        lambda title, status, stem, subtitle, reason: ("card", reason))
+    state = {"images": {"a": {"stages": {"subtraction": {"status": "FAIL", "error": None}}}}}
+    product = {"status": "FAIL", "flags": ["SUBTRACTION_NOISE_HIGH"],
+               "difference": np.zeros((4, 4))}
+    context = {"images": {"a": {"record": {"metadata": {}}, "products": {"subtraction": product}}},
+               "settings": {}}
+    stage_figure(state, context, "subtraction", "a")
+    assert drawn["status"] == "FAIL"
+
+    # A backend failure (no difference) gets the card, with the reason.
+    product.update({"difference": None, "error": "hotpants: exit code 1"})
+    assert stage_figure(state, context, "subtraction", "a") == ("card", "hotpants: exit code 1")
+
+
 def test_astrometry_matches_reach_star_selection(monkeypatch):
     """Regression: matches were stored as 'astrometry_matches' and star selection failed."""
 

@@ -500,13 +500,19 @@ def write_stage_summary(state, context, stage):
 # Figures
 # ---------------------------------------------------------------------------
 
-def _status_card(state, context, stage, image_id, entry):
+def _status_card(state, context, stage, image_id, entry, reason=None):
     from .diagnostics import plot_stage_status, _image_subtitle
 
     metadata = {}
     if image_id is not None:
         metadata = context["images"][image_id]["record"].get("metadata") or {}
-    reason = entry.get("error") or entry.get("stale_reason") or "No reason recorded."
+    if reason is None:
+        reason = entry.get("error") or entry.get("stale_reason")
+    if not reason and image_id is not None:
+        flags = _flags_for(stage, context, image_id)
+        if flags:
+            reason = "Flags: " + ", ".join(flags)
+    reason = reason or "No reason recorded."
     return plot_stage_status(
         STAGE_TITLES.get(stage, stage), entry.get("status"),
         image_file_stem(image_id) if image_id else "run",
@@ -557,7 +563,16 @@ def stage_figure(state, context, stage, image_id=None):
         # blocked by a rejection or an earlier failure get no figure of their own.
         return None
     if status == "FAIL":
-        return _status_card(state, context, stage, image_id, entry)
+        # A stage that raised has nothing to draw. A stage that ran and judged
+        # its own result a failure (e.g. subtraction quality checks) gets its
+        # normal figure, which is what shows why.
+        product = (context["images"][image_id].get("products", {}).get(stage)
+                   if image_id is not None else _shared(context, stage)) or {}
+        if entry.get("error") or not product:
+            return _status_card(state, context, stage, image_id, entry)
+        if stage == "subtraction" and product.get("difference") is None:
+            reason = product.get("error") or None
+            return _status_card(state, context, stage, image_id, entry, reason)
     if image_id is not None:
         image = context["images"][image_id]
         record = image["record"]
@@ -752,6 +767,14 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
                 except Exception as problem:
                     plt.close("all")
                     entry["diagnostic_error"] = "{}: {}".format(type(problem).__name__, problem)
+                    if entry.get("status") == "FAIL":
+                        # The stage's own figure could not be drawn: at least
+                        # say why the image failed.
+                        try:
+                            written[image_id] = _save(
+                                _status_card(state, context, stage, image_id, entry), path, dpi)
+                        except Exception:
+                            plt.close("all")
             if skipped:
                 written["skipped"] = _save(_skipped_card(state, context, stage, skipped),
                                            directory / "skipped.png", dpi)
@@ -766,6 +789,10 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
                     if figure is not None:
                         written["batch"] = _save(figure, path, dpi)
                         entry["diagnostic_plot"] = written["batch"]
+                    elif path.exists():
+                        # Do not leave an earlier run's figure (e.g. a SKIPPED card).
+                        path.unlink()
+                        entry.pop("diagnostic_plot", None)
                 except Exception as problem:
                     plt.close("all")
                     entry["diagnostic_error"] = "{}: {}".format(type(problem).__name__, problem)

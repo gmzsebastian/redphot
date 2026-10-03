@@ -231,6 +231,7 @@ QUALITY_FLAGS = {
         "SUBTRACTION_BACKEND_MISSING",
         "SUBTRACTION_FAILED",
         "SUBTRACTION_RESIDUAL_HIGH",
+        "SUBTRACTION_TOO_FEW_STARS",
         "SUBTRACTION_DIPOLE",
         "SUBTRACTION_FLUX_LOSS",
         "SUBTRACTION_NOISE_HIGH",
@@ -1075,8 +1076,29 @@ DEFAULT_SETTINGS = {
             "require_psf": True,
         },
         "maximum_alignment_rms_pixels": 0.5,
+        # The template is placed with the WCSs, then moved onto the quality
+        # stars (Gaussian fits in both images) when they disagree by at least
+        # minimum_registration_shift_pixels. The offsets are fitted with a
+        # polynomial in x, y; "auto" picks the lowest order (0 = shift ...
+        # 3 = cubic) that fits about as well as any (a WCS without distortion
+        # terms, e.g. LDSS3, needs the cubic). Offsets beyond
+        # maximum_registration_shift_arcsec anywhere in the frame mean a
+        # broken WCS (FAIL).
+        "register_template": True,
+        "registration_order": "auto",
+        "minimum_registration_shift_pixels": 0.05,
+        "maximum_registration_shift_arcsec": 3.0,
+        "registration_maximum_stars": 150,
+        "registration_iterations": 3,
+        # Hotpants kernel_order "auto" is 1 (linear variation over the frame)
+        # unless Hotpants finds fewer stamps than this; then 0 (one kernel).
+        "minimum_stamps_for_varying_kernel": 30,
         "maximum_residual_fraction": 0.10,
+        # Dipole = residual first moment / (star flux x FWHM), i.e. the
+        # science/template misregistration in FWHM; only stars where it is
+        # measured to better than dipole_maximum_noise_fraction count.
         "maximum_dipole_fraction": 0.20,
+        "dipole_maximum_noise_fraction": 0.05,
         "maximum_flux_bias_fraction": 0.10,
         "maximum_noise_ratio": 2.0,
         "minimum_quality_stars": 3,
@@ -2111,6 +2133,8 @@ def validate_settings(settings):
         raise ValueError("subtraction.blank_aperture_count must be positive")
     if int(subtraction_settings.get("minimum_quality_stars", 3)) < 1:
         raise ValueError("subtraction.minimum_quality_stars must be positive")
+    if subtraction_settings.get("registration_order", "auto") not in {"auto", 0, 1, 2, 3}:
+        raise ValueError("subtraction.registration_order must be auto or 0-3")
     hotpants_settings = subtraction_settings.get("hotpants", {})
     stamp_count = hotpants_settings.get("stamp_count", "auto")
     if stamp_count != "auto" and int(stamp_count) < 1:

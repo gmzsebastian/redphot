@@ -11,6 +11,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import io
+import re
 import shutil
 import subprocess
 import tempfile
@@ -580,9 +581,44 @@ def _template_cache_path(cache, survey, filter_name, footprint):
         footprint["width_arcmin"], footprint["height_arcmin"])
 
 
+def _polynomial_terms(x, y, order, center, half_size):
+    """Polynomial terms 1, u, v, u^2, uv, v^2, ... of normalized coordinates."""
+
+    u = (np.asarray(x, dtype=float) - center[0]) / half_size[0]
+    v = (np.asarray(y, dtype=float) - center[1]) / half_size[1]
+    return [u ** (degree - power) * v ** power
+            for degree in range(int(order) + 1) for power in range(degree + 1)]
+
+
+def _registration_offsets(pixel_offset, x, y):
+    """Template - science offsets (dx, dy) at science pixels ``x``, ``y``."""
+
+    if pixel_offset is None:
+        return 0.0, 0.0
+    if isinstance(pixel_offset, list):
+        total_x, total_y = 0.0, 0.0
+        for item in pixel_offset:
+            dx, dy = _registration_offsets(item, x, y)
+            total_x, total_y = total_x + dx, total_y + dy
+        return total_x, total_y
+    if isinstance(pixel_offset, Mapping):
+        terms = _polynomial_terms(x, y, pixel_offset["order"], pixel_offset["center"],
+                                  pixel_offset["half_size"])
+        dx = sum(c * t for c, t in zip(pixel_offset["coefficients_x"], terms))
+        dy = sum(c * t for c, t in zip(pixel_offset["coefficients_y"], terms))
+        return dx, dy
+    return float(pixel_offset[0]), float(pixel_offset[1])
+
+
 def _resample_array(data, input_wcs, output_wcs, output_shape, mask=None,
-                    order=3, tile_rows=256):
-    """Resample one derived array onto an output WCS in memory-limited tiles."""
+                    order=3, tile_rows=256, pixel_offset=None):
+    """Resample one derived array onto an output WCS in memory-limited tiles.
+
+    With ``pixel_offset``, output pixel (x, y) takes the input value at the
+    sky position of output pixel (x + dx, y + dy); ``pixel_offset`` is either
+    a constant (dx, dy), a registration polynomial from
+    :func:`measure_template_registration`, or a list of those (summed).
+    """
 
     data = np.asarray(data, dtype=float)
     invalid = ~np.isfinite(data)
@@ -597,7 +633,8 @@ def _resample_array(data, input_wcs, output_wcs, output_shape, mask=None,
             np.arange(output_shape[1], dtype=float),
             indexing="ij",
         )
-        sky = output_wcs.pixel_to_world(xx, yy)
+        offset_x, offset_y = _registration_offsets(pixel_offset, xx, yy)
+        sky = output_wcs.pixel_to_world(xx + offset_x, yy + offset_y)
         input_x, input_y = input_wcs.world_to_pixel(sky)
         inside = (
             np.isfinite(input_x) & np.isfinite(input_y)
@@ -875,8 +912,17 @@ def validate_template(template, image_records, settings=None, filter_name=None):
     }
 
 
-def align_template_to_science(science_record, template, settings=None):
-    """Resample only the template onto the unchanged science-image grid."""
+def align_template_to_science(science_record, template, settings=None,
+                              pixel_offset=None):
+    """Resample only the template onto the unchanged science-image grid.
+
+    ``pixel_offset`` is where the template's stars land relative to the
+    science stars, in science pixels, when the template is placed with the
+    WCSs alone: a constant (dx, dy) or the registration polynomial of
+    :func:`measure_template_registration`. The template is then sampled that
+    far away so its stars fall on the science stars; the science pixels are
+    never moved.
+    """
 
     if settings is None:
         settings = get_default_settings()
@@ -893,7 +939,7 @@ def align_template_to_science(science_record, template, settings=None):
     aligned, footprint = _resample_array(
         template["data"], template_wcs, science_wcs, science.shape,
         template.get("mask"), subtraction.get("resampling_order", 3),
-        subtraction.get("resampling_tile_rows", 256),
+        subtraction.get("resampling_tile_rows", 256), pixel_offset=pixel_offset,
     )
     return {
         "data": aligned,
@@ -903,7 +949,215 @@ def align_template_to_science(science_record, template, settings=None):
         "wcs": science_wcs,
         "science_shape": science.shape,
         "science_pixels_resampled": False,
+        "pixel_offset": pixel_offset,
     }
+
+
+def _fit_star(data, bad, x, y, fwhm):
+    """Fit one star with a round Gaussian plus constant; return (x, y, fwhm) or None."""
+
+    from astropy.modeling import fitting, models
+    import warnings
+
+    half = int(max(4, np.ceil(1.5 * fwhm)))
+    xi, yi = int(round(x)), int(round(y))
+    y0, y1, x0, x1 = yi - half, yi + half + 1, xi - half, xi + half + 1
+    if y0 < 0 or x0 < 0 or y1 > data.shape[0] or x1 > data.shape[1]:
+        return None
+    cut = np.asarray(data[y0:y1, x0:x1], dtype=float)
+    cut_bad = np.asarray(bad[y0:y1, x0:x1], dtype=bool) | ~np.isfinite(cut)
+    if cut_bad.mean() > 0.1:
+        return None
+    sky = float(np.median(np.concatenate([cut[0], cut[-1], cut[:, 0], cut[:, -1]])))
+    peak = float(np.max(np.where(cut_bad, -np.inf, cut))) - sky
+    if not np.isfinite(peak) or peak <= 0:
+        return None
+    grid_y, grid_x = np.mgrid[y0:y1, x0:x1]
+    sigma = max(0.5, float(fwhm) / 2.354820045)
+    model = models.Gaussian2D(peak, x, y, sigma, sigma, 0.0, fixed={"theta": True}) + \
+        models.Const2D(sky)
+    model.x_stddev_0.tied = lambda item: item.y_stddev_0
+    model.y_stddev_0.bounds = (0.3, 2.0 * half)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted = fitting.LevMarLSQFitter()(
+                model, grid_x, grid_y, np.where(cut_bad, sky, cut),
+                weights=(~cut_bad).astype(float), maxiter=200,
+            )
+    except Exception:
+        return None
+    gaussian = fitted[0]
+    fx, fy = float(gaussian.x_mean.value), float(gaussian.y_mean.value)
+    width = 2.354820045 * abs(float(gaussian.y_stddev.value))
+    if gaussian.amplitude.value <= 0 or abs(fx - x) > 0.5 * half or abs(fy - y) > 0.5 * half \
+            or not np.isfinite(width) or not 0.5 < width < 2.0 * half:
+        return None
+    return fx, fy, width
+
+
+def measure_template_registration(science_record, aligned_template, quality_stars=None,
+                                  settings=None):
+    """Compare the quality stars in the science image and the aligned template.
+
+    Each star is fitted with a round Gaussian in both images and the
+    template - science offsets are fitted with a polynomial in the science
+    pixel coordinates (sigma clipped). ``subtraction.registration_order``
+    "auto" uses the lowest order (up to 3, and only with at least three
+    stars per coefficient) whose scatter is within 20% (or 0.05 px) of the
+    best one: a shift is enough for a good WCS, while images whose WCS has
+    no distortion terms (e.g. LDSS3) need the cubic.
+
+    Returns the polynomial (``polynomial``, usable as ``pixel_offset``), the
+    median offset (``dx``, ``dy``), the scatter of the stars about the
+    polynomial (``scatter_pixels``) and about a pure shift
+    (``shift_scatter_pixels``), the median science and template FWHM (pixels
+    on the science grid), and the number of stars. Values are ``None`` when
+    too few stars fit.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    subtraction = settings.get("subtraction", {})
+    science = _record_data(science_record)
+    template = np.asarray(aligned_template["data"], dtype=float)
+    science_bad = _record_mask(science_record, science.shape)
+    template_bad = np.asarray(aligned_template["mask"], dtype=bool) | ~np.isfinite(template)
+    fwhm = _seeing_pixels(science_record)
+    positions = _quality_positions(science_record, quality_stars)
+    maximum = int(subtraction.get("registration_maximum_stars", 150))
+    if len(positions) > maximum:
+        # Spread the stars over the field rather than taking the first ones.
+        positions = [positions[int(i)] for i in np.linspace(0, len(positions) - 1, maximum)]
+    rows = []
+    for x, y, _ in positions:
+        a = _fit_star(science, science_bad, x, y, fwhm)
+        if a is None:
+            continue
+        b = _fit_star(template, template_bad, a[0], a[1], fwhm)
+        if b is None:
+            continue
+        rows.append((a[0], a[1], b[0] - a[0], b[1] - a[1], a[2], b[2]))
+    result = {"star_count": len(rows), "dx": None, "dy": None, "scatter_pixels": None,
+              "shift_scatter_pixels": None, "order": None, "polynomial": None,
+              "science_fwhm_pixels": None, "template_fwhm_pixels": None}
+    if len(rows) < int(subtraction.get("minimum_quality_stars", 3)):
+        return result
+    values = np.asarray(rows, dtype=float)
+    ny, nx = science.shape
+    center, half_size = (0.5 * (nx - 1), 0.5 * (ny - 1)), (0.5 * nx, 0.5 * ny)
+    requested = subtraction.get("registration_order", "auto")
+    fits_by_order = {}
+    for order in range(0, 4):
+        count = (order + 1) * (order + 2) // 2
+        if requested != "auto" and order != int(requested):
+            continue
+        if len(values) < max(3 * count, 3):
+            continue
+        design = np.column_stack(_polynomial_terms(values[:, 0], values[:, 1], order,
+                                                   center, half_size))
+        keep = np.ones(len(values), dtype=bool)
+        for _ in range(5):
+            cx = np.linalg.lstsq(design[keep], values[keep, 2], rcond=None)[0]
+            cy = np.linalg.lstsq(design[keep], values[keep, 3], rcond=None)[0]
+            radial = np.hypot(values[:, 2] - design @ cx, values[:, 3] - design @ cy)
+            scatter = float(1.4826 * np.median(radial[keep]))
+            updated = radial <= 3.0 * max(scatter, 0.05)
+            if np.array_equal(updated, keep) or np.count_nonzero(updated) < max(3 * count, 3):
+                break
+            keep = updated
+        fits_by_order[order] = {
+            "order": order, "coefficients_x": [float(v) for v in cx],
+            "coefficients_y": [float(v) for v in cy], "center": center,
+            "half_size": half_size, "scatter_pixels": scatter,
+            "star_count": int(np.count_nonzero(keep)),
+        }
+    if not fits_by_order:
+        return result
+    best = min(item["scatter_pixels"] for item in fits_by_order.values())
+    chosen = next(item for order, item in sorted(fits_by_order.items())
+                  if item["scatter_pixels"] <= max(1.2 * best, best + 0.05))
+    dx, dy = np.median(values[:, 2]), np.median(values[:, 3])
+    result.update({
+        "dx": float(dx), "dy": float(dy), "order": chosen["order"],
+        "polynomial": chosen,
+        "scatter_pixels": chosen["scatter_pixels"],
+        "shift_scatter_pixels": (fits_by_order.get(0) or {}).get("scatter_pixels"),
+        "science_fwhm_pixels": float(np.median(values[:, 4])),
+        "template_fwhm_pixels": float(np.median(values[:, 5])),
+    })
+    return result
+
+
+def _maximum_offset(pixel_offset, shape, step=32):
+    """Largest |offset| of a registration over the science frame (pixels)."""
+
+    grid_y, grid_x = np.mgrid[0:shape[0]:step, 0:shape[1]:step]
+    dx, dy = _registration_offsets(pixel_offset, grid_x, grid_y)
+    return float(np.max(np.hypot(dx, dy) * np.ones(grid_x.shape)))
+
+
+def register_template_to_science(science_record, template, aligned, quality_stars=None,
+                                 settings=None):
+    """Move the aligned template onto the science stars.
+
+    The WCSs alone can leave the template off the science stars: a fraction
+    of a pixel when the two astrometric frames disagree, and several pixels
+    across the field when the science WCS has a rotation or lacks distortion
+    terms. The offsets are measured on the quality stars
+    (:func:`measure_template_registration`) and the template is resampled
+    again with them; this repeats (``registration_iterations``) because stars
+    that start too far off to be fitted are only picked up once the bulk of
+    the offset is removed.
+
+    Returns ``(aligned, registration, error)``; ``error`` is a message when
+    the offsets exceed ``maximum_registration_shift_arcsec`` (a broken WCS).
+    The registration holds the first measurement (including the seeing of
+    both images on the science grid), the applied polynomials, the residual
+    offsets, and the history of every pass.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    subtraction = settings.get("subtraction", {})
+    shape = np.shape(aligned["data"])
+    scale = _pixel_scale_arcsec(_record_wcs(science_record)) or 1.0
+    minimum = float(subtraction.get("minimum_registration_shift_pixels", 0.05))
+    maximum = float(subtraction.get("maximum_registration_shift_arcsec", 3.0))
+    iterations = int(subtraction.get("registration_iterations", 3))
+    enabled = subtraction.get("register_template", True)
+    polynomials, history, registration, error = [], [], None, None
+    for iteration in range(iterations + 1):
+        measured = measure_template_registration(
+            science_record, aligned, quality_stars, settings)
+        history.append({key: measured.get(key) for key in (
+            "star_count", "dx", "dy", "order", "scatter_pixels", "shift_scatter_pixels")})
+        if registration is None:
+            registration = dict(measured)
+        polynomial = measured["polynomial"]
+        if not enabled or polynomial is None or iteration == iterations:
+            break
+        if _maximum_offset(polynomial, shape) < minimum:
+            break
+        candidate = polynomials + [polynomial]
+        shift = _maximum_offset(candidate, shape)
+        if shift * scale > maximum:
+            error = ("template is up to {:.1f}\" off the science stars (> {:.1f}\"); "
+                     "check the science WCS".format(shift * scale, maximum))
+            break
+        polynomials = candidate
+        aligned = align_template_to_science(
+            science_record, template, settings, pixel_offset=polynomials)
+    registration.update({
+        "applied_offset": polynomials or None,
+        "maximum_shift_pixels": _maximum_offset(polynomials, shape) if polynomials else 0.0,
+        "residual_dx": history[-1]["dx"],
+        "residual_dy": history[-1]["dy"],
+        "residual_scatter_pixels": history[-1]["shift_scatter_pixels"],
+        "history": history,
+    })
+    aligned["registration"] = registration
+    return aligned, registration, error
 
 
 def _seeing_pixels(record, fallback=4.0):
@@ -916,6 +1170,28 @@ def _seeing_pixels(record, fallback=4.0):
     arcsec = _finite_float(quality.get("fwhm_arcsec"))
     scale = _pixel_scale_arcsec(_record_wcs(record))
     return arcsec / scale if arcsec is not None and scale else float(fallback)
+
+
+def _unknown_saturation_level(data, mask, background, rms):
+    """Upper valid level for an image without a saturation value.
+
+    Half the brightest unmasked pixel. Images whose headers lack SATURATE
+    often still have saturated stars (the LDSS3, IMACS and Binospec frames
+    of AT 2019stc have flat-topped cores at 60000-67000 ADU), and
+    nonlinearity sets in below that; half the maximum stays clear of both
+    while keeping all but the brightest stars. The old choice, sky + 500
+    sigma (7400 ADU for AT2019stc_g_wcs), threw away the bright stars
+    Hotpants needs for its kernel fit.
+    """
+
+    values = np.asarray(data, dtype=float)[~np.asarray(mask, dtype=bool)]
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return None
+    level = 0.5 * float(np.max(values))
+    if background is not None and rms is not None:
+        level = max(level, float(background) + 50.0 * float(rms))
+    return level
 
 
 def choose_hotpants_parameters(science_record, template, aligned_template,
@@ -937,7 +1213,16 @@ def choose_hotpants_parameters(science_record, template, aligned_template,
     if template_fwhm is None:
         arcsec = _finite_float((template.get("metadata") or {}).get("fwhm_arcsec"))
         scale = _pixel_scale_arcsec(aligned_template.get("wcs"))
-        template_fwhm = arcsec / scale if arcsec is not None and scale else science_fwhm
+        template_fwhm = arcsec / scale if arcsec is not None and scale else None
+    # Seeing measured on the same stars in both images (science grid) beats
+    # header values: survey templates rarely carry a usable FWHM keyword.
+    measured = aligned_template.get("registration") or {}
+    measured_science = _finite_float(measured.get("science_fwhm_pixels"))
+    measured_template = _finite_float(measured.get("template_fwhm_pixels"))
+    if measured_science is not None and measured_template is not None:
+        science_fwhm, template_fwhm = measured_science, measured_template
+    if template_fwhm is None:
+        template_fwhm = science_fwhm
     science_fwhm = max(float(science_fwhm), 0.5)
     template_fwhm = max(float(template_fwhm), 0.5)
     broader = max(science_fwhm, template_fwhm)
@@ -969,6 +1254,12 @@ def choose_hotpants_parameters(science_record, template, aligned_template,
     stamp_grid = max(3, min(12, int(np.sqrt(science.size) / max(20 * broader, 1))))
     science_saturation = _finite_float((science_record.get("metadata") or {}).get("saturation"))
     template_saturation = _finite_float((template.get("metadata") or {}).get("saturation"))
+    if science_saturation is None:
+        science_saturation = _unknown_saturation_level(
+            science, science_mask, science_background, science_rms)
+    if template_saturation is None:
+        template_saturation = _unknown_saturation_level(
+            template_data, template_mask, template_background, template_rms)
     parameters = {
         "convolve": "template" if template_fwhm <= science_fwhm else "science",
         "science_fwhm_pixels": science_fwhm,
@@ -978,17 +1269,24 @@ def choose_hotpants_parameters(science_record, template, aligned_template,
         "template_background": template_background,
         "science_rms": science_rms,
         "template_rms": template_rms,
-        "science_lower": science_background - 5 * science_rms,
-        "template_lower": template_background - 5 * template_rms,
-        "science_upper": science_saturation or science_background + 500 * science_rms,
-        "template_upper": template_saturation or template_background + 500 * template_rms,
+        # Hotpants rejects every pixel outside [lower, upper] and everything
+        # within a kernel radius of it, so these must bracket the real data:
+        # 10 sigma below the sky, and the saturation level above.
+        "science_lower": science_background - 10 * science_rms,
+        "template_lower": template_background - 10 * template_rms,
+        "science_upper": science_saturation,
+        "template_upper": template_saturation,
         "kernel_radius": kernel_radius,
         "stamp_radius": max(kernel_radius + 3, int(np.ceil(4 * broader))),
         "stamp_grid_x": stamp_grid,
         "stamp_grid_y": stamp_grid,
         "stamps_per_cell": 3,
         "kernel_order": 1,
-        "background_order": 1,
+        # Both inputs are already sky subtracted (redphot's background stage
+        # and the survey pipelines), so only a constant offset is fitted. A
+        # linear term, poorly constrained by the few stamps of a small or
+        # shallow frame, put large gradients into the difference (IMACS, LDSS3).
+        "background_order": 0,
         "gaussian_components": gaussian_components,
     }
     aliases = {
@@ -1117,7 +1415,7 @@ def match_background_and_scale(science_record, aligned_template, settings=None,
 
 def _hotpants_command(executable, science_path, template_path, output_path,
                       parameters, settings, science_mask_path=None,
-                      template_mask_path=None):
+                      template_mask_path=None, output_mask_path=None):
     """Build a shell-free Hotpants command line."""
 
     command = [
@@ -1125,6 +1423,10 @@ def _hotpants_command(executable, science_path, template_path, output_path,
         "-inim", str(science_path), "-tmplim", str(template_path),
         "-outim", str(output_path),
         "-c", "t" if parameters["convolve"] == "template" else "i",
+        # Keep the difference on the science image's photometric system (the
+        # Hotpants default, "t", divides it by the kernel sum and puts it on
+        # the template's), so science zeropoints and noise apply to it.
+        "-n", "i",
         "-il", "{:.8g}".format(parameters["science_lower"]),
         "-iu", "{:.8g}".format(parameters["science_upper"]),
         "-tl", "{:.8g}".format(parameters["template_lower"]),
@@ -1145,8 +1447,23 @@ def _hotpants_command(executable, science_path, template_path, output_path,
         command.extend(["-imi", str(science_mask_path)])
     if template_mask_path is not None:
         command.extend(["-tmi", str(template_mask_path)])
+    if output_mask_path is not None:
+        command.extend(["-omi", str(output_mask_path)])
     command.extend(str(value) for value in settings.get("hotpants", {}).get("extra_arguments", []))
     return command
+
+
+def _hotpants_stamp_count(log):
+    """Number of stamps Hotpants built ("N stamps built"), or None."""
+
+    found = re.findall(r"(\d+) stamps built", str((log or {}).get("stderr") or ""))
+    return int(found[-1]) if found else None
+
+
+# Hotpants output-mask bit for pixels it could not difference (input out of
+# its valid range, masked, or within a kernel radius of either, plus the
+# unconvolved border). Those pixels hold the fill value, not a difference.
+HOTPANTS_OUTPUT_BAD = 0x8000
 
 
 def _run_hotpants(science, aligned_template, header, parameters, settings,
@@ -1169,6 +1486,7 @@ def _run_hotpants(science, aligned_template, header, parameters, settings,
         science_mask_path = directory / "science_mask.fits"
         template_mask_path = directory / "template_mask.fits"
         output_path = directory / "difference.fits"
+        output_mask_path = directory / "difference_mask.fits"
         science_data, science_bad = finite_image_for_external_tool(science)
         template_data, template_bad = finite_image_for_external_tool(aligned_template)
         if science_bad.any():
@@ -1197,7 +1515,7 @@ def _run_hotpants(science, aligned_template, header, parameters, settings,
             template_mask_path = None
         command = _hotpants_command(
             resolved, science_path, template_path, output_path, parameters, settings,
-            science_mask_path, template_mask_path,
+            science_mask_path, template_mask_path, output_mask_path,
         )
         completed = subprocess.run(
             command, capture_output=True, text=True,
@@ -1220,6 +1538,14 @@ def _run_hotpants(science, aligned_template, header, parameters, settings,
         if difference.shape != science.shape or not np.isfinite(difference).any():
             raise RuntimeError("Hotpants produced an invalid difference image")
         difference[science_bad | template_bad] = np.nan
+        if output_mask_path.exists():
+            output_mask = np.asarray(fits.getdata(output_mask_path), dtype=np.int64)
+            if output_mask.shape == difference.shape:
+                hotpants_bad = (output_mask & HOTPANTS_OUTPUT_BAD) != 0
+                difference[hotpants_bad] = np.nan
+                log["hotpants_bad_fraction"] = float(np.mean(hotpants_bad))
+        if not np.isfinite(difference).any():
+            raise RuntimeError("Hotpants flagged every pixel of the difference image as bad")
         log["kernel_header"] = {
             key: output_header[key]
             for key in output_header
@@ -1278,8 +1604,19 @@ def _aperture_sum(data, x, y, radius, mask=None):
     return float(np.sum(values[good])) if np.count_nonzero(good) >= 3 else None
 
 
+_QUALITY_ROLES = ("role_qc_anchor", "role_calibration", "role_psf")
+
+
 def _quality_positions(science_record, quality_stars):
-    """Select finite detector positions for non-variable quality stars."""
+    """Select finite detector positions for non-variable quality stars.
+
+    ``quality_stars`` is a star table with ``x``/``y`` on the science grid
+    (the pipeline passes the star-selection measurements). Rows of other
+    images are skipped. When the table has role columns, only stars with a
+    QC-anchor, calibration, or PSF role are used (these are unsaturated,
+    isolated, catalog-matched stars); a table without role columns is used
+    as given.
+    """
 
     if quality_stars is None:
         quality_stars = science_record.get("measurements")
@@ -1287,25 +1624,64 @@ def _quality_positions(science_record, quality_stars):
         return []
     positions = []
     image_id = _image_id(science_record)
+    names = list(getattr(quality_stars, "colnames", []))
+    roles = [name for name in _QUALITY_ROLES if name in names]
+    if "source_id" in names:
+        id_column = "source_id"
+    elif "persistent_id" in names:
+        id_column = "persistent_id"
+    else:
+        id_column = None
     for row in quality_stars:
-        names = getattr(row, "colnames", [])
         if "image_id" in names and str(row["image_id"]) != image_id:
             continue
-        role_ok = True
-        for name in ("role_qc_anchor", "role_calibration", "role_psf"):
-            if name in names and bool(row[name]):
-                role_ok = True
-                break
+        if roles and not any(
+            not np.ma.is_masked(row[name]) and bool(row[name]) for name in roles
+        ):
+            continue
         x = _finite_float(row["x"] if "x" in names else None)
         y = _finite_float(row["y"] if "y" in names else None)
-        if role_ok and x is not None and y is not None:
-            positions.append((x, y, str(row["source_id"]) if "source_id" in names else None))
+        if x is not None and y is not None:
+            positions.append((x, y, str(row[id_column]) if id_column else None))
+    return positions
+
+
+def _blank_positions(shape, avoid, radius, count, seed):
+    """Random aperture centers at least ``radius`` from the edges and off ``avoid``."""
+
+    rng = np.random.default_rng(int(seed))
+    positions = []
+    attempts = 0
+    while len(positions) < count and attempts < count * 30:
+        attempts += 1
+        x = rng.uniform(radius, shape[1] - radius - 1)
+        y = rng.uniform(radius, shape[0] - radius - 1)
+        if not avoid[int(round(y)), int(round(x))]:
+            positions.append((x, y))
     return positions
 
 
 def evaluate_subtraction(science_record, aligned_template, difference,
-                         settings=None, quality_stars=None):
-    """Evaluate residuals, dipoles, flux bias, background, and blank noise."""
+                         settings=None, quality_stars=None, template_scale=None):
+    """Evaluate residuals, dipoles, flux bias, background, and blank noise.
+
+    For every quality star (``quality_stars``, see :func:`_quality_positions`)
+    inside an aperture of 1.5 FWHM:
+
+    * ``residual_fraction`` = |difference flux| / science flux;
+    * ``dipole_fraction`` = |first moment of the difference about the star| /
+      (science flux x FWHM): the misregistration between science and
+      matched template in units of the FWHM (a symmetric ring from a
+      seeing mismatch has no first moment). Only stars whose dipole is
+      measured to better than ``dipole_maximum_noise_fraction`` enter the
+      median.
+
+    ``noise_ratio`` compares random blank apertures (off every detected
+    source) in the difference with the noise expected there: the same
+    apertures in the science image, plus (when ``template_scale``, the
+    science / template flux ratio, is given) in the template scaled to the
+    science, added in quadrature.
+    """
 
     if settings is None:
         settings = get_default_settings()
@@ -1314,64 +1690,96 @@ def evaluate_subtraction(science_record, aligned_template, difference,
     difference = np.asarray(difference, dtype=float)
     mask = _record_mask(science_record, science.shape) | np.asarray(
         aligned_template["mask"], dtype=bool
-    ) | ~np.isfinite(difference)
+    ) | ~np.isfinite(difference) | ~np.isfinite(science)
     background, rms = _robust_location_scale(difference[~mask])
-    _, science_rms = _robust_location_scale(science[~mask])
+    science_center, science_rms = _robust_location_scale(science[~mask])
+    science_center = science_center or 0.0
     positions = _quality_positions(science_record, quality_stars)
     fwhm = _seeing_pixels(science_record)
     radius = max(2.0, 1.5 * fwhm)
+    noise_limit = float(subtraction.get("dipole_maximum_noise_fraction", 0.05))
     rows = []
-    residual_fractions = []
-    dipoles = []
     for x, y, source_id in positions:
-        science_flux = _aperture_sum(science, x, y, radius, mask)
-        residual_flux = _aperture_sum(difference, x, y, radius, mask)
-        if science_flux is None or residual_flux is None or science_flux == 0:
+        y0 = max(0, int(np.floor(y - radius)))
+        y1 = min(science.shape[0], int(np.ceil(y + radius)) + 1)
+        x0 = max(0, int(np.floor(x - radius)))
+        x1 = min(science.shape[1], int(np.ceil(x + radius)) + 1)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        good = ((xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2) & ~mask[y0:y1, x0:x1]
+        if np.count_nonzero(good) < 3:
             continue
-        residual_fraction = abs(residual_flux / science_flux)
-        y0, y1 = max(0, int(y - radius)), min(science.shape[0], int(y + radius) + 1)
-        x0, x1 = max(0, int(x - radius)), min(science.shape[1], int(x + radius) + 1)
-        patch = difference[y0:y1, x0:x1]
-        threshold = 3.0 * (rms or 0.0)
-        positive = np.count_nonzero(patch > threshold)
-        negative = np.count_nonzero(patch < -threshold)
-        dipole = min(positive, negative) / max(positive + negative, 1)
-        residual_fractions.append(residual_fraction)
-        dipoles.append(dipole)
-        rows.append((source_id, x, y, science_flux, residual_flux, residual_fraction, dipole))
+        # Stars with masked (e.g. saturated) or unsubtracted pixels in the
+        # aperture do not measure the subtraction.
+        if np.count_nonzero(good) < 0.9 * np.pi * radius ** 2:
+            continue
+        star = science[y0:y1, x0:x1][good] - science_center
+        residual = difference[y0:y1, x0:x1][good]
+        science_flux = float(np.sum(star))
+        if not np.isfinite(science_flux) or science_flux <= 0:
+            continue
+        residual_flux = float(np.sum(residual))
+        moment_x = float(np.sum(residual * (xx[good] - x)))
+        moment_y = float(np.sum(residual * (yy[good] - y)))
+        dipole = float(np.hypot(moment_x, moment_y) / (science_flux * fwhm))
+        spread = float(np.sqrt(np.sum((xx[good] - x) ** 2 + (yy[good] - y) ** 2) / 2.0))
+        dipole_noise = (rms or 0.0) * spread / (science_flux * fwhm)
+        rows.append((source_id, x, y, science_flux, residual_flux,
+                     abs(residual_flux / science_flux), dipole, dipole_noise))
     table = Table(
         rows=rows,
         names=("source_id", "x", "y", "science_flux", "residual_flux",
-               "residual_fraction", "dipole_fraction"),
+               "residual_fraction", "dipole_fraction", "dipole_noise"),
         masked=True,
     )
-    count = int(subtraction.get("blank_aperture_count", 50))
-    rng = np.random.default_rng(int(subtraction.get("blank_aperture_seed", 12345)))
-    blank = []
-    source_mask = mask.copy()
+    # Blank apertures: off the quality stars and off every detected source.
+    avoid = mask.copy()
+    yy, xx = np.ogrid[:science.shape[0], :science.shape[1]]
     for x, y, _ in positions:
-        yy, xx = np.ogrid[:science.shape[0], :science.shape[1]]
-        source_mask |= (xx - x) ** 2 + (yy - y) ** 2 <= (3 * fwhm) ** 2
-    attempts = 0
-    while len(blank) < count and attempts < count * 30:
-        attempts += 1
-        x = rng.uniform(radius, science.shape[1] - radius)
-        y = rng.uniform(radius, science.shape[0] - radius)
-        if source_mask[int(round(y)), int(round(x))]:
+        avoid |= (xx - x) ** 2 + (yy - y) ** 2 <= (3 * fwhm) ** 2
+    products = science_record.get("background_products") or {}
+    for name in ("detected_source_mask", "protected_source_mask"):
+        value = products.get(name)
+        if isinstance(value, np.ndarray) and value.shape == science.shape:
+            avoid |= ndimage.binary_dilation(np.asarray(value, dtype=bool),
+                                             iterations=max(1, int(np.ceil(radius))))
+    blank_positions = _blank_positions(
+        science.shape, avoid, radius, int(subtraction.get("blank_aperture_count", 50)),
+        subtraction.get("blank_aperture_seed", 12345))
+    template_data = np.asarray(aligned_template.get("data"), dtype=float) \
+        if aligned_template.get("data") is not None else None
+    scale = _finite_float(template_scale)
+    if template_data is not None and template_data.shape == science.shape and scale is not None:
+        template_center, _ = _robust_location_scale(template_data[~mask])
+        scaled_template = scale * (template_data - (template_center or 0.0))
+    else:
+        scaled_template = None
+    blank, science_blank, template_blank = [], [], []
+    for x, y in blank_positions:
+        flux = _aperture_sum(difference, x, y, radius, avoid)
+        reference = _aperture_sum(science - science_center, x, y, radius, avoid)
+        if flux is None or reference is None:
             continue
-        flux = _aperture_sum(difference, x, y, radius, source_mask)
-        if flux is not None:
-            blank.append(flux)
+        blank.append(flux)
+        science_blank.append(reference)
+        if scaled_template is not None:
+            value = _aperture_sum(scaled_template, x, y, radius, avoid)
+            if value is not None:
+                template_blank.append(value)
     _, blank_rms = _robust_location_scale(blank)
-    expected_noise = None
-    if science_rms is not None:
-        expected_noise = science_rms * np.sqrt(np.pi * radius ** 2)
+    _, science_noise = _robust_location_scale(science_blank)
+    _, template_noise = _robust_location_scale(template_blank)
+    if science_noise is None and science_rms is not None:
+        science_noise = science_rms * np.sqrt(np.pi * radius ** 2)
+    expected_noise = science_noise
+    if science_noise is not None and template_noise is not None:
+        expected_noise = float(np.hypot(science_noise, template_noise))
     noise_ratio = (
         blank_rms / expected_noise
         if blank_rms is not None and expected_noise not in {None, 0.0} else None
     )
-    residual = float(np.median(residual_fractions)) if residual_fractions else None
-    dipole = float(np.median(dipoles)) if dipoles else None
+    residual = float(np.median(table["residual_fraction"])) if len(table) else None
+    measured = [row for row in rows if row[7] <= noise_limit]
+    dipole = float(np.median([row[6] for row in measured])) if measured else None
     flux_bias = (
         abs(float(np.median([row[4] for row in rows])))
         / max(float(np.median(np.abs([row[3] for row in rows]))), 1.0e-12)
@@ -1380,7 +1788,7 @@ def evaluate_subtraction(science_record, aligned_template, difference,
     flags = []
     minimum = int(subtraction.get("minimum_quality_stars", 3))
     if len(rows) < minimum:
-        flags.append("SUBTRACTION_RESIDUAL_HIGH")
+        flags.append("SUBTRACTION_TOO_FEW_STARS")
     if residual is not None and residual > float(subtraction.get("maximum_residual_fraction", 0.10)):
         flags.append("SUBTRACTION_RESIDUAL_HIGH")
     if dipole is not None and dipole > float(subtraction.get("maximum_dipole_fraction", 0.20)):
@@ -1396,8 +1804,12 @@ def evaluate_subtraction(science_record, aligned_template, difference,
         "background_rms": rms,
         "median_residual_fraction": residual,
         "median_dipole_fraction": dipole,
+        "dipole_star_count": len(measured),
         "flux_bias_fraction": flux_bias,
         "blank_aperture_rms": blank_rms,
+        "science_blank_aperture_rms": science_noise,
+        "template_blank_aperture_rms": template_noise,
+        "expected_blank_aperture_rms": expected_noise,
         "blank_aperture_count": len(blank),
         "noise_ratio": noise_ratio,
         "star_residuals": table,
@@ -1440,6 +1852,17 @@ def perform_image_subtraction(science_record, template, settings=None,
         if aligned["coverage_fraction"] < float(subtraction.get("minimum_coverage_fraction", 0.99)):
             result["flags"].append("TEMPLATE_COVERAGE_INCOMPLETE")
             return result
+        aligned, registration, error = register_template_to_science(
+            science_record, template, aligned, quality_stars, settings)
+        result["aligned_template"] = aligned
+        result["registration"] = registration
+        if error is not None:
+            result["flags"].append("TEMPLATE_ALIGNMENT_FAILED")
+            result["error"] = error
+            return result
+        if aligned["coverage_fraction"] < float(subtraction.get("minimum_coverage_fraction", 0.99)):
+            result["flags"].append("TEMPLATE_COVERAGE_INCOMPLETE")
+            return result
         parameters = choose_hotpants_parameters(science_record, template, aligned, settings)
         scale_match = match_background_and_scale(
             science_record, aligned, settings, quality_stars
@@ -1462,6 +1885,24 @@ def perform_image_subtraction(science_record, template, settings=None,
                         science, aligned["data"], header, parameters, subtraction,
                         _record_mask(science_record, science.shape), aligned["mask"],
                     )
+                    # A spatially varying kernel needs stamps all over the
+                    # frame; with only a few (small or shallow fields) it is
+                    # unconstrained, so fit one kernel for the whole frame.
+                    stamps = _hotpants_stamp_count(log)
+                    minimum_stamps = int(subtraction.get("minimum_stamps_for_varying_kernel", 30))
+                    if stamps is not None and stamps < minimum_stamps and \
+                            int(parameters["kernel_order"]) > 0 and \
+                            subtraction.get("hotpants", {}).get("kernel_order", "auto") == "auto":
+                        parameters["kernel_order_requested"] = parameters["kernel_order"]
+                        parameters["kernel_order"] = 0
+                        difference, log = _run_hotpants(
+                            science, aligned["data"], header, parameters, subtraction,
+                            _record_mask(science_record, science.shape), aligned["mask"],
+                        )
+                        log["kernel_order_reason"] = (
+                            "{} stamps < {}: spatially constant kernel".format(
+                                stamps, minimum_stamps))
+                    log["stamp_count"] = _hotpants_stamp_count(log)
                 elif method == "pyzogy":
                     matched_template = aligned["data"]
                     if subtraction.get("photometric_scale", True):
@@ -1488,7 +1929,8 @@ def perform_image_subtraction(science_record, template, settings=None,
             result["error"] = "; ".join(errors)
             return result
         quality = evaluate_subtraction(
-            science_record, aligned, result["difference"], settings, quality_stars
+            science_record, aligned, result["difference"], settings, quality_stars,
+            template_scale=scale_match.get("scale"),
         )
         result["quality"] = quality
         result["flags"].extend(quality["flags"])

@@ -410,7 +410,16 @@ each tile's cutouts are mosaicked onto one tangent-plane grid (no finer than
 half the science pixel scale). Tile mosaics and the aligned template are derived
 products. Template coverage, filter, depth, seeing, saturation, WCS, and
 pre-transient date are checked. The science grid remains fixed and only the
-template is resampled.
+template is resampled. The WCSs alone can leave the template off the science
+stars (a few tenths of an arcsecond between astrometric frames, more across
+the field when a science WCS has a rotation error or no distortion terms), so
+the quality stars are fitted with Gaussians in both images, the offsets are
+fitted with a polynomial in x and y (order 0-3, the lowest that fits about as
+well as any), and the template is resampled again onto the science stars
+(``subtraction.register_template``; a few passes, so stars that start too far
+off are picked up). Offsets beyond ``maximum_registration_shift_arcsec`` fail
+the image as ``TEMPLATE_ALIGNMENT_FAILED``. The same fits give the seeing of
+both images on the science grid, which sets the Hotpants kernel.
 
 Robust matched pixels determine a photometric scale and additive background.
 For Hotpants, the approximate Gaussian matching width is
@@ -423,13 +432,25 @@ and the sharper image is convolved toward the broader PSF. The default kernel
 basis uses Gaussian widths near :math:`0.5\sigma_K`, :math:`\sigma_K`, and
 :math:`2\sigma_K`, with polynomial orders decreasing for broader components.
 Kernel support, thresholds, masks, and saturation are derived from the measured
-seeing and noise but remain configurable. The checked subprocess records its
-exact command, parameters, stdout, and stderr. PyZOGY can be selected when its
+seeing and noise but remain configurable: valid data run from 10 sigma below
+the sky to the saturation level (half the brightest pixel when the header has
+none); only a constant background offset is fitted, since both inputs are sky
+subtracted; and the kernel varies linearly over the frame only when Hotpants
+finds at least ``minimum_stamps_for_varying_kernel`` stamps. Hotpants runs with
+``-n i``, so the difference stays on the science image's photometric system,
+and pixels its output mask marks as not differenced are set to NaN. The checked
+subprocess records its exact command, parameters, stdout, and stderr. PyZOGY can be selected when its
 required variance and PSF inputs and a configured runner are available.
 
-A generated difference is not automatically accepted. Stellar residuals,
-positive/negative dipoles, flux conservation, residual background, and
-blank-aperture noise determine PASS/WARN/FAIL. Difference photometry then uses
+A generated difference is not automatically accepted. On the quality stars of
+the star selection (QC, calibration, or PSF role) within 1.5 FWHM: the residual
+fraction (difference flux / science flux), the dipole (first moment of the
+residual / (science flux x FWHM), i.e. the misregistration in FWHM, from stars
+where it is measured to better than ``dipole_maximum_noise_fraction``), and the
+flux bias; and the noise ratio of random blank apertures off every detected
+source, difference versus the science and scaled template apertures added in
+quadrature. Fewer than ``minimum_quality_stars`` measurable stars is
+``SUBTRACTION_TOO_FEW_STARS``. These determine PASS/FAIL. Difference photometry then uses
 the same fixed coordinate, methods, signed-flux schema, and limits as science
 photometry. Preferred-result rules retain all alternatives and explicitly mark
 whether host light is included.

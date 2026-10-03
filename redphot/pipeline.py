@@ -2541,10 +2541,15 @@ def _run_subtraction(context, image_id, settings):
     template = templates.get(filter_name, templates.get("default"))
     if template is None:
         raise ValueError("No template is available for filter {}".format(filter_name))
+    shared = context.get("shared", {})
+    # Stars used to check the subtraction (residuals, scale, template seeing):
+    # the star-selection table (x, y on each science grid, with roles) unless
+    # the caller supplied its own.
+    quality_stars = shared.get("quality_stars")
+    if quality_stars is None:
+        quality_stars = (shared.get("star_selection") or {}).get("measurements")
     return perform_image_subtraction(
-        record, template, settings,
-        context.get("shared", {}).get("quality_stars"),
-        context.get("shared", {}).get("pyzogy_runner"),
+        record, template, settings, quality_stars, shared.get("pyzogy_runner"),
     )
 
 
