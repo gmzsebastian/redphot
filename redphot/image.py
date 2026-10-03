@@ -430,6 +430,24 @@ def _combined_header(hdulist, index):
     return header
 
 
+def _sip_consistent_header(header):
+    """Mark SIP distortion in CTYPE when a header has SIP terms but no ``-SIP``.
+
+    astropy applies such SIP coefficients anyway, but logs a long INFO message
+    every time the WCS is built or written; declaring them makes the WCS
+    internally consistent (and the logs readable) without changing it.
+    """
+
+    if "A_ORDER" not in header or "B_ORDER" not in header:
+        return header
+    for key in ("CTYPE1", "CTYPE2"):
+        value = str(header.get(key, ""))
+        if value and not value.upper().endswith("-SIP") and value[:4].upper() in {
+                "RA--", "DEC-", "GLON", "GLAT", "ELON", "ELAT"}:
+            header[key] = value + "-SIP"
+    return header
+
+
 def _wcs_for_data_hdu(hdulist, data_index, header_index, search_order):
     """Find a usable celestial WCS for a science array."""
 
@@ -455,7 +473,7 @@ def _wcs_for_data_hdu(hdulist, data_index, header_index, search_order):
             )
 
         try:
-            candidate = WCS(header, relax=True)
+            candidate = WCS(_sip_consistent_header(header), relax=True)
             if candidate.has_celestial:
                 return candidate.celestial, index
         except Exception:
@@ -1031,7 +1049,7 @@ def read_fits_image(path, settings=None, target=None):
 
         array = np.array(_numeric_2d_array(hdulist[data_index]), copy=True)
         original_dtype = str(array.dtype)
-        header = _combined_header(hdulist, data_index)
+        header = _sip_consistent_header(_combined_header(hdulist, data_index))
         unit = _data_unit(header)
 
         mask = None

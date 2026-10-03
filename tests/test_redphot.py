@@ -1317,3 +1317,32 @@ def test_profile_found_in_the_header_applies_its_fallback_values(tmp_path):
     assert image["settings"]["instrument"]["profile"] == "keplercam"
     assert image["record"]["metadata"]["saturation"] == pytest.approx(50000.0)
     assert image["record"]["metadata"]["gain"] == pytest.approx(4.45)
+
+
+def test_relative_alignment_accepts_wcs_with_different_frames():
+    """Regression: FK5/obstime WCS (IMACS) vs ICRS reference made astropy refuse offsets."""
+
+    from redphot.alignment import _relative_match_table
+
+    shape = (100, 100)
+    reference_header = _wcs_header(shape)
+    reference_header["RADESYS"] = "ICRS"
+    other_header = _wcs_header(shape)
+    other_header["RADESYS"] = "FK5"
+    other_header["EQUINOX"] = 2000.0
+    other_header["MJD-OBS"] = 58848.0
+    rows = Table({"persistent_id": ["a", "b", "c"], "x": [10.0, 50.0, 80.0],
+                  "y": [20.0, 60.0, 30.0]})
+    table = _relative_match_table(rows, rows, WCS(other_header), WCS(reference_header))
+    assert len(table) == 3
+    assert np.all(np.abs(np.asarray(table["residual_ra_original_arcsec"])) < 0.1)
+
+
+def test_sip_terms_without_sip_ctype_are_declared(tmp_path):
+    from redphot.image import _sip_consistent_header
+
+    header = _wcs_header((50, 50))
+    header.update({"A_ORDER": 2, "B_ORDER": 2, "A_2_0": 1e-7, "B_0_2": 1e-7})
+    fixed = _sip_consistent_header(header.copy())
+    assert fixed["CTYPE1"] == "RA---TAN-SIP" and fixed["CTYPE2"] == "DEC--TAN-SIP"
+    assert _sip_consistent_header(_wcs_header((50, 50)))["CTYPE1"] == "RA---TAN"

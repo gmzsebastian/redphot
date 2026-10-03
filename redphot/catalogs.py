@@ -2603,7 +2603,7 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
         calibration_selected = _spatially_distributed_selection(
             image_table,
             calibration_candidates,
-            int(star_settings.get("maximum_calibration_stars", 100)),
+            int(star_settings.get("maximum_calibration_stars", 200)),
             grid,
             calibration_score,
         )

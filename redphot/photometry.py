@@ -2267,7 +2267,7 @@ def _solve_zeropoint_group(records, indices, unstable_pairs, settings):
         if record["input_accepted"] and record["individual_zeropoint"] is not None:
             usable.append(index)
     usable.sort(key=lambda index: -(records[index]["snr"] or 0.0))
-    usable = usable[: int(calibration.get("maximum_stars", 100))]
+    usable = usable[: int(calibration.get("maximum_stars", 200))]
     inlier = np.ones(len(usable), dtype=bool)
     sigma = float(calibration.get("sigma_clip", 3.0))
     for _ in range(int(calibration.get("maximum_iterations", 5))):

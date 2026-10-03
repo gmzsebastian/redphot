@@ -2511,8 +2511,9 @@ def plot_alignment_check(check, output_path=None, show=False, status=None, setti
     n_src = len(sources)
     rows, columns = (n_src, len(shown) + 1) if across else (len(shown) + 1, n_src)
     panel = 1.45
-    width = max(9.0, columns * panel + 1.2)
-    height = rows * panel + 1.6
+    # Wide enough for the header line and the image names on the left.
+    width = max(12.0, columns * panel + (1.2 if across else 2.6))
+    height = rows * panel + 1.8
     ratios = {}
     half = float(check.get("half_size_arcsec") or 6.0)
     step = float(check.get("step_arcsec") or 0.5)
@@ -2530,8 +2531,8 @@ def plot_alignment_check(check, output_path=None, show=False, status=None, setti
     figure, grid = _new_figure(
         "Alignment check", subtitle, status,
         "each source sits on the teal crosshair in every image and the centroids (+) "
-        "cluster tightly in the summary panel; a pattern of offsets that changes "
-        "across the field means a rotation or scale error.",
+        "cluster tightly in the Σ panels; offsets that change across the field mean a "
+        "rotation or scale error.",
         size=(width, height), rows=rows, columns=columns, **ratios,
     )
     for source_index, source in enumerate(sources):

@@ -16,7 +16,7 @@ from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.table import MaskedColumn, Table
 from astropy.wcs.utils import proj_plane_pixel_scales
 
-from .catalogs import refine_wcs_from_matches
+from .catalogs import _plain_icrs, refine_wcs_from_matches
 from .config import get_default_settings
 
 
@@ -150,9 +150,12 @@ def _relative_match_table(current_rows, reference_rows, current_wcs, reference_w
     reference_y = np.asarray(
         [float(reference_lookup[key]["y"]) for key in common]
     )
-    reference_sky = reference_wcs.pixel_to_world(reference_x, reference_y).icrs
+    # Plain ICRS positions: WCS from different instruments attach different
+    # frame attributes (FK5 equinox, observation time), and offsets between
+    # coordinates that differ in those attributes are refused by astropy.
+    reference_sky = _plain_icrs(reference_wcs.pixel_to_world(reference_x, reference_y))
     expected_x, expected_y = current_wcs.world_to_pixel(reference_sky)
-    measured_sky = current_wcs.pixel_to_world(x, y).icrs
+    measured_sky = _plain_icrs(current_wcs.pixel_to_world(x, y))
     longitude, latitude = measured_sky.spherical_offsets_to(reference_sky)
     separation = measured_sky.separation(reference_sky)
     table["persistent_id"] = common
@@ -742,7 +745,7 @@ def _coordinate_prior(image_records, settings, prior=None):
     """Resolve a user/discovery or metadata coordinate prior."""
 
     if isinstance(prior, SkyCoord):
-        return prior.icrs, "supplied_prior"
+        return _plain_icrs(prior), "supplied_prior"
     if prior is not None:
         if isinstance(prior, dict):
             ra, dec = prior.get("ra"), prior.get("dec")
@@ -880,7 +883,7 @@ def _centroid_candidate(data, wcs, prior, fwhm_pixels, settings, source,
     ellipticity = 1.0 - minor_sigma / major_sigma if major_sigma > 0 else 1.0
     global_x = centroid_x + x0
     global_y = centroid_y + y0
-    coordinate = wcs.pixel_to_world(global_x, global_y).icrs
+    coordinate = _plain_icrs(wcs.pixel_to_world(global_x, global_y))
     offset = float(prior.separation(coordinate).arcsec)
     aperture_noise = float(rms) * np.sqrt(np.count_nonzero(aperture))
     snr = total / aperture_noise if aperture_noise > 0 else None
@@ -1523,7 +1526,16 @@ def select_alignment_check_sources(image_records, alignments, measurements, mast
         candidates.append({
             "name": identity, "kind": "star", "ra_deg": ra, "dec_deg": dec,
             "snr": float(np.median(entry["snr"])), "u": u_value, "v": v_value,
+            "coverage": entry["accepted"] / float(len(used_ids)),
         })
+    # Prefer stars measured in as many images as possible, so each one can be
+    # checked in (nearly) all of them: mixed instruments have different fields
+    # of view. Use the highest coverage that still leaves a choice of stars.
+    for level in sorted({item["coverage"] for item in candidates}, reverse=True):
+        common = [item for item in candidates if item["coverage"] >= level]
+        if len(common) >= 2 * count:
+            candidates = common
+            break
     # Bright enough for a precise centroid, but not the brightest (closest to
     # saturation): keep the upper-middle part of the S/N distribution.
     if len(candidates) > 4 * count:
@@ -1677,8 +1689,7 @@ def build_alignment_check(image_records, alignments, sources, settings=None):
                 measured = _native_centroid(data, mask, x, y, image["fwhm_pixels"])
                 if measured is not None:
                     mx, my, significance = measured
-                    measured_sky = image["wcs"].pixel_to_world(mx, my).icrs
-                    sky = SkyCoord(measured_sky.ra, measured_sky.dec, frame="icrs")
+                    sky = _plain_icrs(image["wcs"].pixel_to_world(mx, my))
                     east, north = center.spherical_offsets_to(sky)
                     entry.update({
                         "dx_arcsec": float(east.to_value(u.arcsec)),

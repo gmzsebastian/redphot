@@ -676,7 +676,10 @@ DEFAULT_SETTINGS = {
             "calibration_minimum_snr": 10.0,
             "ensemble_minimum_snr": 15.0,
             "qc_minimum_snr": 50.0,
-            "maximum_calibration_stars": 100,
+            # Zeropoint ("calibration" role) stars per image, spread over the
+            # field; the highest-S/N candidates win, so a small number only
+            # covers the bright end of the magnitude range.
+            "maximum_calibration_stars": 200,
             "maximum_ensemble_stars": 50,
             "maximum_qc_anchors": 1,
             "spatial_grid": [3, 3],
@@ -957,7 +960,9 @@ DEFAULT_SETTINGS = {
             "user": "user",
         },
         "minimum_stars": 3,
-        "maximum_stars": 100,
+        # Most stars used in one zeropoint fit (highest S/N first); matches
+        # comparison_stars.maximum_calibration_stars.
+        "maximum_stars": 200,
         "minimum_star_snr": 10.0,
         "maximum_catalog_error_mag": 0.10,
         "allow_missing_catalog_error": True,
@@ -2025,7 +2030,7 @@ def validate_settings(settings):
     calibration_settings = settings["calibration"]
     if int(calibration_settings.get("minimum_stars", 3)) < 1:
         raise ValueError("calibration.minimum_stars must be positive")
-    if int(calibration_settings.get("maximum_stars", 100)) < int(
+    if int(calibration_settings.get("maximum_stars", 200)) < int(
         calibration_settings.get("minimum_stars", 3)
     ):
         raise ValueError(
