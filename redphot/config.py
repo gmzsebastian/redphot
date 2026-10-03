@@ -1492,6 +1492,13 @@ def normalize_filter_name(filter_name):
     """
     Convert a raw filter name to a standard redphot filter name.
 
+    Names are looked up in ``FILTER_ALIASES`` as written, with ``_`` and
+    spaces read as ``-``, and (for names longer than one character) in lower
+    case. If that fails, the words "filter" and "band" and primes are dropped
+    and the lookup is repeated, so "g_filter", "Filter r", "i-band" and "g'"
+    are accepted. Single letters keep their case ("r" is Sloan r, "R" is
+    Cousins R).
+
     Unrecognized filter names are returned unchanged so that the caller can
     decide whether to accept, override, or reject them.
     """
@@ -1512,6 +1519,17 @@ def normalize_filter_name(filter_name):
         lower_value = normalized.lower()
         if lower_value in FILTER_ALIASES:
             return FILTER_ALIASES[lower_value]
+
+    words = [
+        word for word in normalized.replace("'", "").split("-")
+        if word and word.lower() not in ("filter", "band")
+    ]
+    stripped = "-".join(words)
+    if stripped and stripped != normalized:
+        if stripped in FILTER_ALIASES:
+            return FILTER_ALIASES[stripped]
+        if len(stripped) > 1 and stripped.lower() in FILTER_ALIASES:
+            return FILTER_ALIASES[stripped.lower()]
 
     return value
 

@@ -17,7 +17,12 @@ from astropy.nddata import CCDData
 from astropy.table import Table
 from astropy.wcs import WCS
 
-from redphot.config import get_default_settings, resolve_settings, validate_settings
+from redphot.config import (
+    get_default_settings,
+    normalize_filter_name,
+    resolve_settings,
+    validate_settings,
+)
 from redphot.image import (
     apply_cosmic_rays,
     assess_image_quality_batch,
@@ -455,6 +460,19 @@ def test_output_profiles_and_traceable_core_products(tmp_path):
 
 def test_default_configuration_is_valid():
     validate_settings(get_default_settings())
+
+
+def test_filter_names_with_filter_or_band_words_are_recognized():
+    for raw, expected in [
+        ("g_filter", "g"), ("Filter r", "r"), ("FILTER_i", "i"), ("z-band", "z"),
+        ("g'", "g"), ("Sloan_r_filter", "r"), ("R_filter", "R"), ("Bessell_V_filter", "V"),
+    ]:
+        assert normalize_filter_name(raw) == expected, raw
+    # Single letters keep their case and unknown names come back unchanged.
+    assert normalize_filter_name("r") == "r"
+    assert normalize_filter_name("R") == "R"
+    assert normalize_filter_name("filter") == "filter"
+    assert normalize_filter_name("Halpha_filter") == "Halpha_filter"
 
 
 def test_pipeline_applies_instrument_filter_and_image_precedence(tmp_path):
