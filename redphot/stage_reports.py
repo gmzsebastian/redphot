@@ -570,7 +570,7 @@ def stage_figure(state, context, stage, image_id=None):
     if stage == "background":
         return plots.plot_background_diagnostics(_input_ccd(context, image_id, stage),
                                                  product.get("products"), product.get("info"),
-                                                 metadata, status=status)
+                                                 metadata, status=status, settings=settings)
     if stage == "source_quality":
         return plots.plot_image_quality_diagnostics(_output_ccd(context, image_id, "background"),
                                                     product.get("sources"), product.get("segmentation"),

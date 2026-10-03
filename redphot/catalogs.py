@@ -1513,6 +1513,100 @@ def _record_shape(record):
     return int(shape[0]), int(shape[1])
 
 
+def quick_aperture_fluxes(record, x, y, fwhm, settings=None):
+    """Fixed-aperture fluxes of stars with a local sky annulus.
+
+    Detection (segment) fluxes stop where a star drops below the detection
+    threshold, so faint stars lose a larger fraction of their light than
+    bright ones. Aperture fluxes in a radius tied to the seeing do not have
+    that bias, so they are used for the quick zeropoint and its diagnostics.
+    Two radii are measured: a small one
+    (``image_quality.usability.quick_aperture_fwhm`` × FWHM) for good S/N and
+    a large one (``quick_aperture_correction_fwhm`` × FWHM) used to derive the
+    aperture correction from bright stars. The sky is the sigma-clipped median
+    in an annulus of ``quick_sky_annulus_fwhm`` × FWHM. Stars with more than
+    10% of either aperture masked get ``NaN``.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        ``aperture_flux``, ``aperture_flux_error``, ``aperture_flux_large``
+        (all in image units) and ``aperture_radius_pixels``.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    y = np.atleast_1d(np.asarray(y, dtype=float))
+    count = x.size
+    result = {
+        "aperture_flux": np.full(count, np.nan),
+        "aperture_flux_error": np.full(count, np.nan),
+        "aperture_flux_large": np.full(count, np.nan),
+        "aperture_radius_pixels": np.full(count, np.nan),
+    }
+    ccd = (record or {}).get("ccd")
+    if ccd is None or count == 0 or fwhm is None:
+        return result
+    fwhm = float(fwhm)
+    if not np.isfinite(fwhm) or fwhm <= 0:
+        return result
+    from astropy.stats import SigmaClip
+    from photutils.aperture import (
+        ApertureStats,
+        CircularAnnulus,
+        CircularAperture,
+        aperture_photometry,
+    )
+
+    usability = settings.get("image_quality", {}).get("usability", {})
+    small_radius = float(usability.get("quick_aperture_fwhm", 1.5)) * fwhm
+    large_radius = float(usability.get("quick_aperture_correction_fwhm", 4.0)) * fwhm
+    inner, outer = usability.get("quick_sky_annulus_fwhm", [5.0, 7.0])
+    data = np.asarray(ccd.data, dtype=float)
+    mask = ~np.isfinite(data)
+    if getattr(ccd, "mask", None) is not None:
+        mask |= np.asarray(ccd.mask, dtype=bool)
+    positions = np.column_stack([x, y])
+    annulus = CircularAnnulus(positions, float(inner) * fwhm, float(outer) * fwhm)
+    sky_stats = ApertureStats(
+        data, annulus, mask=mask, sigma_clip=SigmaClip(sigma=3.0, maxiters=5)
+    )
+    sky = np.atleast_1d(np.asarray(sky_stats.median, dtype=float))
+    sky_std = np.atleast_1d(np.asarray(sky_stats.std, dtype=float))
+    sky_pixels = np.atleast_1d(np.asarray(sky_stats.sum_aper_area.value, dtype=float))
+    apertures = [CircularAperture(positions, small_radius),
+                 CircularAperture(positions, large_radius)]
+    filled = np.where(mask, 0.0, data)
+    photometry = aperture_photometry(filled, apertures)
+    fluxes = []
+    areas = []
+    for index, aperture in enumerate(apertures):
+        area = np.atleast_1d(np.asarray(aperture.area_overlap(data, mask=mask), dtype=float))
+        total = np.atleast_1d(np.asarray(aperture.area_overlap(data), dtype=float))
+        flux = np.asarray(photometry["aperture_sum_{}".format(index)], dtype=float) - sky * area
+        flux[~(area >= 0.9 * total)] = np.nan
+        fluxes.append(flux)
+        areas.append(area)
+    gain = (record.get("metadata") or {}).get("gain")
+    try:
+        gain = float(gain)
+    except (TypeError, ValueError):
+        gain = None
+    with np.errstate(invalid="ignore", divide="ignore"):
+        variance = areas[0] * sky_std ** 2 * (1.0 + areas[0] / np.maximum(sky_pixels, 1.0))
+        if gain is not None and gain > 0:
+            variance = variance + np.clip(fluxes[0], 0.0, None) / gain
+        error = np.sqrt(variance)
+    result.update({
+        "aperture_flux": fluxes[0],
+        "aperture_flux_error": error,
+        "aperture_flux_large": fluxes[1],
+        "aperture_radius_pixels": np.full(count, small_radius),
+    })
+    return result
+
+
 def _distance_from_mask(mask):
     """Return the distance to the nearest true mask pixel."""
 
@@ -1610,6 +1704,10 @@ def _measurement_table(rows):
         "x",
         "y",
         "flux",
+        "aperture_flux",
+        "aperture_flux_error",
+        "aperture_flux_large",
+        "aperture_radius_pixels",
         "snr",
         "fwhm_pixels",
         "fwhm_arcsec",
@@ -1980,6 +2078,18 @@ def build_master_source_table(image_records, settings=None):
                     "rejection_reasons": "",
                 }
             )
+        image_rows = [row for row in measurement_rows if row["image_id"] == image_id]
+        if image_rows:
+            apertures = quick_aperture_fluxes(
+                record,
+                [row["x"] for row in image_rows],
+                [row["y"] for row in image_rows],
+                image_fwhm if image_fwhm is not None else image_rows[0]["image_fwhm_pixels"],
+                settings,
+            )
+            for index, row in enumerate(image_rows):
+                for name, values in apertures.items():
+                    row[name] = float(values[index])
 
     if not master_parts:
         return Table(masked=True), _measurement_table([])

@@ -80,7 +80,7 @@ gain/read-noise/saturation flags.
 
 Image and astrometry flags include ``BAD_EDGES``, ``TARGET_NEAR_EDGE``,
 ``TARGET_MASKED``, ``TRAIL_PRESENT``, ``TARGET_TRAIL``,
-``TARGET_COSMIC_RAY``, ``BACKGROUND_UNRELIABLE``,
+``TARGET_COSMIC_RAY``, ``BACKGROUND_UNRELIABLE``, ``BACKGROUND_MESHES_EXCLUDED``,
 ``FRINGE_CORRECTION_FAILED``, ``WCS_MISSING``, ``WCS_POOR``, and relative
 alignment failures.
 

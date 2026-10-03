@@ -152,6 +152,7 @@ QUALITY_FLAGS = {
         "TARGET_TRAIL",
         "TARGET_COSMIC_RAY",
         "BACKGROUND_UNRELIABLE",
+        "BACKGROUND_MESHES_EXCLUDED",
         "BACKGROUND_GRADIENT_HIGH",
         "FRINGE_CORRECTION_FAILED",
     ],
@@ -402,8 +403,13 @@ DEFAULT_SETTINGS = {
         "mask_invalid_edges": True,
         "mask_saturated": True,
         "mask_nonlinear": True,
-        "saturation_grow_pixels": 5,
-        "saturation_halo_fwhm": 5.0,
+        # Saturated cores grow into the connected region still brighter than
+        # this fraction of the way from sky to saturation (covers damaged
+        # centers and bleeds of heavily saturated stars), then by a buffer of
+        # max(saturation_grow_pixels, saturation_halo_fwhm x FWHM) pixels.
+        "saturation_region_fraction": 0.10,
+        "saturation_grow_pixels": 2,
+        "saturation_halo_fwhm": 1.0,
         "detect_bad_rows": True,
         "detect_bad_columns": True,
         "detect_amplifier_boundaries": False,
@@ -414,12 +420,21 @@ DEFAULT_SETTINGS = {
         "trail_grow_pixels": 5,
         "trail_min_elongation": 4.0,
         "trail_min_pixels": 20,
+        # Trails are followed along their line in chunks of this length and
+        # extended while each chunk is this significant, bridging gaps (e.g.
+        # behind masked stars) up to trail_max_gap_pixels.
+        "trail_chunk_pixels": 32,
+        "trail_extend_sigma": 3.0,
+        "trail_max_gap_pixels": 200,
+        "trail_refine_line": True,
         "manual_regions": [],
         "saturation_level": None,
         "nonlinearity_level": None,
         "prefer_nonlinearity_limit": True,
         "saturation_high_fraction": 0.02,
         "bad_line_sigma": 6.0,
+        "bad_line_window": 15,
+        "bad_line_min_pixel_sigma": 1.0,
         "bad_line_grow_pixels": 0,
         "amplifier_boundaries": [],
         "amplifier_seam_sigma": 8.0,
@@ -480,14 +495,23 @@ DEFAULT_SETTINGS = {
         "minimum_mesh_fwhm": 10.0,
         "sigma_clip": 3.0,
         "maximum_iterations": 10,
-        "exclude_percentile": 20.0,
+        # A box is measured when at most this percentage of its pixels is
+        # masked; more crowded boxes are interpolated from their neighbors.
+        # 50 (with source_mask_grow_fwhm 1.5) keeps most boxes measured in
+        # crowded fields; at 20 / 3.0 almost every box was interpolated.
+        "exclude_percentile": 50.0,
+        # Warn when more than this fraction of background boxes had too many
+        # masked pixels and were interpolated instead of measured.
+        "excluded_mesh_warn_fraction": 0.5,
         "estimator": "SExtractorBackground",
         "rms_estimator": "StdBackgroundRMS",
         "fallback_to_global": True,
         "source_mask_enabled": True,
         "source_mask_sigma": 3.0,
         "source_mask_min_pixels": 5,
-        "source_mask_grow_fwhm": 3.0,
+        # Detected sources are grown by this many FWHM before the sky is
+        # measured.
+        "source_mask_grow_fwhm": 1.5,
         "source_mask_kernel_fwhm": 1.0,
         "protect_target": True,
         "target_protection_fwhm": 5.0,
@@ -521,6 +545,10 @@ DEFAULT_SETTINGS = {
         "minimum_fwhm_pixels": 1.0,
         "maximum_fwhm_pixels": None,
         "maximum_ellipticity_for_seeing": 0.50,
+        # Seeing = median FWHM of Gaussian fits to unsaturated stars at least
+        # this bright (S/N), fitting at most seeing_maximum_fits of them.
+        "seeing_minimum_snr": 20.0,
+        "seeing_maximum_fits": 300,
         "maximum_sources": 1000,
         "reject_saturated": True,
         "reject_masked": True,
@@ -679,15 +707,18 @@ DEFAULT_SETTINGS = {
         "upstream_background_difference_fail_fraction": 1.00,
         "upstream_background_rms_difference_warn_fraction": 0.50,
         "upstream_background_rms_difference_fail_fraction": 1.00,
+        # Comparisons with the rest of the batch (same filter where possible)
+        # only warn by default: an image that is worse than its siblings
+        # deserves a look, but only the absolute limits above reject it.
         "batch_minimum_images": 3,
         "batch_fwhm_ratio_warn": 1.50,
-        "batch_fwhm_ratio_fail": 2.50,
+        "batch_fwhm_ratio_fail": None,
         "batch_ellipticity_offset_warn": 0.15,
-        "batch_ellipticity_offset_fail": 0.30,
+        "batch_ellipticity_offset_fail": None,
         "batch_background_ratio_warn": 2.00,
-        "batch_background_ratio_fail": 5.00,
+        "batch_background_ratio_fail": None,
         "batch_background_rms_ratio_warn": 2.00,
-        "batch_background_rms_ratio_fail": 5.00,
+        "batch_background_rms_ratio_fail": None,
         "wcs_rms_warn_arcsec": 1.0,
         "wcs_rms_fail_arcsec": 3.0,
         "zeropoint_offset_warn_mag": 0.50,
@@ -712,6 +743,13 @@ DEFAULT_SETTINGS = {
             "missing_qc_anchor_status": "WARN",
             "zeropoint_sigma_clip": 3.0,
             "zeropoint_maximum_iterations": 5,
+            # Quick zeropoints use fixed apertures (radius in FWHM) with a
+            # local sky annulus; a larger aperture on the brightest
+            # calibration stars gives the aperture correction to total flux.
+            "quick_aperture_fwhm": 1.5,
+            "quick_aperture_correction_fwhm": 4.0,
+            "quick_sky_annulus_fwhm": [5.0, 7.0],
+            "aperture_correction_stars": 20,
             "zeropoint_scatter_warn_mag": 0.10,
             "zeropoint_scatter_fail_mag": 0.30,
             "transparency_minimum_images": 2,
@@ -1052,9 +1090,19 @@ DEFAULT_SETTINGS = {
         "comparison_star_rms_fail_mag": 0.15,
         "comparison_star_reduced_chi2_warn": 3.0,
         "comparison_star_reduced_chi2_fail": 10.0,
+        # Added in quadrature to each comparison-star error before the chi2
+        # test, standing in for flat-field and calibration systematics.
+        "comparison_star_error_floor_mag": 0.01,
         "minimum_stable_comparison_stars": 3,
+        # Epoch metrics (zeropoint, depth, seeing, sky, WCS) are compared within
+        # each filter once there are metric_outlier_minimum_images epochs.
+        # Outliers only warn by default: the images already passed the
+        # usability and PSF gates, so a different seeing or sky is not by
+        # itself a reason to drop a light-curve point. Set a fail sigma to make
+        # extreme outliers exclude the epoch.
         "metric_outlier_warn_sigma": 3.5,
-        "metric_outlier_fail_sigma": 6.0,
+        "metric_outlier_fail_sigma": None,
+        "metric_outlier_minimum_images": 4,
         "problem_group_warn_fraction": 0.25,
         "problem_group_fail_fraction": 0.50,
         "minimum_group_images": 2,
@@ -1070,8 +1118,14 @@ DEFAULT_SETTINGS = {
         "method_disagreement_warn_sigma": 3.0,
         "method_disagreement_fail_sigma": 5.0,
         "method_disagreement_floor_mag": 0.05,
+        # A light-curve point is flagged only when both neighbors in the same
+        # filter are within temporal_maximum_gap_days and it departs from
+        # their interpolation by temporal_outlier_sigma AND by more than
+        # temporal_allowed_rate_mag_per_day times the longer gap (real
+        # evolution, e.g. a second peak, is not an outlier).
         "temporal_outlier_sigma": 5.0,
-        "temporal_maximum_gap_days": 30.0,
+        "temporal_maximum_gap_days": 3.0,
+        "temporal_allowed_rate_mag_per_day": 0.1,
         "preferred_order": [
             "difference:psf",
             "difference:small_aperture",
@@ -1624,7 +1678,7 @@ def validate_settings(settings):
             "background.filter_size must contain two positive odd integers"
         )
 
-    exclude_percentile = settings["background"].get("exclude_percentile", 20.0)
+    exclude_percentile = settings["background"].get("exclude_percentile", 50.0)
     if not 0 <= float(exclude_percentile) <= 100:
         raise ValueError("background.exclude_percentile must be between 0 and 100")
 
@@ -2183,9 +2237,11 @@ def validate_settings(settings):
     if not 1 <= chi_warn <= chi_fail:
         raise ValueError("comparison-star chi-square limits must satisfy 1 <= warn <= fail")
     metric_warn = float(batch_settings.get("metric_outlier_warn_sigma", 3.5))
-    metric_fail = float(batch_settings.get("metric_outlier_fail_sigma", 6.0))
-    if not 0 < metric_warn <= metric_fail:
+    metric_fail = batch_settings.get("metric_outlier_fail_sigma")
+    if metric_warn <= 0 or (metric_fail is not None and metric_warn > float(metric_fail)):
         raise ValueError("batch metric limits must satisfy 0 < warn <= fail")
+    if int(batch_settings.get("metric_outlier_minimum_images", 4)) < 2:
+        raise ValueError("batch_consistency.metric_outlier_minimum_images must be at least 2")
     fraction_warn = float(batch_settings.get("problem_group_warn_fraction", 0.25))
     fraction_fail = float(batch_settings.get("problem_group_fail_fraction", 0.50))
     if not 0 <= fraction_warn <= fraction_fail <= 1:

@@ -92,11 +92,38 @@ separate components as well as a union so downstream flags can identify the
 cause of an overlap. Target, host, and PSF-star protection regions are tracked
 explicitly.
 
+Saturated cores (pixels at or above the lower of the saturation and
+nonlinearity levels) are grown into the connected region that is still
+brighter than ``masks.saturation_region_fraction`` of the way from the sky to
+saturation, then widened by ``max(saturation_grow_pixels, saturation_halo_fwhm
+× FWHM)``. The masked area therefore scales with how saturated each star is and
+covers the damaged centers that heavily saturated stars often show after
+reduction, instead of a fixed large disk around every saturated pixel. Pixels
+already excluded by the region stage (overscan, junk outside the data section)
+never seed saturation masks.
+
+Bad rows and columns are lines whose median departs sharply from the running
+median of their neighbors (``bad_line_window``) and by more than
+``bad_line_min_pixel_sigma`` times the pixel noise, so smooth gradients and
+faint readout patterns are not masked.
+
+Trails are seeded by long, thin, elongated groups of bright pixels (widths are
+robust percentiles, so stars touching a trail do not hide it) and then
+followed along their line across the whole frame in chunks of
+``trail_chunk_pixels``: a chunk belongs to the trail while the median on the
+line exceeds that of parallel control strips by ``trail_extend_sigma``, and
+masked stretches up to ``trail_max_gap_pixels`` are bridged. Features that
+point at and touch a saturated star (bleeds, readout smears, diffraction
+spikes) are added to the saturation mask instead of being called trails.
+
 Optional cosmic-ray cleaning uses the L.A.Cosmic implementation in
 ``astroscrappy``. Its contrast, significance, iteration, gain, read-noise, and
 saturation settings are configurable. The cleaned array is a derivative; the
 cosmic-ray mask is retained, and protected target/PSF cores are not accepted as
-ordinary clean pixels merely because interpolation produced a value.
+ordinary clean pixels merely because interpolation produced a value. Detections
+that touch the target region are never masked (a compact transient can look
+like a hit); ``TARGET_COSMIC_RAY`` is still raised so the epoch can be checked.
+Non-finite pixels are passed to ``astroscrappy`` as masked, finite values.
 
 Fringe correction
 -----------------
@@ -124,8 +151,16 @@ measurement, with configurable mask growth and explicit target/host
 protection. ``photutils.background.Background2D`` estimates an additive
 large-scale model and a background RMS map from sigma-clipped meshes. Mesh
 size is required to be substantially broader than the stellar PSF. Meshes with
-too many excluded pixels are ignored and the remaining mesh grid is filtered
-smoothly before interpolation.
+more than ``exclude_percentile`` percent of their pixels masked are not
+measured but interpolated from the others; the fraction of such meshes is
+reported and ``BACKGROUND_MESHES_EXCLUDED`` is raised when it exceeds
+``excluded_mesh_warn_fraction``. The defaults (sources grown by
+``source_mask_grow_fwhm`` = 1.5 FWHM, meshes measured while at most
+``exclude_percentile`` = 50% masked) keep most meshes measured in crowded
+fields; a mask grown by 3 FWHM with a 20% limit left about 10 of 289 meshes
+measured in a low-latitude KeplerCam field, so the model was nearly flat.
+The diagnostics compare the sky pixels before (one flat level) and after
+subtraction.
 
 The modes are ``off``, ``measure_only``, ``subtract_broad``, ``local_only``,
 and ``broad_plus_local``. Broad subtraction removes only the two-dimensional
@@ -146,14 +181,20 @@ minor widths, orientation, ellipticity,
 
    e = 1-\frac{b}{a},
 
-and a Gaussian-equivalent FWHM. Robust medians and scatters summarize the
-stellar population. Saturated detections, masks, trails, target-local
-background, and upstream LCO quality values are assessed separately.
+and the second-moment FWHM of each footprint (kept as ``moment_fwhm_pixels``).
+Footprint moments grow with brightness, because brighter stars have larger
+footprints, so the seeing is instead the median FWHM of elliptical Gaussian
+fits (geometric mean of the axes) to up to ``seeing_maximum_fits`` unsaturated,
+high-S/N stars; neighbors' pixels carry no weight in each fit. Saturated
+detections, masks, trails, target-local background, and upstream LCO quality
+values are assessed separately.
 
-PASS, WARN, and FAIL use both configured absolute limits and deviations from
-the batch median. A coherent population of elongated sources indicates a
-tracking problem; a single elongated detection is treated as a possible trail
-or blend rather than proof of bad tracking.
+PASS, WARN, and FAIL use configured absolute limits. At the usability gate
+each image is also compared with the batch (the same filter where possible;
+sky level and noise only within a filter and as rates per second); by default
+these relative checks only warn. A coherent population of elongated sources
+indicates a tracking problem; a single elongated detection is treated as a
+possible trail or blend rather than proof of bad tracking.
 
 Catalogs and astrometry
 -----------------------
@@ -205,6 +246,12 @@ Usability and limiting depth
 The first review gate combines catalog recovery, recovery of a bright QC
 anchor, approximate transparency and scatter, seeing, elongation, background,
 global/local depth, cloud spatial structure, and target-artifact overlap.
+Quick zeropoints use fixed-aperture fluxes (``quick_aperture_fwhm`` × FWHM,
+local sky annulus) with an aperture correction from the brightest calibration
+stars; detection-footprint fluxes lose a growing fraction of the light for
+fainter stars and would make the zeropoint depend on magnitude. The QC anchor
+is chosen per filter as the nominated star measured, unsaturated, in the most
+images of that filter.
 Uniform cloud attenuation appears as a common magnitude residual; spatially
 varying attenuation appears as a residual surface across detector position.
 
@@ -364,11 +411,20 @@ whether host light is included.
 Batch consistency and reported results
 --------------------------------------
 
-Persistent comparison-star measurements form light curves. Robust scatter
-identifies unstable stars and isolated epoch outliers without deleting them.
-Time-series tables track zeropoint, depth, seeing, background, and WCS by
-filter, telescope, and site. Optional ensemble corrections solve only simple
-robust group offsets and preserve both original and corrected values.
+Persistent comparison-star measurements form light curves. A star is called
+unstable only when its reduced chi-square exceeds the limits after adding an
+error floor (``comparison_star_error_floor_mag``) and each epoch's excess
+scatter to its errors; stars with fewer than ``minimum_comparison_epochs`` are
+reported as untested, not unstable, and an excess caused by a single epoch is
+reported as ``SINGLE_EPOCH_OUTLIER``. Nothing is deleted. Time-series tables
+track zeropoint, depth, seeing, background, and WCS by filter, telescope, and
+site; outliers are judged against a per-metric scatter floor and, by default,
+only warn. A light-curve point is a temporal outlier only when both neighbors
+are within ``temporal_maximum_gap_days`` and it departs from them by more than
+its errors and by more than ``temporal_allowed_rate_mag_per_day`` times the
+gap, so real evolution such as a second peak is not flagged. Optional ensemble
+corrections solve only simple robust group offsets and preserve both original
+and corrected values.
 
 Science/difference and aperture/PSF measurements are compared under explicit
 priority and quality rules. The final preferred light curve is therefore a

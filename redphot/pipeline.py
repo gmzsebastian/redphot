@@ -256,7 +256,37 @@ def build_comparison_star_light_curves(measurements, settings=None):
         common = common_modes.get(epoch_key, 0.0)
         record["common_mode_mag"] = common
         record["residual_mag"] = float(record["raw_residual_mag"] - common)
+    # Scatter that an epoch adds to every star (e.g. crowding in very poor
+    # seeing) beyond the reported errors. It is added to each star's errors
+    # in that epoch, so one bad image does not make every star look variable;
+    # a truly variable star still stands out against the others.
+    epoch_excess = {}
+    epoch_members = {}
+    for index, record in enumerate(records):
+        epoch_members.setdefault(
+            (record["image_id"], record["filter"], record["method"]), []
+        ).append(index)
+    for epoch_key, members in epoch_members.items():
+        residual_values = np.asarray([records[index]["residual_mag"] for index in members])
+        error_values = np.asarray([
+            records[index]["magnitude_uncertainty"] or np.nan for index in members
+        ], dtype=float)
+        scatter = _robust_scatter(residual_values) if len(members) >= 5 else None
+        typical_error = (
+            float(np.nanmedian(error_values)) if np.any(np.isfinite(error_values)) else 0.0
+        )
+        excess = (
+            float(np.sqrt(max(0.0, scatter ** 2 - typical_error ** 2)))
+            if scatter is not None else 0.0
+        )
+        epoch_excess[epoch_key] = excess
+        for index in members:
+            records[index]["epoch_excess_scatter_mag"] = excess
     minimum = int(configured.get("minimum_comparison_epochs", 3))
+    floor = float(configured.get("comparison_star_error_floor_mag", 0.01))
+    chi2_warn = float(configured.get("comparison_star_reduced_chi2_warn", 3.0))
+    chi2_fail = float(configured.get("comparison_star_reduced_chi2_fail", 10.0))
+    rms_fail = float(configured.get("comparison_star_rms_fail_mag", 0.15))
     stability_records = []
     for key, indices in groups.items():
         baseline = baselines[key]
@@ -269,27 +299,60 @@ def build_comparison_star_light_curves(measurements, settings=None):
             else np.nan for index in indices
         ])
         valid_errors = np.isfinite(errors) & (errors > 0)
+        # Photon-noise errors of bright stars are a few mmag, below the
+        # flat-field and calibration systematics, so a small error floor (and
+        # each epoch's excess scatter) is added before asking whether a star
+        # scatters more than expected.
+        excess = np.asarray([
+            records[index].get("epoch_excess_scatter_mag", 0.0) for index in indices
+        ], dtype=float)
+        effective_errors = np.sqrt(errors ** 2 + floor ** 2 + excess ** 2)
         reduced_chi2 = (
-            float(np.sum((residuals[valid_errors] / errors[valid_errors]) ** 2) / max(1, np.count_nonzero(valid_errors) - 1))
+            float(np.sum((residuals[valid_errors] / effective_errors[valid_errors]) ** 2) / max(1, np.count_nonzero(valid_errors) - 1))
             if np.count_nonzero(valid_errors) >= 2 else None
         )
         status = "PASS"
         reasons = []
         if len(indices) < minimum:
-            status = "WARN"
+            # Too few epochs to tell: not evidence that the star varies.
+            status = "UNTESTED"
             reasons.append("TOO_FEW_EPOCHS")
-        if rms is not None and rms >= float(configured.get("comparison_star_rms_fail_mag", 0.15)):
-            status = "FAIL"
-            reasons.append("RMS_HIGH")
-        elif rms is not None and rms >= float(configured.get("comparison_star_rms_warn_mag", 0.05)):
-            status = "WARN" if status != "FAIL" else status
-            reasons.append("RMS_WARN")
-        if reduced_chi2 is not None and reduced_chi2 >= float(configured.get("comparison_star_reduced_chi2_fail", 10.0)):
-            status = "FAIL"
-            reasons.append("CHI2_HIGH")
-        elif reduced_chi2 is not None and reduced_chi2 >= float(configured.get("comparison_star_reduced_chi2_warn", 3.0)):
-            status = "WARN" if status != "FAIL" else status
-            reasons.append("CHI2_WARN")
+        elif reduced_chi2 is not None:
+            # A star is unstable only when it scatters significantly more than
+            # its (floored) errors allow; a large RMS of a faint star whose
+            # errors are equally large is just noise. With enough epochs, a
+            # star whose excess comes from a single epoch (a measurement
+            # problem in that image, e.g. a neighbor in bad seeing) is not
+            # called variable: the chi2 without that epoch decides.
+            normalized = np.abs(residuals / effective_errors)
+            usable = valid_errors & np.isfinite(normalized)
+            if reduced_chi2 >= chi2_warn and np.count_nonzero(usable) > minimum:
+                worst = int(np.nanargmax(np.where(usable, normalized, -np.inf)))
+                keep = usable.copy()
+                keep[worst] = False
+                without = float(
+                    np.sum(normalized[keep] ** 2) / max(1, np.count_nonzero(keep) - 1)
+                )
+                if without < chi2_warn:
+                    reduced_chi2 = without
+                    reasons.append("SINGLE_EPOCH_OUTLIER")
+            if reduced_chi2 >= chi2_fail:
+                status = "FAIL"
+                reasons.append("CHI2_HIGH")
+            elif reduced_chi2 >= chi2_warn:
+                status = "WARN"
+                reasons.append("CHI2_WARN")
+                if rms is not None and rms >= rms_fail:
+                    status = "FAIL"
+                    reasons.append("RMS_HIGH")
+        elif rms is not None:
+            # No usable errors: fall back to the absolute scatter limits.
+            if rms >= rms_fail:
+                status = "FAIL"
+                reasons.append("RMS_HIGH")
+            elif rms >= float(configured.get("comparison_star_rms_warn_mag", 0.05)):
+                status = "WARN"
+                reasons.append("RMS_WARN")
         stable = status == "PASS"
         for record_index in indices:
             records[record_index]["stable_star"] = stable
@@ -299,8 +362,10 @@ def build_comparison_star_light_curves(measurements, settings=None):
                 "source_id": key[0], "filter": key[1], "method": key[2],
                 "epoch_count": len(indices), "baseline_magnitude": baseline,
                 "rms_mag": rms, "robust_scatter_mag": robust,
-                "reduced_chi2": reduced_chi2, "status": status,
-                "stable": stable, "reasons": ";".join(reasons),
+                "reduced_chi2": reduced_chi2, "error_floor_mag": floor,
+                "status": status, "stable": stable,
+                "unstable": status in {"WARN", "FAIL"},
+                "reasons": ";".join(reasons),
             }
         )
     light_curves = _records_table(records)
@@ -492,7 +557,26 @@ def build_epoch_metrics(image_records, zeropoints=None, limits=None, settings=No
         "background", "background_rms", "wcs_rms_arcsec",
     )
     warn_sigma = float(configured.get("metric_outlier_warn_sigma", 3.5))
-    fail_sigma = float(configured.get("metric_outlier_fail_sigma", 6.0))
+    fail_value = configured.get("metric_outlier_fail_sigma")
+    fail_sigma = float(fail_value) if fail_value is not None else np.inf
+    minimum_images = int(configured.get("metric_outlier_minimum_images", 4))
+    # The robust scatter of a handful of epochs can be tiny (three images with
+    # the same seeing), which would turn ordinary differences into huge
+    # "sigmas". Each metric's scatter is therefore never taken below a floor
+    # that represents a difference worth flagging (fractions of the median for
+    # seeing and sky, magnitudes or arcsec for the others).
+    floors = {
+        "zeropoint_mag": ("absolute", 0.05),
+        "depth_5sigma_mag": ("absolute", 0.2),
+        "seeing_fwhm_arcsec": ("fraction", 0.15),
+        "background": ("fraction", 0.25),
+        "background_rms": ("fraction", 0.15),
+        "wcs_rms_arcsec": ("absolute", 0.1),
+    }
+    floors.update({
+        key: tuple(value) for key, value in
+        (configured.get("metric_outlier_scatter_floor") or {}).items()
+    })
     for metric in metrics:
         by_filter = {}
         for index, record in enumerate(records):
@@ -500,10 +584,15 @@ def build_epoch_metrics(image_records, zeropoints=None, limits=None, settings=No
             if value is not None:
                 by_filter.setdefault(record["filter"], []).append((index, value))
         for group in by_filter.values():
+            if len(group) < minimum_images:
+                continue
             values = np.asarray([value for _, value in group])
             center = float(np.median(values))
-            scatter = _robust_scatter(values)
-            if scatter in {None, 0.0}:
+            scatter = _robust_scatter(values) or 0.0
+            kind, amount = floors.get(metric, ("absolute", 0.0))
+            floor = float(amount) * (abs(center) if kind == "fraction" else 1.0)
+            scatter = max(float(scatter), floor)
+            if scatter <= 0:
                 continue
             for index, value in group:
                 deviation = abs(value - center) / scatter
@@ -749,7 +838,8 @@ def build_preferred_light_curve(measurements, epoch_metrics, method_comparison,
             }
         )
     temporal_sigma = float(configured.get("temporal_outlier_sigma", 5.0))
-    maximum_gap = float(configured.get("temporal_maximum_gap_days", 30.0))
+    maximum_gap = float(configured.get("temporal_maximum_gap_days", 3.0))
+    allowed_rate = float(configured.get("temporal_allowed_rate_mag_per_day", 0.1))
     by_filter = {}
     for index, record in enumerate(records):
         if record.get("mjd") is not None and record.get("magnitude") is not None:
@@ -767,10 +857,17 @@ def build_preferred_light_curve(measurements, epoch_metrics, method_comparison,
             error = records[current].get("magnitude_uncertainty") or float(
                 configured.get("method_disagreement_floor_mag", 0.05)
             )
-            significance = (records[current]["magnitude"] - expected) / max(error, 0.01)
-            records[current]["temporal_residual_mag"] = float(records[current]["magnitude"] - expected)
+            residual = records[current]["magnitude"] - expected
+            significance = residual / max(error, 0.01)
+            # A transient really changes between epochs: a point is only an
+            # outlier when it departs from its neighbors by more than its
+            # errors AND by more than the source could plausibly change in the
+            # time to the farther neighbor (temporal_allowed_rate_mag_per_day).
+            allowance = allowed_rate * max(t1 - t0, t2 - t1)
+            records[current]["temporal_residual_mag"] = float(residual)
             records[current]["temporal_outlier_sigma"] = float(significance)
-            if abs(significance) >= temporal_sigma:
+            records[current]["temporal_allowance_mag"] = float(allowance)
+            if abs(significance) >= temporal_sigma and abs(residual) > allowance:
                 records[current]["flags"] = _append_flag(
                     records[current]["flags"], "BATCH_MEASUREMENT_OUTLIER"
                 )
@@ -807,7 +904,7 @@ def analyze_batch_consistency(
     )
     unstable_keys = {
         (str(row["source_id"]), str(row["filter"]), str(row["method"]))
-        for row in stability if not bool(row["stable"])
+        for row in stability if bool(row["unstable"])
     }
     for index, row in enumerate(corrected):
         key = (
@@ -862,7 +959,20 @@ def analyze_batch_consistency(
     preferred = build_preferred_light_curve(
         corrected, epoch_metrics, method_comparison, settings
     )
-    unstable_count = sum(not bool(row["stable"]) for row in stability)
+    # Count stars, not star-method pairs: a star measured three ways is still
+    # one star.
+    unstable_count = len({
+        (str(row["source_id"]), str(row["filter"]))
+        for row in stability if bool(row["unstable"])
+    })
+    untested_count = len({
+        (str(row["source_id"]), str(row["filter"]))
+        for row in stability if str(row["status"]) == "UNTESTED"
+    })
+    tested_count = len({
+        (str(row["source_id"]), str(row["filter"]))
+        for row in stability if str(row["status"]) != "UNTESTED"
+    })
     failed_epochs = sum(str(row["status"]) == "FAIL" for row in epoch_metrics)
     outlier_count = sum(bool(row["outlier"]) for row in method_comparison)
     status = "FAIL" if len(preferred) == 0 else "WARN" if any(
@@ -879,6 +989,8 @@ def analyze_batch_consistency(
         "method_comparison": method_comparison,
         "preferred_light_curve": preferred,
         "unstable_comparison_count": unstable_count,
+        "untested_comparison_count": untested_count,
+        "tested_comparison_count": tested_count,
         "failed_epoch_count": failed_epochs,
         "measurement_outlier_count": outlier_count,
         "ensemble_enabled": bool(
@@ -2192,14 +2304,30 @@ def _run_star_selection(context, image_id, settings):
 
 
 def _run_usability(context, image_id, settings):
-    from .image import assess_image_usability
+    from .image import assess_image_quality_batch, assess_image_usability
 
     selection = context["shared"]["star_selection"]
     records = _records_for_stage(context, "astrometry")
     manual = context.get("shared", {}).get("usability_decisions")
-    decisions, residuals = assess_image_usability(
-        records, selection["measurements"], settings, manual
+    # Compare each image's seeing, shape and sky with the rest of the batch
+    # (same filter where possible). The checks go into copies of the quality
+    # results, so rerunning this stage never stacks them twice.
+    batch_quality = assess_image_quality_batch(
+        [record.get("quality") or {} for record in records],
+        settings,
+        groups=[(record.get("metadata") or {}).get("filter") for record in records],
+        exposure_times=[
+            (record.get("metadata") or {}).get("exposure_time") for record in records
+        ],
     )
+    batch_records = [
+        dict(record, quality=quality) for record, quality in zip(records, batch_quality)
+    ]
+    decisions, residuals = assess_image_usability(
+        batch_records, selection["measurements"], settings, manual
+    )
+    for decision, quality in zip(decisions, batch_quality):
+        decision["batch_reference"] = quality.get("batch_reference")
     lookup = {str(item["image_id"]): item for item in decisions}
     for identifier, image in context["images"].items():
         if identifier in lookup:

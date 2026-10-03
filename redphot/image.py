@@ -1830,27 +1830,39 @@ def _disk_structure(radius):
     return (grid_x ** 2 + grid_y ** 2) <= radius ** 2
 
 
-def make_saturation_mask(data, metadata=None, settings=None):
+def make_saturation_mask(data, metadata=None, settings=None, exclude=None):
     """
-    Mask saturated and nonlinear pixels and grow bleed and halo regions.
+    Mask saturated and nonlinear pixels and the bright region around them.
 
     The saturation and nonlinearity levels come from the settings overrides or
     the image metadata. When both are present the lower (more conservative)
-    level defines the bright cores used for halo growth, so wings, bleed
-    columns, and halos around bright stars are excluded from later selection.
+    level defines the saturated cores. Each core is then grown into the
+    connected region of pixels that are still brighter than
+    ``masks.saturation_region_fraction`` of the way from the sky to the
+    saturation level. That region scales with how saturated the star is and
+    also covers the damaged centers of heavily saturated stars (whose reduced
+    values often drop well below the saturation level) and their bleed
+    columns. Finally the region is widened by a small buffer of
+    ``max(saturation_grow_pixels, saturation_halo_fwhm × FWHM)`` pixels.
+
+    Pixels in ``exclude`` (normally the region-stage mask: overscan and other
+    unused pixels) are never treated as saturated, so junk outside the data
+    section does not spawn masks.
 
     Returns
     -------
     components : dict of numpy.ndarray
         ``saturated``, ``nonlinear``, and the grown ``saturation`` mask.
     info : dict
-        Levels used and the saturated-pixel fraction.
+        Levels used, the saturated-pixel fraction, and one entry per masked
+        saturated region (center, pixel counts, equivalent radius).
     """
 
     if settings is None:
         settings = get_default_settings()
     masks_settings = settings.get("masks", {})
-    shape = np.asarray(data).shape
+    data = np.asarray(data, dtype=float)
+    shape = data.shape
 
     saturated = np.zeros(shape, dtype=bool)
     nonlinear = np.zeros(shape, dtype=bool)
@@ -1862,11 +1874,13 @@ def make_saturation_mask(data, metadata=None, settings=None):
     if nonlinear_level is None and metadata is not None:
         nonlinear_level = _as_float(metadata.get("nonlinearity"))
 
-    finite = np.isfinite(data)
+    usable = np.isfinite(data)
+    if exclude is not None:
+        usable &= ~np.asarray(exclude, dtype=bool)
     if masks_settings.get("mask_saturated", True) and sat_level is not None:
-        saturated = finite & (data >= float(sat_level))
+        saturated = usable & (data >= float(sat_level))
     if masks_settings.get("mask_nonlinear", True) and nonlinear_level is not None:
-        nonlinear = finite & (data >= float(nonlinear_level))
+        nonlinear = usable & (data >= float(nonlinear_level))
 
     levels = [level for level in (sat_level, nonlinear_level) if level is not None]
     effective = None
@@ -1875,26 +1889,54 @@ def make_saturation_mask(data, metadata=None, settings=None):
             effective = min(levels)
         else:
             effective = sat_level if sat_level is not None else nonlinear_level
-    core = finite & (data >= float(effective)) if effective is not None else (
+    core = usable & (data >= float(effective)) if effective is not None else (
         np.zeros(shape, dtype=bool)
     )
 
     saturation_mask = core.copy()
-    grow = int(masks_settings.get("saturation_grow_pixels", 5))
-    halo_radius = int(
-        round(
-            masks_settings.get("saturation_halo_fwhm", 5.0)
-            * _fwhm_guess_pixels(settings)
-        )
+    regions = []
+    fraction = float(masks_settings.get("saturation_region_fraction", 0.10))
+    buffer_pixels = max(
+        float(masks_settings.get("saturation_grow_pixels", 2)),
+        float(masks_settings.get("saturation_halo_fwhm", 1.0))
+        * _fwhm_guess_pixels(settings),
     )
-    if core.any() and (grow > 0 or halo_radius > 0):
+    sky = None
+    if core.any():
         ndimage = _try_ndimage()
+        sky = float(np.median(data[usable & ~core])) if np.any(usable & ~core) else 0.0
+        region = core.copy()
         if ndimage is not None:
-            if grow > 0:
-                saturation_mask |= ndimage.binary_dilation(core, iterations=grow)
-            disk = _disk_structure(halo_radius)
-            if disk is not None:
-                saturation_mask |= ndimage.binary_dilation(core, structure=disk)
+            if fraction > 0:
+                threshold = sky + fraction * (float(effective) - sky)
+                bright = usable & (data >= threshold)
+                labels, _ = ndimage.label(bright, structure=np.ones((3, 3), dtype=int))
+                touched = np.unique(labels[core])
+                touched = touched[touched > 0]
+                region |= np.isin(labels, touched)
+            disk = _disk_structure(int(np.ceil(buffer_pixels)))
+            saturation_mask = (
+                ndimage.binary_dilation(region, structure=disk)
+                if disk is not None else region.copy()
+            )
+            region_labels, count = ndimage.label(
+                region, structure=np.ones((3, 3), dtype=int)
+            )
+            if count:
+                index = np.arange(1, count + 1)
+                pixels = ndimage.sum(region, region_labels, index)
+                saturated_pixels = ndimage.sum(core, region_labels, index)
+                centers = ndimage.center_of_mass(region, region_labels, index)
+                for (center_y, center_x), size, hot in zip(centers, pixels, saturated_pixels):
+                    regions.append({
+                        "x": float(center_x),
+                        "y": float(center_y),
+                        "pixels": int(size),
+                        "saturated_pixels": int(hot),
+                        "radius_pixels": float(np.sqrt(size / np.pi) + buffer_pixels),
+                    })
+        else:
+            saturation_mask = region
 
     info = {
         "saturation_level": None if sat_level is None else float(sat_level),
@@ -1902,7 +1944,12 @@ def make_saturation_mask(data, metadata=None, settings=None):
             None if nonlinear_level is None else float(nonlinear_level)
         ),
         "effective_level": None if effective is None else float(effective),
+        "sky_level": sky,
+        "region_fraction": fraction,
+        "buffer_pixels": float(buffer_pixels),
         "saturated_fraction": float(saturated.mean()) if saturated.size else 0.0,
+        "masked_fraction": float(saturation_mask.mean()) if saturation_mask.size else 0.0,
+        "regions": regions,
     }
     components = {
         "saturated": saturated,
@@ -1912,20 +1959,38 @@ def make_saturation_mask(data, metadata=None, settings=None):
     return components, info
 
 
-def _line_bad_indices(profile, sigma):
-    """Return indices of a 1D profile that deviate strongly from the median."""
+def _line_bad_indices(profile, sigma, window=15, minimum_deviation=0.0):
+    """Return indices of a 1D profile that jump away from their neighbors.
 
+    Each line is compared with a running median of the nearby lines, not with
+    the global median, so smooth sky gradients and vignetting near the frame
+    edges are not mistaken for bad rows or columns; only lines that differ
+    sharply from their neighbors are returned.
+    """
+
+    profile = np.asarray(profile, dtype=float)
     finite = np.isfinite(profile)
     if int(finite.sum()) < 10:
         return np.array([], dtype=int)
+    indices = np.arange(profile.size)
+    filled = np.interp(indices, indices[finite], profile[finite])
+    window = max(3, int(window) | 1)
+    ndimage = _try_ndimage()
+    if ndimage is not None:
+        local = ndimage.median_filter(filled, size=window, mode="nearest")
+    else:
+        local = np.full(profile.shape, np.median(filled))
+    residual = profile - local
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        median = np.nanmedian(profile)
-        scale = np.nanmedian(np.abs(profile - median)) * 1.4826
+        center = np.nanmedian(residual)
+        scale = np.nanmedian(np.abs(residual - center)) * 1.4826
     if not np.isfinite(scale) or scale <= 0:
         return np.array([], dtype=int)
-    deviation = np.abs(profile - median)
-    return np.where(finite & (deviation > sigma * scale))[0]
+    deviation = np.abs(residual - center)
+    return np.where(
+        finite & (deviation > sigma * scale) & (deviation > float(minimum_deviation))
+    )[0]
 
 
 def make_line_defect_mask(data, valid=None, settings=None):
@@ -1933,9 +1998,13 @@ def make_line_defect_mask(data, valid=None, settings=None):
     Mask hot or dead rows and columns using robust profile statistics.
 
     Row and column medians are computed over the usable pixels; a line whose
-    median departs from the robust global level by more than ``bad_line_sigma``
-    times the median absolute deviation is masked. A high default sigma keeps
-    ordinary stars and galaxies from being mistaken for defects.
+    median departs from the running median of its ``bad_line_window``
+    neighbors by more than ``bad_line_sigma`` times the robust scatter of those
+    departures, and by more than ``bad_line_min_pixel_sigma`` times the pixel
+    noise (so faint readout patterns well below the noise are left alone), is
+    masked. Comparing with neighbors keeps smooth gradients from
+    being flagged, and a high default sigma keeps ordinary stars and galaxies
+    from being mistaken for defects.
 
     Returns
     -------
@@ -1964,15 +2033,27 @@ def make_line_defect_mask(data, valid=None, settings=None):
     work[~np.isfinite(work)] = np.nan
 
     sigma = float(masks_settings.get("bad_line_sigma", 6.0))
+    window = int(masks_settings.get("bad_line_window", 15))
+    finite_values = work[np.isfinite(work)]
+    pixel_noise = 0.0
+    if finite_values.size:
+        center = np.median(finite_values)
+        pixel_noise = 1.4826 * float(np.median(np.abs(finite_values - center)))
+    minimum = float(masks_settings.get("bad_line_min_pixel_sigma", 1.0)) * pixel_noise
+    info["minimum_deviation"] = minimum
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         if detect_columns:
-            columns = _line_bad_indices(np.nanmedian(work, axis=0), sigma)
+            columns = _line_bad_indices(
+                np.nanmedian(work, axis=0), sigma, window, minimum
+            )
             info["bad_columns"] = columns.tolist()
             for column in columns:
                 mask[:, column] = True
         if detect_rows:
-            rows = _line_bad_indices(np.nanmedian(work, axis=1), sigma)
+            rows = _line_bad_indices(
+                np.nanmedian(work, axis=1), sigma, window, minimum
+            )
             info["bad_rows"] = rows.tolist()
             for row in rows:
                 mask[row, :] = True
@@ -2068,40 +2149,183 @@ def make_amplifier_seam_mask(data, valid=None, settings=None):
     return mask, info
 
 
-def detect_trails(data, base_mask=None, settings=None, exclude_mask=None):
-    """
-    Detect long, thin linear features such as asteroid or satellite trails.
+def _component_geometry(xs, ys):
+    """Robust centroid, direction, length and width of one pixel group.
 
-    Bright pixels are thresholded against a robust background, grouped into
-    connected components, and each component is accepted as a trail only when it
-    is long, narrow, and highly elongated. Compact sources therefore remain
-    untouched. Detection requires ``scipy``; without it the step is skipped.
+    Percentile extents keep a few stars that touch a trail from inflating its
+    width, so a satellite trail crossing a crowded field still looks thin.
+    """
+
+    coords = np.column_stack([xs, ys]).astype(float)
+    center = coords.mean(axis=0)
+    centered = coords - center
+    covariance = np.cov(centered, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    major = eigenvectors[:, int(np.argmax(eigenvalues))]
+    minor = eigenvectors[:, int(np.argmin(eigenvalues))]
+    along = centered @ major
+    across = centered @ minor
+    start, stop = np.percentile(along, [0.5, 99.5])
+    width = float(np.percentile(across, 95) - np.percentile(across, 5))
+    return {
+        "center_x": float(center[0]),
+        "center_y": float(center[1]),
+        "angle_deg": float(np.degrees(np.arctan2(major[1], major[0]))),
+        "start": float(start),
+        "stop": float(stop),
+        "length": float(stop - start),
+        "width": width,
+    }
+
+
+def _attached_saturated_region(geometry, xs, ys, regions, fwhm):
+    """Return the saturated region a candidate points at and touches, if any.
+
+    Bleed columns, readout smears and diffraction spikes run radially out of a
+    saturated star: the star sits on the feature's line and next to its end.
+    """
+
+    angle = np.radians(geometry["angle_deg"])
+    normal = np.array([-np.sin(angle), np.cos(angle)])
+    for region in regions or []:
+        offset = np.array([region["x"] - geometry["center_x"],
+                           region["y"] - geometry["center_y"]])
+        line_distance = abs(float(offset @ normal))
+        nearest = float(np.min(np.hypot(xs - region["x"], ys - region["y"])))
+        radius = float(region.get("radius_pixels", 0.0))
+        if line_distance <= radius + fwhm and nearest <= radius + 3.0 * fwhm:
+            return region
+    return None
+
+
+def _trace_trail(residual, usable, noise, geometry, half_width, settings):
+    """Follow a trail along its line in short chunks and return its extent.
+
+    In each chunk the median of the pixels on the line is compared with the
+    median of two parallel control strips. Starting from the detected segment
+    the trail is extended in both directions while chunks stay significant,
+    bridging masked chunks and gaps up to ``trail_max_gap_pixels``.
+    """
+
+    masks_settings = settings.get("masks", {})
+    chunk = float(masks_settings.get("trail_chunk_pixels", 32))
+    significance = float(masks_settings.get("trail_extend_sigma", 3.0))
+    maximum_gap = float(masks_settings.get("trail_max_gap_pixels", 200))
+    ny, nx = residual.shape
+    angle = np.radians(geometry["angle_deg"])
+    ux, uy = np.cos(angle), np.sin(angle)
+    grid_y, grid_x = np.mgrid[0:ny, 0:nx]
+    dx = grid_x - geometry["center_x"]
+    dy = grid_y - geometry["center_y"]
+    along = dx * ux + dy * uy
+    across = -dx * uy + dy * ux
+    outer = max(6.0 * half_width, half_width + 25.0)
+    band = np.abs(across) <= outer
+    t, d, values, ok = along[band], across[band], residual[band], usable[band]
+    edges = np.arange(t.min(), t.max() + chunk, chunk)
+    count = edges.size - 1
+    chunk_index = np.clip(np.digitize(t, edges) - 1, 0, count - 1)
+    on_line = ok & (np.abs(d) <= half_width)
+    control = ok & (np.abs(d) >= 2.5 * half_width + 2.0)
+    order = np.argsort(chunk_index, kind="stable")
+    bounds = np.searchsorted(chunk_index[order], np.arange(count + 1))
+    scores = np.full(count, np.nan)
+    offsets = np.full(count, np.nan)
+    for index in range(count):
+        members = order[bounds[index]:bounds[index + 1]]
+        line_values = values[members][on_line[members]]
+        control_values = values[members][control[members]]
+        if line_values.size < 0.3 * chunk * 2.0 * half_width or control_values.size < 30:
+            continue
+        reference = float(np.median(control_values))
+        error = 1.2533 * noise * np.sqrt(1.0 / line_values.size + 1.0 / control_values.size)
+        scores[index] = (float(np.median(line_values)) - reference) / error
+        near = members[ok[members] & (np.abs(d[members]) <= 2.0 * half_width)]
+        weights = np.clip(values[near] - reference, 0.0, None)
+        if weights.sum() > 0:
+            offsets[index] = float(np.sum(weights * d[near]) / weights.sum())
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    seed = np.flatnonzero(
+        (centers >= geometry["start"] - 0.5 * chunk)
+        & (centers <= geometry["stop"] + 0.5 * chunk)
+    )
+    if seed.size == 0:
+        seed = np.array([int(np.argmin(np.abs(centers)))])
+    detected = scores >= significance
+
+    def walk(start, step):
+        last, gap, index = start, 0.0, start + step
+        while 0 <= index < count:
+            if np.isfinite(scores[index]):
+                if detected[index]:
+                    last, gap = index, 0.0
+                else:
+                    gap += chunk
+                    if gap > maximum_gap:
+                        break
+            index += step
+        return last
+
+    first, last = walk(int(seed.min()), -1), walk(int(seed.max()), +1)
+    span = slice(first, last + 1)
+    known = np.isfinite(scores[span])
+    return {
+        "start": float(edges[first]),
+        "stop": float(edges[last + 1]),
+        "scores": scores,
+        "offsets": offsets,
+        "centers": centers,
+        "detected": detected,
+        "detected_fraction": float(np.mean(detected[span][known])) if known.any() else 0.0,
+    }
+
+
+def detect_trails(data, base_mask=None, settings=None, exclude_mask=None,
+                  saturated_regions=None):
+    """
+    Detect satellite, asteroid and aircraft trails and mask their full length.
+
+    Bright pixels (``trail_sigma`` above a robust background) are grouped into
+    connected components; a component seeds a trail when it is long, narrow and
+    highly elongated (robust percentile extents, so stars touching the trail
+    do not spoil it). Each seed is then followed along its line across the
+    whole image (see :func:`_trace_trail`), so a faint trail that breaks into
+    pieces is still masked end to end. Seeds that point at and touch a
+    saturated star (bleed columns, readout smears, diffraction spikes) are not
+    trails: they are returned as ``info["bleed_mask"]`` so the caller can add
+    them to the saturation mask. Detection requires ``scipy``.
 
     Parameters
     ----------
     base_mask : numpy.ndarray, optional
         Pixels to ignore during detection (edges, existing mask).
     exclude_mask : numpy.ndarray, optional
-        Additional pixels to exclude, typically the saturation mask so that
-        bleed and diffraction spikes are not mistaken for trails.
+        Additional pixels to exclude, typically the saturation mask.
+    saturated_regions : list of dict, optional
+        ``info["regions"]`` from :func:`make_saturation_mask`, used to
+        recognize bleeds and spikes.
 
     Returns
     -------
     trail_mask : numpy.ndarray
         Boolean mask of accepted, grown trails.
     trails : list of dict
-        Per-trail geometry (length, width, elongation, centroid, angle).
+        Per-trail geometry (start and end, length, width, angle, detected
+        fraction along the line).
     info : dict
-        Detection summary.
+        Detection summary, rejected bleed candidates, and ``bleed_mask``.
     """
 
     if settings is None:
         settings = get_default_settings()
     masks_settings = settings.get("masks", {})
-    shape = np.asarray(data).shape
+    data = np.asarray(data, dtype=float)
+    shape = data.shape
     trail_mask = np.zeros(shape, dtype=bool)
+    bleed_mask = np.zeros(shape, dtype=bool)
     trails = []
-    info = {"n_trails": 0, "detected": False, "skipped": None}
+    info = {"n_trails": 0, "detected": False, "skipped": None, "bleeds": [],
+            "bleed_mask": bleed_mask}
 
     if not masks_settings.get("detect_trails", True):
         info["skipped"] = "disabled"
@@ -2138,49 +2362,105 @@ def detect_trails(data, base_mask=None, settings=None, exclude_mask=None):
     max_width = float(masks_settings.get("trail_max_width_pixels", 20))
     min_elongation = float(masks_settings.get("trail_min_elongation", 4.0))
     min_pixels = int(masks_settings.get("trail_min_pixels", 20))
+    grow = int(masks_settings.get("trail_grow_pixels", 5))
+    fwhm = _fwhm_guess_pixels(settings)
+    residual = data - median
 
     # Use 8-connectivity so thin diagonal trails form a single component.
-    labels, count = ndimage.label(binary, structure=np.ones((3, 3), dtype=int))
-    for label in range(1, count + 1):
-        component = labels == label
-        pixels = int(component.sum())
-        if pixels < min_pixels:
+    labels, _ = ndimage.label(binary, structure=np.ones((3, 3), dtype=int))
+    sizes = np.bincount(labels.ravel())
+    seeds = []
+    for label, window in enumerate(ndimage.find_objects(labels), start=1):
+        if window is None or sizes[label] < min_pixels:
             continue
-        ys, xs = np.where(component)
-        coords = np.column_stack([xs, ys]).astype(float)
-        centered = coords - coords.mean(axis=0)
-        covariance = np.cov(centered, rowvar=False)
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-        major = eigenvectors[:, int(np.argmax(eigenvalues))]
-        minor = eigenvectors[:, int(np.argmin(eigenvalues))]
-        projection_major = centered @ major
-        projection_minor = centered @ minor
-        length = float(projection_major.max() - projection_major.min())
-        width = float(projection_minor.max() - projection_minor.min())
-        elongation = length / max(width, 1.0)
-        if length >= min_length and width <= max_width and elongation >= min_elongation:
-            trail_mask |= component
-            trails.append(
-                {
-                    "label": int(label),
-                    "pixels": pixels,
-                    "length_pixels": length,
-                    "width_pixels": width,
-                    "elongation": elongation,
-                    "centroid_x": float(xs.mean()),
-                    "centroid_y": float(ys.mean()),
-                    "angle_deg": float(
-                        np.degrees(np.arctan2(major[1], major[0]))
-                    ),
-                }
-            )
+        local_y, local_x = np.nonzero(labels[window] == label)
+        xs = local_x + window[1].start
+        ys = local_y + window[0].start
+        geometry = _component_geometry(xs, ys)
+        elongation = geometry["length"] / max(geometry["width"], 1.0)
+        if (
+            geometry["length"] >= min_length
+            and geometry["width"] <= max_width
+            and elongation >= min_elongation
+        ):
+            seeds.append((label, xs, ys, geometry, elongation))
+    seeds.sort(key=lambda item: -item[3]["length"])
 
-    grow = int(masks_settings.get("trail_grow_pixels", 5))
-    if trail_mask.any() and grow > 0:
-        trail_mask = ndimage.binary_dilation(trail_mask, iterations=grow)
+    for label, xs, ys, geometry, elongation in seeds:
+        if trail_mask[ys, xs].mean() >= 0.5 or bleed_mask[ys, xs].mean() >= 0.5:
+            continue
+        attached = _attached_saturated_region(
+            geometry, xs, ys, saturated_regions, fwhm
+        )
+        if attached is not None:
+            component = np.zeros(shape, dtype=bool)
+            component[ys, xs] = True
+            if grow > 0:
+                component = ndimage.binary_dilation(component, iterations=grow)
+            bleed_mask |= component
+            info["bleeds"].append({
+                "center_x": geometry["center_x"],
+                "center_y": geometry["center_y"],
+                "length_pixels": geometry["length"],
+                "angle_deg": geometry["angle_deg"],
+                "star_x": attached["x"],
+                "star_y": attached["y"],
+            })
+            continue
+        half_width = max(1.5, 0.5 * geometry["width"])
+        trace = _trace_trail(residual, valid, scale, geometry, half_width, settings)
+        if masks_settings.get("trail_refine_line", True):
+            detected = trace["detected"] & np.isfinite(trace["offsets"])
+            if np.count_nonzero(detected) >= 3:
+                slope, intercept = np.polyfit(
+                    trace["centers"][detected], trace["offsets"][detected], 1
+                )
+                angle = np.radians(geometry["angle_deg"])
+                refined = dict(geometry)
+                refined["center_x"] = geometry["center_x"] - intercept * np.sin(angle)
+                refined["center_y"] = geometry["center_y"] + intercept * np.cos(angle)
+                refined["angle_deg"] = geometry["angle_deg"] + float(np.degrees(np.arctan(slope)))
+                geometry = refined
+                trace = _trace_trail(residual, valid, scale, geometry, half_width, settings)
+        angle = np.radians(geometry["angle_deg"])
+        ux, uy = np.cos(angle), np.sin(angle)
+        grid_y, grid_x = np.mgrid[0:shape[0], 0:shape[1]]
+        dx = grid_x - geometry["center_x"]
+        dy = grid_y - geometry["center_y"]
+        along = dx * ux + dy * uy
+        across = -dx * uy + dy * ux
+        component = (
+            (along >= trace["start"]) & (along <= trace["stop"])
+            & (np.abs(across) <= half_width + grow)
+        )
+        trail_mask |= component
+        start_x = geometry["center_x"] + trace["start"] * ux
+        start_y = geometry["center_y"] + trace["start"] * uy
+        stop_x = geometry["center_x"] + trace["stop"] * ux
+        stop_y = geometry["center_y"] + trace["stop"] * uy
+        length = trace["stop"] - trace["start"]
+        trails.append(
+            {
+                "label": int(label),
+                "pixels": int(component.sum()),
+                "length_pixels": float(length),
+                "width_pixels": float(2.0 * half_width),
+                "elongation": float(length / max(2.0 * half_width, 1.0)),
+                "seed_length_pixels": float(geometry["length"]),
+                "detected_fraction": trace["detected_fraction"],
+                "centroid_x": float(0.5 * (start_x + stop_x)),
+                "centroid_y": float(0.5 * (start_y + stop_y)),
+                "start_x": float(start_x),
+                "start_y": float(start_y),
+                "end_x": float(stop_x),
+                "end_y": float(stop_y),
+                "angle_deg": float(geometry["angle_deg"]),
+            }
+        )
 
     info["n_trails"] = len(trails)
     info["detected"] = bool(trails)
+    info["bleed_mask"] = bleed_mask
     return trail_mask, trails, info
 
 
@@ -2447,7 +2727,7 @@ def build_masks(ccd, metadata=None, settings=None, target=None, valid=None):
     nonfinite = ~np.isfinite(data)
 
     saturation_components, saturation_info = make_saturation_mask(
-        data, metadata, settings
+        data, metadata, settings, exclude=base
     )
     saturation_full = saturation_components["saturation"]
 
@@ -2463,7 +2743,14 @@ def build_masks(ccd, metadata=None, settings=None, target=None, valid=None):
     trail_mask, trails, trail_info = detect_trails(
         data, base_mask=trail_exclude, settings=settings,
         exclude_mask=saturation_full,
+        saturated_regions=saturation_info.get("regions"),
     )
+    # Bleeds and spikes running out of saturated stars belong to the
+    # saturation mask, not to the trail mask.
+    bleed_mask = trail_info.pop("bleed_mask", None)
+    if bleed_mask is not None and np.any(bleed_mask):
+        saturation_full = saturation_full | bleed_mask
+        saturation_components["saturation"] = saturation_full
 
     pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
     manual_mask, manual_info = make_manual_mask(
@@ -2733,11 +3020,22 @@ def apply_cosmic_rays(ccd, metadata=None, settings=None, target=None, psf_positi
         detect_kwargs["satlevel"] = float(saturation)
     info["parameters"] = dict(detect_kwargs)
 
-    inmask = existing_mask if existing_mask is not None else None
+    # astroscrappy cannot handle NaN/inf (e.g. overscan or flat-field holes):
+    # hand it a finite copy and tell it to ignore those pixels.
+    finite = np.isfinite(data)
+    if not finite.any():
+        info["skipped"] = "no_finite_pixels"
+        return ccd, products, info
+    working_data = np.array(data, dtype=np.float32)
+    if not finite.all():
+        working_data[~finite] = np.float32(np.median(data[finite]))
+    inmask = ~finite
+    if existing_mask is not None:
+        inmask = inmask | existing_mask
     try:
         cosmic_mask, cleaned = astroscrappy.detect_cosmics(
-            np.ascontiguousarray(data, dtype=np.float32),
-            inmask=inmask,
+            np.ascontiguousarray(working_data),
+            inmask=np.ascontiguousarray(inmask),
             **detect_kwargs,
         )
     except Exception as error:
@@ -2748,12 +3046,12 @@ def apply_cosmic_rays(ccd, metadata=None, settings=None, target=None, psf_positi
         info["skipped"] = "detection_failed"
         return ccd, products, info
 
-    cosmic_mask = np.asarray(cosmic_mask, dtype=bool)
+    cosmic_mask = np.asarray(cosmic_mask, dtype=bool) & ~inmask
     grow = int(cosmic_settings.get("grow_pixels", 1))
     if grow > 0 and cosmic_mask.any():
         ndimage = _try_ndimage()
         if ndimage is not None:
-            cosmic_mask = ndimage.binary_dilation(cosmic_mask, iterations=grow)
+            cosmic_mask = ndimage.binary_dilation(cosmic_mask, iterations=grow) & finite
 
     products["cosmic_mask"] = cosmic_mask
     info["applied"] = True
@@ -2770,6 +3068,25 @@ def apply_cosmic_rays(ccd, metadata=None, settings=None, target=None, psf_positi
         info["target_overlap"] = overlap
         if overlap:
             info["flags"].append("TARGET_COSMIC_RAY")
+            if cosmic_settings.get("reject_if_target_overlap", True):
+                # L.A.Cosmic can mistake a compact, well-sampled transient for
+                # a hit. Never mask the target: drop every detection that
+                # touches the target region and keep the flag for review.
+                ndimage = _try_ndimage()
+                if ndimage is not None:
+                    labels, _ = ndimage.label(cosmic_mask, structure=np.ones((3, 3), dtype=int))
+                    yy, xx = np.ogrid[:shape[0], :shape[1]]
+                    near = (xx - target_xy[0]) ** 2 + (yy - target_xy[1]) ** 2 <= radius ** 2
+                    touching = np.unique(labels[near & cosmic_mask])
+                    touching = touching[touching > 0]
+                    protected = np.isin(labels, touching)
+                    info["target_protected_pixels"] = int(protected.sum())
+                    cosmic_mask = cosmic_mask & ~protected
+                    products["cosmic_mask"] = cosmic_mask
+                    info["cosmic_pixel_count"] = int(cosmic_mask.sum())
+                    info["cosmic_pixel_fraction"] = (
+                        float(cosmic_mask.mean()) if cosmic_mask.size else 0.0
+                    )
 
     if psf_positions:
         radius = float(cosmic_settings.get("psf_core_radius_fwhm", 1.0)) * fwhm
@@ -3316,7 +3633,7 @@ def make_background_source_mask(ccd, metadata=None, settings=None, target=None):
     source_count = 0
     fwhm = _fwhm_guess_pixels(settings)
     grow_radius = int(
-        np.ceil(float(background_settings.get("source_mask_grow_fwhm", 3.0)) * fwhm)
+        np.ceil(float(background_settings.get("source_mask_grow_fwhm", 1.5)) * fwhm)
     )
     grow_size = max(1, 2 * grow_radius + 1)
 
@@ -3683,7 +4000,7 @@ def model_background(ccd, metadata=None, settings=None, target=None):
             mask=background_mask,
             filter_size=filter_size,
             exclude_percentile=float(
-                background_settings.get("exclude_percentile", 20.0)
+                background_settings.get("exclude_percentile", 50.0)
             ),
             sigma_clip=sigma_clip,
             bkg_estimator=bkg_estimator,
@@ -3693,7 +4010,15 @@ def model_background(ccd, metadata=None, settings=None, target=None):
         background_rms = np.asarray(estimator.background_rms, dtype=float)
         mesh_background = np.asarray(estimator.background_mesh, dtype=float)
         mesh_rms = np.asarray(estimator.background_rms_mesh, dtype=float)
-        mesh_excluded = np.asarray(estimator.n_pixels_mesh == 0, dtype=bool)
+        # Photutils drops (and interpolates) every box whose number of usable
+        # pixels after clipping is at or below (1 - exclude_percentile/100)
+        # of the box area, not only the fully masked ones.
+        used_pixels = getattr(estimator, "n_pixels_mesh", None)
+        if used_pixels is None:
+            used_pixels = estimator.npixels_mesh
+        exclude_percentile = float(background_settings.get("exclude_percentile", 50.0))
+        good_threshold = (1.0 - exclude_percentile / 100.0) * float(np.prod(effective_box))
+        mesh_excluded = np.asarray(np.asarray(used_pixels) <= good_threshold, dtype=bool)
     except (ImportError, TypeError, ValueError) as error:
         if not background_settings.get("fallback_to_global", True):
             raise
@@ -3732,6 +4057,16 @@ def model_background(ccd, metadata=None, settings=None, target=None):
     )
     info["measured"] = True
     info["excluded_mesh_fraction"] = float(mesh_excluded.mean())
+    info["measured_mesh_count"] = int(np.count_nonzero(~mesh_excluded))
+    info["mesh_count"] = int(mesh_excluded.size)
+    excluded_warn = background_settings.get("excluded_mesh_warn_fraction", 0.5)
+    if (
+        excluded_warn is not None
+        and info.get("fallback") is None
+        and mesh_excluded.size > 1
+        and mesh_excluded.mean() > float(excluded_warn)
+    ):
+        info["flags"].append("BACKGROUND_MESHES_EXCLUDED")
 
     if background_settings.get("measure_residual_gradient", True):
         maximum = int(background_settings.get("gradient_max_samples", 50000))
@@ -3899,6 +4234,7 @@ def _empty_source_table():
         ("peak", float),
         ("fwhm_pixels", float),
         ("fwhm_arcsec", float),
+        ("moment_fwhm_pixels", float),
         ("ellipticity", float),
         ("orientation_deg", float),
         ("saturated", bool),
@@ -3912,8 +4248,119 @@ def _empty_source_table():
     table["area_pixels"].unit = u.pixel ** 2
     table["fwhm_pixels"].unit = u.pixel
     table["fwhm_arcsec"].unit = u.arcsec
+    table["moment_fwhm_pixels"].unit = u.pixel
     table["orientation_deg"].unit = u.deg
     return table
+
+
+def _fit_gaussian_fwhm(data, mask, segmentation, label, x, y, guess, half_size):
+    """Fit one star with an elliptical Gaussian and return its FWHM in pixels.
+
+    The fit uses a ``(2 half_size + 1)``-pixel square cutout. Pixels that are
+    masked, non-finite, or belong to a different segment (a neighbor) carry
+    zero weight, and a constant term absorbs any residual local sky. The FWHM
+    is the geometric mean of the two axes. ``NaN`` is returned when the cutout
+    leaves the image, too much of it is unusable, or the fit wanders off the
+    star.
+    """
+
+    from astropy.modeling import fitting, models
+
+    ny, nx = data.shape
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1 = xi - half_size, xi + half_size + 1
+    y0, y1 = yi - half_size, yi + half_size + 1
+    if x0 < 0 or y0 < 0 or x1 > nx or y1 > ny:
+        return np.nan
+    cut = data[y0:y1, x0:x1]
+    bad = mask[y0:y1, x0:x1] | ~np.isfinite(cut)
+    if segmentation is not None:
+        segments = segmentation[y0:y1, x0:x1]
+        bad = bad | ((segments != 0) & (segments != int(label)))
+    if bad.mean() > 0.3:
+        return np.nan
+    peak = float(np.max(np.where(bad, -np.inf, cut)))
+    if not np.isfinite(peak) or peak <= 0:
+        return np.nan
+    grid_y, grid_x = np.mgrid[y0:y1, x0:x1]
+    sigma = max(0.5, float(guess) / 2.3548)
+    model = models.Gaussian2D(peak, x, y, sigma, sigma, 0.0) + models.Const2D(0.0)
+    model.x_stddev_0.bounds = (0.3, 4.0 * half_size)
+    model.y_stddev_0.bounds = (0.3, 4.0 * half_size)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted = fitting.LevMarLSQFitter()(
+                model, grid_x, grid_y, np.where(bad, 0.0, cut),
+                weights=(~bad).astype(float), maxiter=200,
+            )
+    except Exception:
+        return np.nan
+    gaussian = fitted[0]
+    if (
+        gaussian.amplitude.value <= 0
+        or abs(gaussian.x_mean.value - x) > 2.0
+        or abs(gaussian.y_mean.value - y) > 2.0
+    ):
+        return np.nan
+    fwhm = 2.3548 * float(np.sqrt(abs(gaussian.x_stddev.value * gaussian.y_stddev.value)))
+    return fwhm if np.isfinite(fwhm) and 0.5 < fwhm < 2.0 * half_size else np.nan
+
+
+def measure_gaussian_fwhm(data, mask, segmentation, labels, x, y, candidates,
+                          settings=None):
+    """Measure the seeing from Gaussian fits to bright, isolated stars.
+
+    Moment widths of detection segments grow with brightness because brighter
+    stars have larger footprints, so they are a poor seeing estimate. Here each
+    candidate star (unsaturated, away from the edge, high S/N) is fitted with
+    an elliptical Gaussian whose width does not depend on the footprint. A
+    first pass on the brightest candidates sets the cutout size (about two
+    FWHM on each side); the second pass fits up to
+    ``source_detection.seeing_maximum_fits`` candidates in order of S/N.
+
+    Returns
+    -------
+    fwhm : numpy.ndarray
+        Fitted FWHM in pixels for every source (``NaN`` where not fitted).
+    info : dict
+        Number of fits attempted and succeeded, and the cutout half-size.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    detection = settings.get("source_detection", {})
+    guess = max(1.0, _fwhm_guess_pixels(settings))
+    candidates = np.flatnonzero(np.asarray(candidates, dtype=bool))
+    fwhm = np.full(len(x), np.nan, dtype=float)
+    info = {"attempted": 0, "fitted": 0, "half_size_pixels": None}
+    if candidates.size == 0:
+        return fwhm, info
+    maximum = int(detection.get("seeing_maximum_fits", 300))
+    candidates = candidates[:maximum] if maximum > 0 else candidates
+    data = np.asarray(data, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    first = candidates[:min(30, candidates.size)]
+    half = int(np.clip(np.ceil(2.5 * guess), 5, 30))
+    trial = np.array([
+        _fit_gaussian_fwhm(data, mask, segmentation, labels[i], x[i], y[i], guess, half)
+        for i in first
+    ])
+    if np.any(np.isfinite(trial)):
+        estimate = float(np.nanmedian(trial))
+        half = int(np.clip(np.ceil(2.0 * estimate), 5, 30))
+    else:
+        estimate = guess
+    for index in candidates:
+        fwhm[index] = _fit_gaussian_fwhm(
+            data, mask, segmentation, labels[index], x[index], y[index], estimate, half
+        )
+    info.update({
+        "attempted": int(candidates.size),
+        "fitted": int(np.count_nonzero(np.isfinite(fwhm))),
+        "half_size_pixels": half,
+    })
+    return fwhm, info
 
 
 def _quality_background(data, mask, background_products, settings):
@@ -4236,6 +4683,7 @@ def detect_sources_and_measure_quality(
     detection_error = None
     deblend_applied = False
     deblend_error = None
+    seeing_fit_info = None
 
     if (
         detection_settings.get("enabled", True)
@@ -4337,16 +4785,11 @@ def detect_sources_and_measure_quality(
             with np.errstate(divide="ignore", invalid="ignore"):
                 snr = flux / flux_error
             peak = _plain_array(catalog.max_value)
-            fwhm_pixels = _plain_array(catalog.fwhm)
+            moment_fwhm_pixels = _plain_array(catalog.fwhm)
             ellipticity = _plain_array(catalog.ellipticity)
             orientation = _plain_array(catalog.orientation)
             labels = np.asarray(catalog.labels, dtype=int)
 
-            pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
-            if pixel_scale is None:
-                fwhm_arcsec = np.full(fwhm_pixels.shape, np.nan)
-            else:
-                fwhm_arcsec = fwhm_pixels * pixel_scale
             saturation_level = settings.get("masks", {}).get("saturation_level")
             if saturation_level is None and metadata is not None:
                 saturation_level = _as_float(metadata.get("saturation"))
@@ -4364,26 +4807,52 @@ def detect_sources_and_measure_quality(
                 | (x > data.shape[1] - 1 - border)
                 | (y > data.shape[0] - 1 - border)
             )
-            good = (
-                np.isfinite(fwhm_pixels)
-                & np.isfinite(ellipticity)
+            # Seeing comes from Gaussian fits to bright, unsaturated stars:
+            # segment moment widths grow with brightness (bigger footprints),
+            # so they are kept only as ``moment_fwhm_pixels`` for reference.
+            candidates = (
+                np.isfinite(ellipticity)
                 & np.isfinite(snr)
-                & (snr >= float(detection_settings.get("minimum_snr", 5.0)))
-                & (fwhm_pixels >= float(
-                    detection_settings.get("minimum_fwhm_pixels", 1.0)
-                ))
+                & (snr >= float(detection_settings.get("seeing_minimum_snr", 20.0)))
                 & (ellipticity <= float(
                     detection_settings.get(
                         "maximum_ellipticity_for_seeing", 0.50
                     )
                 ))
                 & ~near_edge
+                & ~saturated
+            )
+            if saturation_level is not None:
+                candidates &= peak < 0.8 * float(saturation_level)
+            snr_order = np.argsort(np.where(candidates, -snr, np.inf))
+            ranked = np.zeros(snr.shape, dtype=bool)
+            fwhm_pixels = np.full(snr.shape, np.nan)
+            if np.any(candidates):
+                ordered = snr_order[: int(np.count_nonzero(candidates))]
+                ranked_fwhm, seeing_fit_info = measure_gaussian_fwhm(
+                    source_data, mask, segmentation_array, labels[ordered],
+                    x[ordered], y[ordered], np.ones(ordered.size, dtype=bool),
+                    settings,
+                )
+                fwhm_pixels[ordered] = ranked_fwhm
+                ranked[ordered] = True
+            else:
+                seeing_fit_info = {"attempted": 0, "fitted": 0, "half_size_pixels": None}
+            pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
+            if pixel_scale is None:
+                fwhm_arcsec = np.full(fwhm_pixels.shape, np.nan)
+            else:
+                fwhm_arcsec = fwhm_pixels * pixel_scale
+            good = (
+                candidates
+                & np.isfinite(fwhm_pixels)
+                & (fwhm_pixels >= float(
+                    detection_settings.get("minimum_fwhm_pixels", 1.0)
+                ))
             )
             maximum_fwhm = detection_settings.get("maximum_fwhm_pixels")
             if maximum_fwhm is not None:
                 good &= fwhm_pixels <= float(maximum_fwhm)
-            if detection_settings.get("reject_saturated", True):
-                good &= ~saturated
 
             order = np.argsort(np.nan_to_num(flux, nan=-np.inf))[::-1]
             maximum_sources = int(detection_settings.get("maximum_sources", 1000))
@@ -4401,6 +4870,7 @@ def detect_sources_and_measure_quality(
                 "peak": peak[order],
                 "fwhm_pixels": fwhm_pixels[order],
                 "fwhm_arcsec": fwhm_arcsec[order],
+                "moment_fwhm_pixels": moment_fwhm_pixels[order],
                 "ellipticity": ellipticity[order],
                 "orientation_deg": orientation[order],
                 "saturated": saturated[order],
@@ -4415,6 +4885,7 @@ def detect_sources_and_measure_quality(
                 ("area_pixels", u.pixel ** 2),
                 ("fwhm_pixels", u.pixel),
                 ("fwhm_arcsec", u.arcsec),
+                ("moment_fwhm_pixels", u.pixel),
                 ("orientation_deg", u.deg),
             ):
                 sources[name].unit = unit
@@ -4502,6 +4973,8 @@ def detect_sources_and_measure_quality(
         "deblend_error": deblend_error,
         "fwhm_pixels": fwhm_pixels,
         "fwhm_arcsec": fwhm_arcsec,
+        "fwhm_method": "gaussian_fit",
+        "seeing_fit": seeing_fit_info,
         "fwhm_scatter_pixels": fwhm_scatter_pixels,
         "fwhm_scatter_arcsec": fwhm_scatter_arcsec,
         "fwhm_scatter_fraction": fwhm_scatter_fraction,
@@ -4651,7 +5124,19 @@ def _batch_metric_reference(results, metric):
     )
 
 
-def assess_image_quality_batch(results, settings=None):
+def _metric_value(result, metric, exposure_time):
+    """Value of one quality metric, as a rate for sky levels when possible."""
+
+    value = result.get(metric)
+    if value is None or not np.isfinite(value):
+        return None
+    if metric in {"background", "background_rms"} and exposure_time:
+        return float(value) / float(exposure_time)
+    return float(value)
+
+
+def assess_image_quality_batch(results, settings=None, groups=None,
+                               exposure_times=None):
     """Apply deviations from batch medians to image-quality results.
 
     The input dictionaries are not modified.  Relative checks are skipped
@@ -4660,6 +5145,13 @@ def assess_image_quality_batch(results, settings=None):
     still allowing a poor-seeing or unusually noisy exposure to be identified
     in a homogeneous observing sequence.
 
+    Images are compared with others in the same group (normally the same
+    filter) when ``groups`` is given. Sky level and sky noise are only
+    compared within a group, and as rates per second when exposure times are
+    given, because different filters and exposure times legitimately have very
+    different skies. Seeing and ellipticity fall back to the whole batch when a
+    group is too small.
+
     Parameters
     ----------
     results : sequence of mapping
@@ -4667,6 +5159,10 @@ def assess_image_quality_batch(results, settings=None):
         :func:`detect_sources_and_measure_quality`.
     settings : mapping, optional
         Resolved run settings containing batch thresholds.
+    groups : sequence, optional
+        Group label (e.g. filter) for each result.
+    exposure_times : sequence of float, optional
+        Exposure time of each image in seconds.
 
     Returns
     -------
@@ -4680,6 +5176,12 @@ def assess_image_quality_batch(results, settings=None):
         settings = get_default_settings()
     quality_settings = settings.get("image_quality", {})
     assessed = deepcopy(list(results))
+    count = len(assessed)
+    groups = list(groups) if groups is not None else [None] * count
+    exposure_times = (
+        [_usable_float(value) for value in exposure_times]
+        if exposure_times is not None else [None] * count
+    )
     minimum_images = int(quality_settings.get("batch_minimum_images", 3))
     metric_settings = (
         (
@@ -4711,28 +5213,37 @@ def assess_image_quality_batch(results, settings=None):
             "BACKGROUND_RMS_HIGH",
         ),
     )
-    references = {}
-    for metric, _, _, _, _ in metric_settings:
-        median, scatter = _batch_metric_reference(assessed, metric)
-        count = sum(
-            result.get(metric) is not None
-            and np.isfinite(result.get(metric))
-            for result in assessed
-        )
-        references[metric] = {
-            "median": median,
-            "scatter": scatter,
-            "count": int(count),
-        }
+    within_group_only = {"background", "background_rms"}
 
-    for result in assessed:
+    def reference_for(metric, members):
+        values = [
+            _metric_value(assessed[index], metric, exposure_times[index])
+            for index in members
+        ]
+        values = [value for value in values if value is not None]
+        median, scatter = _robust_location_scatter(values)
+        return {"median": median, "scatter": scatter, "count": len(values)}
+
+    everyone = list(range(count))
+    for index, result in enumerate(assessed):
+        same_group = [
+            other for other in everyone if groups[other] == groups[index]
+        ]
+        references = {}
+        for metric, _, _, _, _ in metric_settings:
+            reference = reference_for(metric, same_group)
+            reference["group"] = groups[index]
+            if reference["count"] < minimum_images and metric not in within_group_only:
+                reference = reference_for(metric, everyone)
+                reference["group"] = "all"
+            references[metric] = reference
         result["batch_reference"] = deepcopy(references)
         checks = result.setdefault("checks", [])
         flags = result.setdefault("quality_flags", [])
         status = result.get("quality_status", "PASS")
         for metric, method, warn_name, fail_name, flag in metric_settings:
             reference = references[metric]
-            value = result.get(metric)
+            value = _metric_value(result, metric, exposure_times[index])
             median = reference["median"]
             if (
                 reference["count"] < minimum_images
@@ -4892,8 +5403,35 @@ def _quick_zeropoint(rows, metadata, settings):
         if "role_calibration" in rows.colnames
         else np.ones(len(rows), dtype=bool)
     )
-    flux = np.ma.asarray(rows["flux"], dtype=float)
     magnitude = np.ma.asarray(rows["magnitude"], dtype=float)
+    method = "catalog_segment_flux"
+    aperture_correction = None
+    flux = np.ma.asarray(rows["flux"], dtype=float)
+    if "aperture_flux" in rows.colnames:
+        aperture = np.ma.asarray(rows["aperture_flux"], dtype=float)
+        usable = (
+            role & ~np.ma.getmaskarray(aperture)
+            & np.isfinite(aperture.filled(np.nan)) & (aperture.filled(0.0) > 0)
+        )
+        if np.count_nonzero(usable) >= 3:
+            # Fixed apertures have no brightness-dependent loss; a single
+            # aperture correction measured on the brightest calibration stars
+            # brings them to total flux.
+            flux = aperture
+            method = "aperture_flux"
+            if "aperture_flux_large" in rows.colnames:
+                large = np.ma.asarray(rows["aperture_flux_large"], dtype=float).filled(np.nan)
+                small = aperture.filled(np.nan)
+                pairs = usable & np.isfinite(large) & (large > 0)
+                if np.count_nonzero(pairs) >= 3:
+                    brightest = np.argsort(np.where(pairs, -small, np.inf))[
+                        :min(int(usability.get("aperture_correction_stars", 20)),
+                             int(np.count_nonzero(pairs)))
+                    ]
+                    aperture_correction = float(
+                        np.median(-2.5 * np.log10(large[brightest] / small[brightest]))
+                    )
+                    method = "aperture_flux_corrected"
     valid = (
         role
         & ~np.ma.getmaskarray(flux)
@@ -4905,7 +5443,7 @@ def _quick_zeropoint(rows, metadata, settings):
     zeropoints = np.full(len(rows), np.nan, dtype=float)
     zeropoints[valid] = magnitude.filled(np.nan)[valid] + 2.5 * np.log10(
         flux.filled(np.nan)[valid] / exposure
-    )
+    ) - (aperture_correction or 0.0)
     inlier = np.zeros(len(rows), dtype=bool)
     if np.count_nonzero(valid) == 0:
         return zeropoints, None, inlier, "unavailable"
@@ -4929,8 +5467,9 @@ def _quick_zeropoint(rows, metadata, settings):
         "zeropoint_scatter_mag": scatter,
         "star_count": int(values.size),
         "rejected_star_count": int(np.count_nonzero(valid & ~inlier)),
+        "aperture_correction_mag": aperture_correction,
     }
-    return zeropoints, result, inlier, "catalog_segment_flux"
+    return zeropoints, result, inlier, method
 
 
 def _spatial_cloud_amplitude(rows, zeropoints, inlier, shape, settings):
@@ -5234,7 +5773,9 @@ def assess_image_usability(image_records, measurements, settings=None,
     ).get("manual_decisions", {})
     decisions = []
     residual_rows = []
-    qc_anchor_id = None
+    # One quality-control anchor per filter: a star that is the brightest
+    # usable one in g may be saturated (and so never an anchor) in r or i.
+    qc_anchors = {}
     if (
         measurements is not None
         and len(measurements)
@@ -5243,13 +5784,38 @@ def assess_image_usability(image_records, measurements, settings=None,
         qc_rows = measurements[
             np.asarray(measurements["role_qc_anchor"], dtype=bool)
         ]
-        if len(qc_rows):
+        filters = (
+            np.asarray(qc_rows["filter"], dtype=str)
+            if "filter" in qc_rows.colnames
+            else np.full(len(qc_rows), "", dtype="U1")
+        )
+        all_filters = (
+            np.asarray(measurements["filter"], dtype=str)
+            if "filter" in measurements.colnames
+            else np.full(len(measurements), "", dtype="U1")
+        )
+        all_ids = np.asarray(measurements["persistent_id"], dtype=str)
+        all_images = np.asarray(measurements["image_id"], dtype=str)
+        all_saturated = (
+            np.asarray(measurements["saturated"], dtype=bool)
+            if "saturated" in measurements.colnames
+            else np.zeros(len(measurements), dtype=bool)
+        )
+        for filter_name in sorted(set(filters.tolist())):
+            filter_rows = qc_rows[filters == filter_name]
+            in_filter = all_filters == filter_name
             candidates = []
             for persistent_id in set(
-                str(value) for value in qc_rows["persistent_id"]
+                str(value) for value in filter_rows["persistent_id"]
             ):
-                same = np.asarray(qc_rows["persistent_id"], dtype=str) == persistent_id
-                magnitudes = np.ma.asarray(qc_rows["magnitude"][same], dtype=float)
+                # Prefer the anchor that is actually measured (and not
+                # saturated) in the most images of this filter, then the
+                # brightest: each image nominates its own anchor, and the
+                # brightest nominee is often saturated in better seeing.
+                present = in_filter & (all_ids == persistent_id) & ~all_saturated
+                image_count = len(set(all_images[present].tolist()))
+                same = np.asarray(filter_rows["persistent_id"], dtype=str) == persistent_id
+                magnitudes = np.ma.asarray(filter_rows["magnitude"][same], dtype=float)
                 finite = np.asarray(
                     magnitudes.compressed(), dtype=float
                 )
@@ -5257,9 +5823,10 @@ def assess_image_usability(image_records, measurements, settings=None,
                     float(np.median(finite)) if finite.size else np.inf
                 )
                 candidates.append(
-                    (-int(np.count_nonzero(same)), median_magnitude, persistent_id)
+                    (-image_count, -int(np.count_nonzero(same)), median_magnitude, persistent_id)
                 )
-            qc_anchor_id = min(candidates)[2]
+            if candidates:
+                qc_anchors[filter_name] = min(candidates)[3]
 
     for index, record in enumerate(image_records):
         image_id = _usability_image_id(record, index)
@@ -5270,6 +5837,10 @@ def assess_image_usability(image_records, measurements, settings=None,
         metadata = record.get("metadata") or {}
         quality = deepcopy(record.get("quality") or {})
         rows = _image_measurements(measurements, image_id)
+        image_filter = str(metadata.get("filter") or "")
+        if image_filter not in qc_anchors and len(rows) and "filter" in rows.colnames:
+            image_filter = str(rows["filter"][0])
+        qc_anchor_id = qc_anchors.get(image_filter)
         recovery, expected_count, recovered_count = _catalog_recovery(
             record, rows, image_settings
         )

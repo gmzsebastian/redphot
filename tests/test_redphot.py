@@ -188,7 +188,7 @@ def test_synthetic_trail_is_detected_and_masked():
     assert np.count_nonzero(mask[60:68, 10:120]) > 0
 
 
-def test_synthetic_poor_seeing_and_shallow_epoch_is_rejected():
+def test_synthetic_poor_seeing_and_shallow_epoch_is_flagged():
     def quality(fwhm, rms):
         return {
             "fwhm_arcsec": fwhm,
@@ -200,14 +200,17 @@ def test_synthetic_poor_seeing_and_shallow_epoch_is_rejected():
             "quality_flags": [],
         }
 
-    assessed = assess_image_quality_batch(
-        [quality(2.0, 5.0), quality(2.1, 5.0), quality(1.9, 5.0), quality(7.0, 20.0)]
-    )
-    bad = assessed[-1]
-    assert bad["quality_status"] == "FAIL"
+    batch = [quality(2.0, 5.0), quality(2.1, 5.0), quality(1.9, 5.0), quality(7.0, 20.0)]
+    # Relative-to-batch checks warn by default; only absolute limits reject.
+    bad = assess_image_quality_batch(batch)[-1]
+    assert bad["quality_status"] == "WARN"
     assert "SEEING_POOR" in bad["quality_flags"]
     assert "BACKGROUND_RMS_HIGH" in bad["quality_flags"]
     assert "QUALITY_BATCH_OUTLIER" in bad["quality_flags"]
+    # A fail ratio can still be configured to reject such an epoch.
+    settings = get_default_settings()
+    settings["image_quality"]["batch_fwhm_ratio_fail"] = 2.5
+    assert assess_image_quality_batch(batch, settings)[-1]["quality_status"] == "FAIL"
 
 
 def test_synthetic_usable_and_failed_subtraction_quality():
@@ -761,6 +764,7 @@ def test_every_diagnostic_figure_tolerates_missing_products():
         lambda: plots.plot_region_diagnostics(None, {}, {}),
         lambda: plots.plot_mask_diagnostics(None, {}, {}),
         lambda: plots.plot_cosmic_ray_diagnostics(None, {}, {"skipped": "disabled"}),
+        lambda: plots.plot_cosmic_ray_diagnostics(None, {}, {}),
         lambda: plots.plot_background_diagnostics(None, {}, {}),
         lambda: plots.plot_image_quality_diagnostics(None, None, None, {}),
         lambda: plots.plot_astrometry_diagnostics(None, None, None, {}),
@@ -780,3 +784,267 @@ def test_every_diagnostic_figure_tolerates_missing_products():
         plt.close(call())
     assert not plt.get_fignums()
 
+
+
+# ---------------------------------------------------------------------------
+# Seeing, masks, trails, background, usability and batch consistency fixes
+# ---------------------------------------------------------------------------
+
+def _gaussian_star(data, x, y, flux, sigma):
+    yy, xx = np.mgrid[0:data.shape[0], 0:data.shape[1]]
+    data += flux / (2 * np.pi * sigma ** 2) * np.exp(
+        -((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2)
+    )
+
+
+def test_seeing_fwhm_does_not_depend_on_brightness():
+    rng = np.random.default_rng(11)
+    sigma = 1.5
+    data = rng.normal(100.0, 5.0, (260, 260))
+    fluxes = np.geomspace(2e3, 4e5, 49)
+    for index, flux in enumerate(fluxes):
+        row, column = divmod(index, 7)
+        _gaussian_star(data, 25 + 35 * column, 25 + 35 * row, flux, sigma)
+    ccd = CCDData(data, unit="adu")
+    sources, _, info = detect_sources_and_measure_quality(ccd, settings=get_default_settings())
+    true_fwhm = 2.3548 * sigma
+    assert info["fwhm_method"] == "gaussian_fit"
+    assert abs(info["fwhm_pixels"] - true_fwhm) < 0.1
+    fitted = np.asarray(sources["fwhm_pixels"].filled(np.nan), dtype=float)
+    moments = np.asarray(sources["moment_fwhm_pixels"], dtype=float)
+    flux = np.asarray(sources["flux"], dtype=float)
+    faint = np.isfinite(fitted) & (flux < np.nanpercentile(flux, 40))
+    bright = np.isfinite(fitted) & (flux > np.nanpercentile(flux, 60))
+    # The Gaussian fit is flat with brightness; footprint moments are not.
+    assert abs(np.median(fitted[bright]) - np.median(fitted[faint])) < 0.1
+    assert np.median(moments[bright]) - np.median(moments[faint]) > 0.5
+
+
+def test_saturation_mask_scales_with_the_star_and_ignores_unused_pixels():
+    from redphot.image import make_saturation_mask
+
+    data = np.full((200, 200), 1000.0)
+    _gaussian_star(data, 60, 100, 6.0e7, 1.6)     # heavily saturated
+    _gaussian_star(data, 140, 100, 1.0e6, 1.6)    # barely saturated
+    data = np.minimum(data, 60000.0)
+    excluded = np.zeros(data.shape, dtype=bool)
+    excluded[:, :6] = True
+    data[:, :6] = 65000.0                          # junk in an unused strip
+    settings = get_default_settings()
+    settings["masks"]["saturation_level"] = 50000.0
+    components, info = make_saturation_mask(data, settings=settings, exclude=excluded)
+    mask = components["saturation"]
+    assert not mask[:, :6].any()
+    assert not mask[:, 6:12].any()                  # no halo grown from the junk
+    big = mask[60:140, 20:100].sum()
+    small = mask[60:140, 100:180].sum()
+    assert big > 1.4 * small > 0
+    assert mask.mean() < 0.05
+    assert len(info["regions"]) == 2
+
+
+def test_faint_trail_is_masked_end_to_end_and_bleeds_are_not_trails():
+    from redphot.image import make_saturation_mask
+
+    rng = np.random.default_rng(5)
+    data = rng.normal(100.0, 5.0, (300, 400))
+    rows = np.arange(400)
+    trail_y = (150 + 0.05 * (rows - 200)).round().astype(int)
+    for column, row in zip(rows, trail_y):
+        data[row - 1:row + 2, column] += 6.0          # ~1 sigma per pixel
+    data[trail_y[200:320] - 1, rows[200:320]] += 60.0  # one bright stretch seeds it
+    data[trail_y[200:320], rows[200:320]] += 60.0
+    base = np.zeros(data.shape, dtype=bool)
+    base[:, 90:110] = True                           # a masked gap across the trail
+    # A saturated star with a bleed running up from it.
+    _gaussian_star(data, 330, 60, 5.0e7, 1.6)
+    data[60:130, 329:332] += 400.0
+    data = np.minimum(data, 60000.0)
+    settings = get_default_settings()
+    settings["masks"]["saturation_level"] = 50000.0
+    saturation, info = make_saturation_mask(data, settings=settings, exclude=base)
+    mask, trails, trail_info = detect_trails(
+        data, base_mask=base | saturation["saturation"], settings=settings,
+        exclude_mask=saturation["saturation"], saturated_regions=info["regions"],
+    )
+    assert len(trails) == 1
+    for column in (5, 60, 150, 380):
+        assert mask[trail_y[column], column]
+    assert trail_info["bleeds"]
+    assert not mask[80:125, 325:336].any()
+    assert trail_info["bleed_mask"][80:125, 325:336].any()
+
+
+def test_bad_lines_ignore_smooth_gradients_but_catch_dead_columns():
+    from redphot.image import make_line_defect_mask
+
+    rng = np.random.default_rng(2)
+    data = rng.normal(1000.0, 10.0, (300, 300))
+    data += 100.0 * np.exp((np.arange(300) - 299.0) / 10.0)[:, None]  # glow at one edge
+    data[:, 150] -= 200.0
+    mask, info = make_line_defect_mask(data, settings=get_default_settings())
+    assert info["bad_columns"] == [150]
+    assert info["bad_rows"] == []
+
+
+def test_background_reports_the_meshes_photutils_interpolates():
+    rng = np.random.default_rng(3)
+    data = rng.normal(500.0, 5.0, (256, 256))
+    mask = np.zeros(data.shape, dtype=bool)
+    mask[:, :128] = (np.arange(128) % 5 < 2)[None, :]   # 40% of each left box
+    ccd = CCDData(data, unit="adu", mask=mask)
+    settings = get_default_settings()
+    settings["background"].update({"box_size": [64, 64], "exclude_percentile": 20.0})
+    _, products, info = model_background(ccd, settings=settings)
+    assert products["mesh_excluded"].sum() == 8
+    assert info["excluded_mesh_fraction"] == pytest.approx(0.5)
+    assert "BACKGROUND_MESHES_EXCLUDED" not in info["flags"]
+    mask[:, 128:192] = (np.arange(64) % 5 < 2)[None, :]   # now 12 of 16 boxes
+    _, _, info = model_background(CCDData(data, unit="adu", mask=mask), settings=settings)
+    assert info["excluded_mesh_fraction"] == pytest.approx(0.75)
+    assert "BACKGROUND_MESHES_EXCLUDED" in info["flags"]
+
+
+def test_cosmic_rays_handle_nonfinite_pixels_and_never_mask_the_target(recwarn):
+    pytest.importorskip("astroscrappy")
+    rng = np.random.default_rng(8)
+    shape = (120, 120)
+    data = rng.normal(500.0, 10.0, shape)
+    data[:, :3] = np.nan
+    data[30, 90] += 3000.0          # an ordinary hit
+    data[60, 60] += 3000.0          # a hit (or compact source) on the target
+    wcs = WCS(_wcs_header(shape))
+    ccd = CCDData(data, unit="adu", wcs=wcs)
+    target = wcs.pixel_to_world(60, 60)
+    settings = get_default_settings()
+    settings["masks"]["cosmic_rays"].update({"enabled": True, "gain": 1.0, "read_noise": 5.0})
+    _, products, info = apply_cosmic_rays(ccd, settings=settings, target=target)
+    assert not [warning for warning in recwarn if issubclass(warning.category, RuntimeWarning)]
+    assert products["cosmic_mask"][30, 90]
+    assert not products["cosmic_mask"][58:63, 58:63].any()
+    assert info["target_overlap"] and info["target_protected_pixels"] > 0
+
+
+def test_quick_zeropoint_uses_aperture_fluxes_without_a_magnitude_trend():
+    from redphot.image import _quick_zeropoint
+
+    magnitude = np.linspace(14.0, 19.5, 40)
+    total = 10 ** (-0.4 * (magnitude - 25.0)) * 300.0
+    rows = Table({
+        "magnitude": magnitude,
+        "role_calibration": np.ones(40, dtype=bool),
+        "aperture_flux": 0.8 * total,
+        "aperture_flux_large": 0.98 * total,
+        # Footprint fluxes lose more light for fainter stars.
+        "flux": total * (1.0 - 0.6 * (magnitude - 14.0) / 5.5),
+    }, masked=True)
+    zeropoints, result, inlier, method = _quick_zeropoint(
+        rows, {"exposure_time": 300.0}, get_default_settings()
+    )
+    assert method == "aperture_flux_corrected"
+    assert result["zeropoint_scatter_mag"] < 0.01
+    assert abs(result["zeropoint_mag"] - 25.0 - 2.5 * np.log10(0.98)) < 0.01
+    assert abs(np.polyfit(magnitude, zeropoints, 1)[0]) < 1e-3
+
+
+def test_batch_quality_compares_sky_within_a_filter_and_only_warns():
+    def quality(fwhm, background):
+        return {"fwhm_arcsec": fwhm, "ellipticity": 0.05, "background": background,
+                "background_rms": 10.0, "quality_status": "PASS",
+                "checks": [], "quality_flags": []}
+
+    results = [quality(2.0, 300.0), quality(2.1, 320.0), quality(2.0, 310.0),
+               quality(5.6, 305.0), quality(1.9, 3000.0), quality(2.0, 3100.0),
+               quality(2.0, 2900.0)]
+    groups = ["g", "g", "g", "g", "r", "r", "r"]
+    assessed = assess_image_quality_batch(results, get_default_settings(), groups=groups,
+                                          exposure_times=[300.0] * 7)
+    assert all("BACKGROUND_HIGH" not in item["quality_flags"] for item in assessed)
+    assert "SEEING_POOR" in assessed[3]["quality_flags"]
+    assert assessed[3]["quality_status"] == "WARN"
+
+
+def test_comparison_star_stability_uses_errors_floor_and_epochs():
+    from redphot.pipeline import build_comparison_star_light_curves
+
+    rows = []
+    images = ["a", "b", "c", "d", "e"]
+    rng = np.random.default_rng(1)
+    for index, image in enumerate(images):
+        def add(source, magnitude, error):
+            rows.append({"image_id": image, "source_id": source, "filter": "r",
+                         "method": "psf", "source_type": "comparison",
+                         "image_kind": "science", "valid": True, "mjd_mid": 100.0 + index,
+                         "calibrated_magnitude": magnitude,
+                         "calibrated_magnitude_uncertainty": error})
+        add("bright", 14.0 + rng.normal(0, 0.006), 0.003)
+        add("faint", 19.0 + rng.normal(0, 0.08), 0.1)
+        add("variable", 15.0 + (0.3 if index % 2 else 0.0), 0.005)
+        for star in range(6):
+            add("field{}".format(star), 15.5 + rng.normal(0, 0.005), 0.005)
+        if index < 2:
+            add("sparse", 16.0, 0.01)
+    _, stability = build_comparison_star_light_curves(Table(rows), get_default_settings())
+    status = {row["source_id"]: str(row["status"]) for row in stability}
+    assert status["bright"] == "PASS"
+    assert status["faint"] == "PASS"
+    assert status["variable"] == "FAIL"
+    assert status["sparse"] == "UNTESTED"
+
+
+def test_light_curve_evolution_is_not_flagged_but_jumps_are():
+    from redphot.pipeline import build_preferred_light_curve
+
+    def target(image, mjd, magnitude):
+        return {"image_id": image, "source_type": "target", "image_kind": "science",
+                "method": "psf", "valid": True, "filter": "r", "mjd_mid": mjd,
+                "calibrated_magnitude": magnitude,
+                "calibrated_magnitude_uncertainty": 0.02, "flags": ""}
+
+    slow = Table([target("a", 100.0, 19.8), target("b", 117.0, 19.45),
+                  target("c", 131.0, 20.0)], masked=True)
+    curve = build_preferred_light_curve(slow, Table(), Table(), get_default_settings())
+    assert not any("BATCH_MEASUREMENT_OUTLIER" in str(flag) for flag in curve["flags"])
+    fast = Table([target("a", 100.0, 19.8), target("b", 101.0, 19.0),
+                  target("c", 102.0, 19.8)], masked=True)
+    curve = build_preferred_light_curve(fast, Table(), Table(), get_default_settings())
+    assert "BATCH_MEASUREMENT_OUTLIER" in str(curve["flags"][1])
+
+
+def test_epoch_metrics_do_not_fail_on_a_tiny_batch_scatter():
+    from redphot.pipeline import build_epoch_metrics
+
+    records = [
+        {"image_id": str(index), "metadata": {"filter": "r", "mjd_mid": 100.0 + index},
+         "quality": {"fwhm_arcsec": fwhm}}
+        for index, fwhm in enumerate([1.92, 1.93, 1.94, 2.17, 2.36])
+    ]
+    metrics = build_epoch_metrics(records, settings=get_default_settings())
+    assert set(str(value) for value in metrics["status"]) == {"PASS"}
+
+
+def test_region_figure_keeps_its_layout_and_marks_unused_lines():
+    import warnings
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from redphot import diagnostics as plots
+
+    data = np.random.default_rng(0).normal(600.0, 10.0, (120, 130))
+    valid = np.ones(data.shape, dtype=bool)
+    valid[:, :8] = valid[:, 122:] = valid[119:, :] = False
+    region = {"header_section": {"applied": True, "keyword": "DATASEC",
+                                 "bounds": (8, 122, 0, 119)}}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        figure = plots.plot_region_diagnostics(
+            CCDData(data, unit="adu"), region, {"full_valid_mask": valid})
+        figure.canvas.draw()
+    assert not [item for item in caught if "constrained" in str(item.message).lower()]
+    # Constrained layout really ran (the default left margin would be 0.125).
+    assert min(axis.get_position().x0 for axis in figure.axes) < 0.06
+    texts = [child.get_text() for axis in figure.axes for child in axis.texts]
+    assert any("columns 0–7 not used" in text for text in texts)
+    plt.close(figure)
