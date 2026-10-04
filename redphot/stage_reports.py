@@ -78,6 +78,8 @@ def image_file_stem(image_id):
 
 
 def _finite(value):
+    if value is None or value is np.ma.masked or np.ma.is_masked(value):
+        return None
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -94,6 +96,14 @@ def _robust(values):
         return None, None
     median = float(np.median(values))
     return median, float(1.4826 * np.median(np.abs(values - median)))
+
+
+def _unit_text(ccd):
+    """Pixel unit of an image as plain text ("adu" when none is set)."""
+
+    unit = getattr(ccd, "unit", None)
+    text = "" if unit is None else str(unit)
+    return text if text and text != "dimensionless" else "adu"
 
 
 def _entry(state, stage, image_id=None):
@@ -137,6 +147,27 @@ def _shared(context, stage):
     return (context.get("shared") or {}).get(stage) or {}
 
 
+def _target_pixel(context, record):
+    """Frozen target position on an image's (aligned) grid, or ``None``."""
+
+    solution = _shared(context, "alignment").get("target_solution") or {}
+    if _finite(solution.get("ra_deg")) is None or _finite(solution.get("dec_deg")) is None:
+        return None
+    try:
+        from astropy.coordinates import SkyCoord
+
+        from .subtraction import _record_wcs
+
+        wcs = _record_wcs(record)
+        if wcs is None:
+            return None
+        x, y = wcs.world_to_pixel(SkyCoord(float(solution["ra_deg"]),
+                                           float(solution["dec_deg"]), unit="deg"))
+        return float(x), float(y)
+    except Exception:
+        return None
+
+
 def _decision(context, image_id):
     for item in _shared(context, "usability").get("decisions", []) or []:
         if str(item.get("image_id")) == str(image_id):
@@ -168,7 +199,7 @@ def metric_specs(stage, settings):
     astrometry = settings.get("astrometry", {})
     specs = {
         "read": [
-            {"key": "sky_median", "label": "Sky level", "spec": "{:.0f}"},
+            {"key": "sky_median", "label": "Sky level", "spec": "{:.0f}", "unit_key": "sky_unit"},
             {"key": "airmass", "label": "Airmass", "spec": "{:.2f}"},
             {"key": "finite_percent", "label": "Finite pixels", "unit": "%", "spec": "{:.2f}"},
         ],
@@ -188,8 +219,8 @@ def metric_specs(stage, settings):
         ],
         "fringe": [{"key": "fringe_scale", "label": "Fringe scale", "spec": "{:.3g}"}],
         "background": [
-            {"key": "sky_level", "label": "Sky level", "spec": "{:.0f}"},
-            {"key": "sky_rms", "label": "Sky RMS", "spec": "{:.1f}"},
+            {"key": "sky_level", "label": "Sky level", "spec": "{:.0f}", "unit_key": "sky_unit"},
+            {"key": "sky_rms", "label": "Sky RMS", "spec": "{:.1f}", "unit_key": "sky_unit"},
             {"key": "residual_median_sigma", "label": "Residual median", "unit": "σ",
              "spec": "{:+.3f}", "warn": 0.1},
             {"key": "residual_width_sigma", "label": "Residual width", "unit": "σ",
@@ -274,6 +305,7 @@ def _image_metrics(stage, context, image_id):
     if stage == "read":
         data = getattr(product.get("ccd"), "data", None)
         values["sky_median"] = _robust(data)[0] if data is not None else None
+        values["sky_unit"] = _unit_text(product.get("ccd"))
         values["airmass"] = metadata.get("airmass")
         values["exposure_time"] = metadata.get("exposure_time")
         fraction = _finite(metadata.get("finite_fraction"))
@@ -310,6 +342,7 @@ def _image_metrics(stage, context, image_id):
             if products.get("background") is not None else None
         values["sky_rms"] = _robust(products.get("background_rms"))[0] \
             if products.get("background_rms") is not None else None
+        values["sky_unit"] = _unit_text(_input_ccd(context, image_id, stage))
         reduction = _finite(info.get("gradient_reduction_fraction"))
         values["gradient_removed_percent"] = None if reduction is None else 100 * reduction
         corrected, rms = products.get("background_subtracted"), products.get("background_rms")
@@ -653,11 +686,16 @@ def stage_figure(state, context, stage, image_id=None):
         if status == "SKIPPED" or (product or {}).get("skipped"):
             return None
         if stage == "subtraction":
-            return plots.plot_subtraction_diagnostics(product, record, metadata=metadata,
-                                                      status=status)
+            return plots.plot_subtraction_diagnostics(
+                product, record, metadata=metadata, status=status,
+                target=_target_pixel(context, record))
         if stage == "difference_photometry":
             return plots.plot_difference_photometry_diagnostics(product, metadata=metadata,
                                                                 status=status)
+        if stage == "templates" and image_id is None:
+            return plots.plot_template_footprints((product or {}).get("templates"),
+                                                  status=status,
+                                                  flags=(product or {}).get("flags"))
         return None
     if stage == "batch_consistency":
         return plots.plot_batch_consistency_diagnostics(_shared(context, stage), status=status)

@@ -1199,8 +1199,11 @@ def determine_fixed_target_position(image_records, alignments, stacks,
     if any(item.get("rejection_reason") == "TARGET_CENTROID_OFFSET" for item in candidates):
         flags.append("TARGET_CENTROID_OFFSET")
 
+    # "fixed": use the coordinate the user gave (target= or target_position.ra/dec)
+    # as it is, instead of measuring the position.
     fixed_user = (
-        prior_source == "user" and target.get("user_position_mode", "prior") == "fixed"
+        prior_source in {"user", "supplied_prior"}
+        and target.get("user_position_mode", "prior") == "fixed"
     )
     if fixed_user:
         final_coordinate = prior_coordinate

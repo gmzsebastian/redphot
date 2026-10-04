@@ -179,6 +179,23 @@ measured in a low-latitude KeplerCam field, so the model was nearly flat.
 The diagnostics compare the sky pixels before (one flat level) and after
 subtraction.
 
+Bright, saturated stars keep their light above the sky far beyond the fixed
+source-mask growth (scattered light and PSF wings out to 200-260 px on
+KeplerCam). Meshes around them are then less than half masked and are
+measured on halo light, so the model absorbs part of the star (about +21 ADU,
+1 RMS, at the star in a KeplerCam r frame). The ``bright_star_count``
+brightest stars (saturated cores count in the ranking; a saturated star whose
+segment is split around its masked core is treated as one star) therefore get
+a halo mask: annuli are walked outward through the pixels not masked yet, the
+median excess over the local sky is measured in each, and the walk stops when
+it drops below ``bright_star_halo_sigma`` (0.25) times the sky RMS, or when
+the excess stops falling with radius (a plateau is large-scale sky structure
+that the model should follow). A circle of that radius is masked. The local
+sky is a robust plane fitted to an outer annulus around the star
+(``bright_star_sky_annulus_fraction`` of ``bright_star_maximum_radius_pixels``),
+so a sky gradient does not bias the walk. All other sources keep the fixed
+growth. The halos are drawn in the Background figure.
+
 The modes are ``off``, ``measure_only``, ``subtract_broad``, ``local_only``,
 and ``broad_plus_local``. Broad subtraction removes only the two-dimensional
 instrumental structure. Local sky used by aperture or PSF photometry is
@@ -205,6 +222,19 @@ fits (geometric mean of the axes) to up to ``seeing_maximum_fits`` unsaturated,
 high-S/N stars; neighbors' pixels carry no weight in each fit. Saturated
 detections, masks, trails, target-local background, and upstream LCO quality
 values are assessed separately.
+
+Seeing does not depend on brightness, so a FWHM that grows for the brightest
+unsaturated stars marks cores that are nonlinear (or saturated below the
+assumed saturation level). The fitted stars are ordered by flux and a running
+median of their FWHM is compared with the median of the fainter half; the
+flux where it rises more than ``broadening_fraction`` (5%) above it, with at
+least ``broadening_minimum_stars`` stars beyond, is the broadening onset. It is
+drawn in the "FWHM versus brightness" panel with the peak level of the stars
+there (sky included, comparable to the saturation level), the image gets
+``BRIGHT_STARS_BROADENED``, and the stars above it are left out of the seeing
+and rejected for the PSF and the zeropoint (``NONLINEAR``) at star selection.
+Images without a saturation keyword use ``metadata.fallback_values.saturation``
+(50,000).
 
 PASS, WARN, and FAIL use configured absolute limits. At the usability gate
 each image is also compared with the batch (the same filter where possible;
@@ -247,8 +277,9 @@ Comparison and PSF-star selection
 A master catalog provides persistent IDs across epochs. Catalog-level screens
 reject unsuitable magnitude or uncertainty, non-stellar morphology, excessive
 proper motion, known variability, crowding, or disallowed color. Per-image
-screens then apply edge, saturation/halo, mask/trail, S/N, shape, neighbor, and
-detector-region criteria.
+screens then apply edge, saturation/halo, nonlinearity (brighter than the
+FWHM broadening onset), mask/trail, S/N, shape, neighbor, and detector-region
+criteria.
 
 Roles are independent: astrometry, PSF, calibration, ensemble comparison, and
 bright quality-control anchor. A star rejected for PSF shape can still be an
@@ -374,7 +405,12 @@ positive flux :math:`F` and exposure :math:`t`,
 
 Each calibration star gives :math:`ZP_i=m_{\rm cat,i}-m_{\rm inst,i}`.
 Method- and image-specific zeropoints are inverse-variance weighted after
-iterative robust clipping. Their uncertainty includes the formal weighted
+iterative robust clipping. Each star's variance is its formal error squared
+plus the star-to-star scatter beyond the formal errors,
+:math:`\sigma_{\rm int}^2=\max(s^2-\tilde\sigma^2,0)` (robust scatter :math:`s`,
+median formal error :math:`\tilde\sigma`; ``calibration.add_intrinsic_scatter``),
+so the brightest stars, whose formal errors are tiny, cannot set the
+zeropoint alone. Their uncertainty includes the formal weighted
 error and observed residual scatter. The calibrated target is
 
 .. math::

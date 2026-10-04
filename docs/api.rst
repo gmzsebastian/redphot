@@ -2,9 +2,17 @@ Function API
 ============
 
 RedPhot intentionally exposes functions from their defining modules rather
-than building a large top-level namespace. The most useful entry points are in
-``redphot.pipeline``; lower-level functions support interactive review and
-custom workflows.
+than building a large top-level namespace. The most useful entry points are
+``redphot.pipeline.run_batch`` (everything in one call) and ``redphot.steps``
+(one step at a time, and changing a step for chosen images); lower-level
+functions support interactive review and custom workflows.
+
+Step by step
+------------
+
+.. automodule:: redphot.steps
+   :members:
+   :member-order: bysource
 
 Configuration
 -------------

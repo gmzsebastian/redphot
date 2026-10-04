@@ -56,7 +56,32 @@ state, context = run_batch(
 )
 ```
 
-## Stepwise runs
+## Step by step
+
+`redphot.steps` runs one step at a time, so each step's plots can be checked
+before going on, and changes a step's settings by name for chosen images:
+
+```python
+from redphot.steps import start_run, run_step, rerun_from, show_parameters
+
+state, context = start_run("data/*.fits", "AT2024rmj_redphot", target=target)
+run_step(state, context, 1)                    # read; then 2, 3, ... 19
+run_step(state, context, 6, images=[3], box_size=[64, 64])   # redo step 6 for image 3
+show_parameters(9)                             # settings of step 9 and their values
+```
+
+After a run (all in one or step by step), change a setting of one step for
+some images and continue from that step; steps before it are not redone, and
+later steps are redone only for images whose results change:
+
+```python
+rerun_from(state, context, 9, images=[3, 7], minimum_snr=20)
+```
+
+`docs/tutorials/step_by_step.rst` explains every step, what to look at and
+what to change.
+
+## Stepwise runs with the lower-level functions
 
 Stages can also be run one at a time (`run_pipeline_stage`) to look at each
 stage's plots before going on. Nothing ever waits for an approval: at the
@@ -80,17 +105,17 @@ Every stage writes plots and a `summary.csv` to
 be checked before continuing (see `docs/outputs.rst`).
 
 Runs can be resumed with `resume_pipeline("AT2024rmj_redphot")`. Configuration
-changes made with `set_image_overrides` mark only affected and downstream
-products stale.
+changes made with `set_image_overrides` (or `redphot.steps`) mark only the
+first stage that reads the changed setting and what follows it stale.
 
 ## Output size
 
 `minimal` saves core tables, the final light-curve figure
 (`<object>_lightcurve.png/.pdf`, every photometry method), configuration, log,
-and manifest. `standard` also saves reports, PSF models, difference images,
-one processed FITS file per image (`processed/`: cut to the usable area,
-background-subtracted, aligned WCS, with MASK, BKG and BKGRMS extensions) and
-the same images resampled onto one common grid (`registered/`). `full` saves
+and manifest. `standard` also saves reports and, per image in `fits/`, the
+PSF model, the difference image (when subtraction ran), and one final
+processed image (cut to the usable area, background-subtracted, WCS aligned
+to the reference, with MASK, BKG and BKGRMS extensions). `full` saves
 every supplied derivative. Individual products can be changed with
 `output.product_overrides`.
 
@@ -102,7 +127,11 @@ With subtraction enabled, templates come from a user file
 Pan-STARRS1 (STScI cutout service), the DESI Legacy Surveys (`legacy`, or
 `decam` for DECam-only data), or SDSS (through SkyView). Each survey's recipe
 is in `subtraction.template_surveys`; set `template_source` to one survey name
-to use only that one. Downloads are cached per survey, field and size.
+to use only that one. Downloads are cached per survey, field and size; a
+cached template of the same survey and band that covers the field is reused
+even when the refined WCS has moved the field center slightly. The Templates
+figure (`15_templates/batch.png`) shows each template with the outline of
+every image that uses it.
 
 ```python
 {"output": {

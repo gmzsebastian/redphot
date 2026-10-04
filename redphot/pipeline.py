@@ -1105,7 +1105,15 @@ def _pipeline_event(state, status, stage, image_id=None, message=""):
 
 
 def _stage_definitions():
-    """Return the ordered built-in stage dependency schema."""
+    """Return the ordered built-in stage dependency schema.
+
+    ``settings`` lists the settings each stage reads: a whole section
+    (``"psf"``) or one entry of a section (``"psf.maximum_stars"``).
+    ``ignore`` removes parts of a listed section that a later stage reads
+    instead, so changing them does not redo this stage. Settings read by an
+    earlier stage do not need to be listed again: a change there redoes that
+    stage and everything after it.
+    """
 
     return [
         {"name": "read", "scope": "image", "requires": [],
@@ -1113,19 +1121,38 @@ def _stage_definitions():
         {"name": "region", "scope": "image", "requires": ["read"],
          "settings": ["crop"]},
         {"name": "masks", "scope": "image", "requires": ["region"],
-         "settings": ["masks"]},
+         "settings": ["masks"], "ignore": ["masks.cosmic_rays"]},
         {"name": "cosmic_rays", "scope": "image", "requires": ["masks"],
-         "settings": ["masks"]},
+         "settings": ["masks.cosmic_rays"]},
         {"name": "fringe", "scope": "image", "requires": ["cosmic_rays"],
          "settings": ["fringe"]},
         {"name": "background", "scope": "image", "requires": ["fringe"],
          "settings": ["background"]},
         {"name": "source_quality", "scope": "image", "requires": ["background"],
-         "settings": ["source_detection", "image_quality"]},
+         "settings": ["source_detection", "image_quality"],
+         # Read by usability (step 10) only: the comparisons across the batch
+         # and the zeropoint/catalog checks.
+         "ignore": ["image_quality." + name for name in (
+             "usability", "batch_minimum_images", "batch_fwhm_ratio_warn",
+             "batch_fwhm_ratio_fail", "batch_ellipticity_offset_warn",
+             "batch_ellipticity_offset_fail", "batch_background_ratio_warn",
+             "batch_background_ratio_fail", "batch_background_rms_ratio_warn",
+             "batch_background_rms_ratio_fail", "zeropoint_scatter_warn_mag",
+             "zeropoint_scatter_fail_mag", "minimum_catalog_recovery_warn",
+             "minimum_catalog_recovery_fail", "expected_target_magnitude",
+             "zeropoint_offset_warn_mag", "zeropoint_offset_fail_mag",
+             "minimum_useful_depth_mag", "wcs_rms_warn_arcsec", "wcs_rms_fail_arcsec")]},
         {"name": "astrometry", "scope": "image", "requires": ["source_quality"],
-         "settings": ["astrometry", "catalogs"]},
+         "settings": ["astrometry", "catalogs"],
+         "ignore": ["catalogs.comparison_stars", "catalogs.photometry_catalog",
+                    "catalogs.photometry_catalog_by_filter",
+                    "catalogs.photometric_match_arcsec"]},
         {"name": "star_selection", "scope": "batch", "requires": ["astrometry"],
-         "settings": ["catalogs", "psf"]},
+         "settings": ["catalogs", "psf.maximum_stars", "psf.minimum_stars",
+                      "calibration.catalog",
+                      "image_quality.usability.quick_aperture_fwhm",
+                      "image_quality.usability.quick_aperture_correction_fwhm",
+                      "image_quality.usability.quick_sky_annulus_fwhm"]},
         {"name": "usability", "scope": "batch", "requires": ["star_selection"],
          "settings": ["image_quality"]},
         {"name": "alignment", "scope": "batch", "requires": ["usability"],
@@ -1137,9 +1164,16 @@ def _stage_definitions():
         {"name": "calibration", "scope": "batch", "requires": ["science_photometry"],
          "settings": ["calibration", "upper_limits"]},
         {"name": "templates", "scope": "batch", "requires": ["calibration"],
-         "settings": ["subtraction"]},
+         "settings": ["subtraction." + name for name in (
+             "enabled", "template_path", "template_source", "template_survey_priority",
+             "template_surveys", "survey_names", "survey_filter_map",
+             "download_pixel_scale_arcsec", "download_timeout_s", "maximum_mosaic_pixels",
+             "cache_directory", "use_cached_templates", "save_downloaded_templates",
+             "template_margin_arcmin", "allow_approximate_filter_match",
+             "approximate_filter_matches", "minimum_coverage_fraction",
+             "minimum_footprint_coverage", "resampling_order", "resampling_tile_rows")]},
         {"name": "subtraction", "scope": "image", "requires": ["templates"],
-         "settings": ["subtraction"]},
+         "settings": ["subtraction"], "ignore": ["subtraction.photometry"]},
         {"name": "difference_photometry", "scope": "image", "requires": ["subtraction"],
          "settings": ["subtraction", "apertures", "upper_limits"]},
         {"name": "batch_consistency", "scope": "batch",
@@ -1150,6 +1184,97 @@ def _stage_definitions():
         {"name": "outputs", "scope": "batch", "requires": [],
          "signature_requires": "all", "settings": ["diagnostics", "output"]},
     ]
+
+
+def _setting_at(settings, path):
+    """Value of a dotted settings path (``None`` when it does not exist)."""
+
+    value = settings
+    for key in path.split("."):
+        if not isinstance(value, Mapping) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def _without_path(value, parts):
+    """Copy of a nested mapping without the entry at ``parts``."""
+
+    if not isinstance(value, Mapping) or not parts or parts[0] not in value:
+        return value
+    copied = dict(value)
+    if len(parts) == 1:
+        copied.pop(parts[0])
+    else:
+        copied[parts[0]] = _without_path(copied[parts[0]], parts[1:])
+    return copied
+
+
+def _settings_subset(settings, definition):
+    """The settings one stage reads (see :func:`_stage_definitions`)."""
+
+    subset = {
+        name: _setting_at(settings, name) for name in definition.get("settings", [])
+    }
+    for path in definition.get("ignore", []):
+        section, *rest = path.split(".")
+        if section in subset:
+            subset[section] = _without_path(subset[section], rest)
+    return subset
+
+
+def _paths_overlap(first, second):
+    """True when one dotted settings path contains the other."""
+
+    first, second = first.split("."), second.split(".")
+    size = min(len(first), len(second))
+    return first[:size] == second[:size]
+
+
+def stage_reads_setting(stage_name, path):
+    """Whether a stage's results depend on the setting at dotted ``path``.
+
+    Example: ``stage_reads_setting("star_selection", "psf.maximum_stars")``
+    is True, ``stage_reads_setting("star_selection", "psf.box_size_pixels")``
+    is False.
+    """
+
+    definition = next(
+        (item for item in _stage_definitions() if item["name"] == stage_name), None
+    )
+    if definition is None:
+        raise KeyError("Unknown pipeline stage: {}".format(stage_name))
+    if any(_paths_overlap(path, ignored) and len(path.split(".")) >= len(ignored.split("."))
+           for ignored in definition.get("ignore", [])):
+        return False
+    return any(_paths_overlap(path, name) for name in definition.get("settings", []))
+
+
+def _override_paths(overrides, prefix=()):
+    """Dotted paths of every value set in a nested overrides mapping."""
+
+    paths = []
+    for key, value in (overrides or {}).items():
+        here = prefix + (str(key),)
+        if isinstance(value, Mapping) and value:
+            paths.extend(_override_paths(value, here))
+        else:
+            paths.append(".".join(here))
+    return paths
+
+
+def first_stage_reading(overrides):
+    """Name of the first stage that reads any setting in ``overrides``.
+
+    ``"read"`` when no stage lists them, so an unknown setting redoes
+    everything.
+    """
+
+    paths = _override_paths(overrides)
+    for item in _stage_definitions():
+        if any(stage_reads_setting(item["name"], path) for path in paths):
+            return item["name"]
+    return "read"
 
 
 def pipeline_stage_names():
@@ -1237,6 +1362,9 @@ def initialize_pipeline(
         "instrument_name": instrument_name,
         "filter_settings": _json_value(filter_settings or {}),
         "batch_stages": {}, "images": {}, "events": [],
+        # Image order of the run (the JSON file stores the images sorted by
+        # name); load_pipeline_state restores it so image numbers stay put.
+        "image_order": list(identifiers),
     }
     context = {
         "settings": base_settings, "target": target, "images": {},
@@ -1280,6 +1408,100 @@ def _state_paths(state, settings=None):
     )
 
 
+def _exact_wcs_values(wcs):
+    """The numbers of a WCS that its FITS header rounds to ~14 digits."""
+
+    core = wcs.wcs
+    cd_form = bool(core.has_cd() and not core.has_pc())
+    values = {
+        "crpix": np.array(core.crpix, dtype=float),
+        "crval": np.array(core.crval, dtype=float),
+        # Keep the CD or PC form: code that later sets one of them (for
+        # example the alignment) must find the WCS in the form it had.
+        "cd": np.array(core.cd, dtype=float) if cd_form else None,
+        "pc": None if cd_form else np.array(core.get_pc(), dtype=float),
+        "cdelt": None if cd_form else np.array(core.get_cdelt(), dtype=float),
+        "lonpole": float(core.lonpole), "latpole": float(core.latpole),
+        "pv": [tuple(item) for item in core.get_pv()],
+        "pixel_shape": wcs.pixel_shape,
+        "sip": None,
+    }
+    if wcs.sip is not None:
+        sip = wcs.sip
+        values["sip"] = tuple(
+            None if value is None else np.array(value, dtype=float)
+            for value in (sip.a, sip.b, sip.ap, sip.bp, sip.crpix)
+        )
+    return values
+
+
+def _rebuild_wcs(header_text, values):
+    """Rebuild a WCS saved by :class:`_CheckpointPickler` with its exact numbers."""
+
+    import warnings
+
+    from astropy.io import fits
+    from astropy.wcs import WCS, Sip
+
+    import re
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        header = fits.Header.fromstring(header_text)
+        if values.get("cd") is not None:
+            # The header carries the matrix as PC with CDELT = 1; put it back
+            # as CD so the rebuilt WCS has the form of the original.
+            for key in list(header.keys()):
+                if re.match(r"^(PC\d+_\d+|CDELT\d+)$", key):
+                    del header[key]
+            for row, line in enumerate(values["cd"], 1):
+                for column, value in enumerate(line, 1):
+                    header["CD{}_{}".format(row, column)] = float(value)
+        wcs = WCS(header, relax=True)
+        core = wcs.wcs
+        core.crpix = values["crpix"]
+        core.crval = values["crval"]
+        if values.get("cd") is not None:
+            core.cd = values["cd"]
+        else:
+            core.pc = values["pc"]
+            core.cdelt = values["cdelt"]
+        core.lonpole = values["lonpole"]
+        core.latpole = values["latpole"]
+        if values["pv"]:
+            core.set_pv(values["pv"])
+        if values["sip"] is not None:
+            wcs.sip = Sip(*values["sip"])
+        if values["pixel_shape"] is not None:
+            wcs.pixel_shape = values["pixel_shape"]
+        core.set()
+    return wcs
+
+
+class _CheckpointPickler(pickle.Pickler):
+    """Pickler that keeps WCS numbers exact.
+
+    Astropy pickles a WCS through its FITS header, which rounds every number
+    to about 14 digits; a reloaded run would then measure positions very
+    slightly differently from the run that saved it, and results that should
+    be unchanged would no longer be identical.
+    """
+
+    def reducer_override(self, obj):
+        from astropy.wcs import WCS
+
+        if type(obj) is WCS and not any(
+            getattr(obj, name, None) is not None
+            for name in ("cpdis1", "cpdis2", "det2im1", "det2im2")
+        ):
+            try:
+                return _rebuild_wcs, (obj.to_header_string(relax=True),
+                                      _exact_wcs_values(obj))
+            except Exception:  # anything unusual: astropy's own pickling
+                return NotImplemented
+        return NotImplemented
+
+
 def save_pipeline_state(state, context):
     """Atomically save readable run state and a local scientific checkpoint."""
 
@@ -1290,7 +1512,7 @@ def save_pipeline_state(state, context):
     checkpoint_temporary = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
     state_temporary.write_text(json.dumps(_json_value(state), indent=2, sort_keys=True) + "\n")
     with checkpoint_temporary.open("wb") as handle:
-        pickle.dump(context, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        _CheckpointPickler(handle, protocol=pickle.HIGHEST_PROTOCOL).dump(context)
     state_temporary.replace(state_path)
     checkpoint_temporary.replace(checkpoint_path)
     return {"state": str(state_path), "checkpoint": str(checkpoint_path)}
@@ -1338,6 +1560,13 @@ def load_pipeline_state(run_directory, settings=None):
         for stage in state.get("batch_stages", {}).values():
             if stage.get("status") in {"PASS", "WARN", "APPROVED"}:
                 stage["status"] = "STALE"
+    order = state.get("image_order") or [
+        image_id for image_id in context.get("images", {}) if image_id in state["images"]
+    ]
+    order = [image_id for image_id in order if image_id in state["images"]]
+    order += [image_id for image_id in state["images"] if image_id not in order]
+    state["images"] = {image_id: state["images"][image_id] for image_id in order}
+    state["image_order"] = order
     context["_state"] = state
     return state, context
 
@@ -1347,7 +1576,7 @@ def _stage_signature(state, context, definition, image_id=None):
         context["images"][image_id]["settings"] if image_id is not None
         else context["settings"]
     )
-    subset = {name: settings.get(name) for name in definition.get("settings", [])}
+    subset = _settings_subset(settings, definition)
     dependencies = {}
     required_names = definition.get("requires", [])
     if definition.get("signature_requires") == "all":
@@ -1357,6 +1586,18 @@ def _stage_signature(state, context, definition, image_id=None):
     for required in required_names:
         if required in state.get("batch_stages", {}):
             entry = state["batch_stages"][required]
+            digests = entry.get("image_digests") or {}
+            if image_id is not None and image_id in digests:
+                # An image stage depends only on this image's part of the
+                # batch result (see _batch_image_digests), so redoing a
+                # batch stage redoes later steps only for images whose
+                # part changed.
+                dependencies[required] = {
+                    "digest": digests[image_id],
+                    "status": state["images"][image_id].get("stages", {})
+                    .get(required, {}).get("status"),
+                }
+                continue
             dependencies[required] = {
                 "batch": (entry.get("signature"), entry.get("status")),
                 "image_reviews": {
@@ -1381,8 +1622,231 @@ def _stage_signature(state, context, definition, image_id=None):
                "dependencies": dependencies}
     if image_id is not None:
         payload["input"] = state["images"][image_id].get("input_fingerprint")
-        payload["overrides"] = state["images"][image_id].get("overrides", {})
+    else:
+        # Per-image settings (overrides, instrument profiles) that differ
+        # from the run settings in what this batch stage reads.
+        differing = {}
+        for key, image in context.get("images", {}).items():
+            image_subset = _settings_subset(image.get("settings") or settings, definition)
+            if image_subset != subset:
+                differing[key] = image_subset
+        if differing:
+            payload["image_settings"] = differing
     return _hash_value(payload)
+
+
+# ---------------------------------------------------------------------------
+# Per-image digests of batch results
+# ---------------------------------------------------------------------------
+# What the image stages after a batch stage read from its result, split per
+# image. Keys of the result holding tables or lists with an ``image_id`` are
+# reduced to that image's rows; "shared" keys apply to every image.
+_BATCH_IMAGE_PARTS = {
+    "star_selection": {"rows": ["measurements", "summaries"], "shared": []},
+    "usability": {"rows": ["decisions", "star_residuals"], "shared": []},
+    # projections and residuals only feed the plots; the target position is
+    # compared to pipeline.rerun_position_tolerance_mas (_shared_digest_part).
+    "alignment": {"rows": ["alignments"], "shared": ["target_solution"]},
+    "calibration": {"rows": ["measurements", "zeropoints", "calibration_stars",
+                             "aperture_corrections", "limits"], "shared": []},
+    "templates": {"rows": [], "shared": ["flags"]},
+}
+
+
+def _feed_hash(digest, value, cache=None):
+    """Add a stable byte form of ``value`` to a hashlib object."""
+
+    from astropy.wcs import WCS
+
+    if cache is not None and id(value) in cache:
+        digest.update(cache[id(value)][1].encode())
+        return
+    if cache is not None and isinstance(value, np.ndarray) and value.size > 100000:
+        # Large arrays shared by several images (templates) are hashed once;
+        # the cache keeps a reference so the id cannot be reused.
+        cache[id(value)] = (value, _content_hash(value))
+        digest.update(cache[id(value)][1].encode())
+        return
+    if value is None or isinstance(value, (bool, int, float, str, bytes, np.generic)):
+        digest.update(repr(value).encode())
+    elif isinstance(value, Table):
+        digest.update(b"<table>")
+        for name in value.colnames:
+            digest.update(str(name).encode())
+            _feed_hash(digest, value[name], cache)
+    elif isinstance(value, np.ndarray):
+        digest.update("{}{}{}".format(type(value).__name__, value.dtype.str,
+                                      value.shape).encode())
+        unit = getattr(value, "unit", None)
+        if unit is not None:
+            digest.update(str(unit).encode())
+        if np.ma.isMaskedArray(value):
+            digest.update(np.ascontiguousarray(np.ma.getmaskarray(value)).view(np.uint8))
+            value = np.ma.getdata(value)
+        if value.dtype.hasobject:
+            for item in value.ravel():
+                _feed_hash(digest, item, cache)
+        else:
+            # Hash the array's memory directly (no copy for contiguous arrays).
+            digest.update(np.ascontiguousarray(value).reshape(-1).view(np.uint8))
+    elif isinstance(value, Mapping):
+        for key in sorted(value, key=str):
+            digest.update(str(key).encode())
+            _feed_hash(digest, value[key], cache)
+    elif isinstance(value, (list, tuple)):
+        digest.update("<{}>".format(len(value)).encode())
+        for item in value:
+            _feed_hash(digest, item, cache)
+    elif isinstance(value, set):
+        for item in sorted(value, key=repr):
+            _feed_hash(digest, item, cache)
+    elif isinstance(value, WCS):
+        digest.update(value.to_header_string(relax=True).encode())
+    elif hasattr(value, "data") and hasattr(value, "wcs") and hasattr(value, "mask"):
+        for part in (value.data, value.mask, value.wcs, getattr(value, "uncertainty", None)):
+            _feed_hash(digest, getattr(part, "array", part), cache)
+    elif hasattr(value, "ra") and hasattr(value, "dec"):
+        _feed_hash(digest, np.asarray(value.ra.deg), cache)
+        _feed_hash(digest, np.asarray(value.dec.deg), cache)
+    else:
+        import re
+
+        digest.update(re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value)).encode())
+
+
+def _content_hash(value, cache=None):
+    digest = hashlib.sha256()
+    _feed_hash(digest, value, cache)
+    return digest.hexdigest()
+
+
+def _rows_for_image(value, image_id):
+    """The rows of a table or list that belong to one image."""
+
+    if isinstance(value, Table):
+        if "image_id" not in value.colnames or len(value) == 0:
+            return value
+        return value[np.asarray(value["image_id"]).astype(str) == str(image_id)]
+    if isinstance(value, (list, tuple)):
+        return [
+            item for item in value
+            if not isinstance(item, Mapping) or str(item.get("image_id")) == str(image_id)
+        ]
+    return value
+
+
+def _template_part(result, context, image_id):
+    """The template (and footprint) one image is subtracted against."""
+
+    templates = (result or {}).get("templates") or {}
+    metadata = context["images"][image_id]["record"].get("metadata") or {}
+    template = templates.get(str(metadata.get("filter")), templates.get("default"))
+    if not isinstance(template, Mapping):
+        return template
+    part = {key: value for key, value in template.items() if key != "science_footprints"}
+    part["science_footprints"] = _rows_for_image(
+        template.get("science_footprints") or [], image_id
+    )
+    return part
+
+
+def _shared_digest_part(stage, result, settings, keys, previous=None):
+    """The shared part of a batch result as the later image stages use it.
+
+    For alignment only the target position (and whether it is frozen) is
+    used. When it moved by less than ``pipeline.rerun_position_tolerance_mas``
+    from the position the previous digests used (``previous``), that previous
+    position is kept, so the images are not all redone for a negligible move.
+    Returns the shared part and the position used.
+    """
+
+    shared = {key: result.get(key) for key in keys}
+    target = shared.get("target_solution")
+    position = None
+    if stage == "alignment" and isinstance(target, Mapping):
+        position = [_finite_float(target.get("ra_deg")), _finite_float(target.get("dec_deg"))]
+        tolerance = float((settings or {}).get("pipeline", {}).get(
+            "rerun_position_tolerance_mas", 10.0) or 0.0)
+        if (tolerance > 0 and previous is not None and None not in position
+                and None not in list(previous)):
+            ra0, dec0 = (float(value) for value in previous)
+            moved = 3.6e6 * float(np.hypot(
+                (position[0] - ra0) * np.cos(np.deg2rad(dec0)), position[1] - dec0))
+            if moved < tolerance:
+                position = [ra0, dec0]
+        shared["target_solution"] = {
+            "position": position, "frozen": target.get("frozen"),
+            "version": target.get("version"),
+        }
+    return shared, position
+
+
+def _batch_image_digests(state, context, definition, result, previous=None):
+    """One digest per image of the part of a batch result that image uses.
+
+    Returns ``None`` for batch stages without per-image parts (their later
+    image stages then follow the whole batch signature).
+    """
+
+    stage = definition["name"]
+    parts = _BATCH_IMAGE_PARTS.get(stage)
+    if parts is None or not isinstance(result, Mapping):
+        return None
+    expected = parts["rows"] + parts["shared"] + (["templates"] if stage == "templates" else [])
+    if not any(key in result for key in expected):
+        return None  # not the usual result (a replaced stage function)
+    batch_entry = state.get("batch_stages", {}).get(stage, {})
+    cache = {}
+    digests = {}
+    shared_part, position = _shared_digest_part(
+        stage, result, context.get("settings"), parts["shared"],
+        (previous or {}).get("digest_target_position"),
+    )
+    if position is not None:
+        batch_entry["digest_target_position"] = position
+    shared = _content_hash(shared_part, cache)
+    for image_id, image in state["images"].items():
+        upstream = []
+        for required in definition.get("requires", []):
+            if required in state.get("batch_stages", {}):
+                entry = state["batch_stages"][required]
+                upstream.append((entry.get("image_digests") or {}).get(
+                    image_id, entry.get("signature")))
+            else:
+                entry = image.get("stages", {}).get(required, {})
+                upstream.append((entry.get("signature"), entry.get("status"),
+                                 entry.get("review_status")))
+        own = {key: _rows_for_image(result.get(key), image_id) for key in parts["rows"]}
+        if stage == "templates":
+            own["template"] = _template_part(result, context, image_id)
+        digests[image_id] = _content_hash(
+            {"stage": stage, "status": batch_entry.get("status"), "shared": shared,
+             "own": own, "upstream": upstream}, cache,
+        )
+    return digests
+
+
+def _mark_images_after_batch(state, stage_name, image_ids, reason):
+    """Mark the image stages after a batch stage stale for some images.
+
+    Stops at the next batch stage: that one compares its own per-image
+    results when it runs again.
+    """
+
+    definitions = {item["name"]: item for item in _stage_definitions()}
+    for name in _downstream_names(stage_name)[1:]:
+        if definitions[name]["scope"] == "batch":
+            break
+        for identifier in image_ids:
+            entry = state["images"][identifier].get("stages", {}).get(name)
+            if entry and entry.get("status") not in {"STALE", "REJECTED"} and not (
+                entry.get("status") == "SKIPPED" and not entry.get("blocked", False)
+            ):
+                entry["status"] = "STALE"
+                entry["review_status"] = None
+                entry["stale_reason"] = reason
+                _pipeline_event(state, "STALE", name, identifier, reason)
+            _update_image_status(state, identifier)
 
 
 def _stage_status(result):
@@ -1452,6 +1916,19 @@ def _dependency_ready(state, definition, image_id=None):
             if not active:
                 return False, "no image completed dependency {}".format(required)
     return True, None
+
+
+def _dependency_stale(state, definition, image_id):
+    """True when a stage this one needs is marked STALE (waiting to be redone)."""
+
+    for required in definition.get("requires", []):
+        batch = state.get("batch_stages", {}).get(required)
+        entry = batch if batch is not None else (
+            state["images"][image_id].get("stages", {}).get(required, {})
+        )
+        if (entry or {}).get("status") == "STALE":
+            return True
+    return False
 
 
 def _stage_entry(status, signature, result=None, error=None, blocked=False):
@@ -1566,7 +2043,12 @@ def _execute_image_stage(state, context, definition, image_id):
         )
         _pipeline_event(state, status, stage, image_id, message)
         return status
+    previous = image.get("stages", {}).get(stage, {})
     if not ready:
+        if _accepted_entry(previous) and _dependency_stale(state, definition, image_id):
+            # The step this one needs is waiting to be redone; keep the
+            # current result until then (it is checked again afterwards).
+            return previous["status"]
         status = "SKIPPED"
         image["stages"][stage] = _stage_entry(
             status, signature, error=reason, blocked=True
@@ -1574,8 +2056,7 @@ def _execute_image_stage(state, context, definition, image_id):
         _pipeline_event(state, status, stage, image_id, reason)
         _update_image_status(state, image_id)
         return status
-    previous = image.get("stages", {}).get(stage, {})
-    if previous.get("signature") == signature and _accepted_status(previous.get("status")):
+    if previous.get("signature") == signature and _accepted_entry(previous):
         return previous["status"]
     runner = definition.get("runner")
     if runner is None:
@@ -1584,6 +2065,10 @@ def _execute_image_stage(state, context, definition, image_id):
         _restore_stage_input(context, image_id, stage)
         result = runner(context, image_id, context["images"][image_id]["settings"])
         _store_stage_output(context, image_id, stage)
+        # The read stage resolves the image's settings again with the
+        # instrument found in its header; sign the result with the settings
+        # it was made with, or the next pass would redo it.
+        signature = _stage_signature(state, context, definition, image_id)
         status = _stage_status(result)
         context["images"][image_id]["products"][stage] = result
         image["stages"][stage] = _stage_entry(status, signature, result=result)
@@ -1634,7 +2119,7 @@ def _execute_batch_stage(state, context, definition):
         _pipeline_event(state, "SKIPPED", stage, message=reason)
         return "SKIPPED"
     previous = state.get("batch_stages", {}).get(stage, {})
-    if previous.get("signature") == signature and _accepted_status(previous.get("status")):
+    if previous.get("signature") == signature and _accepted_entry(previous):
         return previous["status"]
     runner = definition.get("runner")
     if runner is None:
@@ -1645,6 +2130,19 @@ def _execute_batch_stage(state, context, definition):
         context["shared"][stage] = result
         state["batch_stages"][stage] = _stage_entry(status, signature, result=result)
         _apply_batch_image_statuses(state, stage, result)
+        old_digests = previous.get("image_digests")
+        digests = _batch_image_digests(state, context, definition, result, previous)
+        if digests is not None:
+            state["batch_stages"][stage]["image_digests"] = digests
+            changed = [
+                image_id for image_id in digests
+                if (old_digests or {}).get(image_id) != digests[image_id]
+                and state["images"][image_id].get("status") != "REJECTED"
+            ]
+            state["batch_stages"][stage]["changed_images"] = changed
+            _mark_images_after_batch(
+                state, stage, changed, "{} result changed".format(stage)
+            )
         _pipeline_event(state, status, stage)
     except Exception as error:
         status = "FAIL"
@@ -1868,16 +2366,23 @@ def _downstream_names(stage_name):
 
 
 def mark_pipeline_stale(state, stage_name, image_id=None, reason="upstream change"):
-    """Mark one stage and every downstream product stale without deleting it."""
+    """Mark one stage and the products after it stale without deleting them.
+
+    For ``image_id`` (or every image when ``None``) the named stage and the
+    image stages that follow it are marked, up to the next batch stage; every
+    later batch stage is marked as well. Image stages after a batch stage are
+    left alone: when that batch stage runs again it compares each image's part
+    of its new result with the old one and marks only the images whose part
+    changed, so the other images keep their results.
+    """
 
     definitions = {item["name"]: item for item in _stage_definitions()}
     downstream = _downstream_names(stage_name)
     targets = [image_id] if image_id is not None else list(state["images"])
-    cascade_all_images = image_id is None
+    after_batch = False
     for name in downstream:
         definition = definitions[name]
         if definition["scope"] == "batch":
-            cascade_all_images = True
             entry = state.get("batch_stages", {}).get(name)
             if entry and (
                 entry.get("status") != "SKIPPED" or entry.get("blocked", False)
@@ -1885,18 +2390,24 @@ def mark_pipeline_stale(state, stage_name, image_id=None, reason="upstream chang
                 entry["status"] = "STALE"
                 entry["stale_reason"] = reason
                 _pipeline_event(state, "STALE", name, message=reason)
-        else:
-            stage_targets = list(state["images"]) if cascade_all_images else targets
-            for identifier in stage_targets:
-                entry = state["images"][identifier].get("stages", {}).get(name)
-                if entry and (
-                    entry.get("status") != "SKIPPED" or entry.get("blocked", False)
-                ):
-                    entry["status"] = "STALE"
-                    entry["review_status"] = None
-                    entry["stale_reason"] = reason
-                    _pipeline_event(state, "STALE", name, identifier, reason)
-                _update_image_status(state, identifier)
+            if name in _BATCH_IMAGE_PARTS:
+                # Later image stages follow this stage's per-image results.
+                after_batch = True
+            else:
+                targets = list(state["images"])
+            continue
+        if after_batch:
+            continue
+        for identifier in targets:
+            entry = state["images"][identifier].get("stages", {}).get(name)
+            if entry and (
+                entry.get("status") != "SKIPPED" or entry.get("blocked", False)
+            ):
+                entry["status"] = "STALE"
+                entry["review_status"] = None
+                entry["stale_reason"] = reason
+                _pipeline_event(state, "STALE", name, identifier, reason)
+            _update_image_status(state, identifier)
     return state
 
 
@@ -1933,8 +2444,12 @@ def refresh_pipeline_staleness(state, context, stage_functions=None):
     return state
 
 
-def set_image_overrides(state, context, image_id, overrides, from_stage=None):
-    """Persist per-image overrides and invalidate only relevant later stages."""
+def set_image_overrides(state, context, image_id, overrides, from_stage=None, save=True):
+    """Persist per-image overrides and invalidate only relevant later stages.
+
+    ``from_stage`` defaults to the first stage that reads any of the changed
+    settings (:func:`first_stage_reading`).
+    """
 
     if image_id not in state["images"]:
         raise KeyError("Unknown image: {}".format(image_id))
@@ -1946,15 +2461,11 @@ def set_image_overrides(state, context, image_id, overrides, from_stage=None):
     )
     context["images"][image_id]["record"]["settings"] = context["images"][image_id]["settings"]
     if from_stage is None:
-        changed_sections = set((overrides or {}).keys())
-        from_stage = next(
-            (item["name"] for item in _stage_definitions()
-             if changed_sections.intersection(item.get("settings", []))),
-            "read",
-        )
+        from_stage = first_stage_reading(overrides)
     mark_pipeline_stale(state, from_stage, image_id, "individual-image override changed")
     _pipeline_event(state, "STALE", from_stage, image_id, "override saved")
-    save_pipeline_state(state, context)
+    if save:
+        save_pipeline_state(state, context)
     return state, context
 
 
@@ -1977,7 +2488,7 @@ def _resolve_image_settings(context, image_id, overrides):
     )
 
 
-def set_run_overrides(state, context, overrides, from_stage=None):
+def set_run_overrides(state, context, overrides, from_stage=None, save=True):
     """Change run-level settings and invalidate only the affected stages.
 
     Use this for settings read by batch stages (for example ``catalogs`` for
@@ -2001,15 +2512,11 @@ def set_run_overrides(state, context, overrides, from_stage=None):
         image["settings"] = resolved
         image["record"]["settings"] = resolved
     if from_stage is None:
-        changed_sections = set((overrides or {}).keys())
-        from_stage = next(
-            (item["name"] for item in _stage_definitions()
-             if changed_sections.intersection(item.get("settings", []))),
-            "read",
-        )
+        from_stage = first_stage_reading(overrides)
     mark_pipeline_stale(state, from_stage, reason="run-level override changed")
     _pipeline_event(state, "STALE", from_stage, message="run override saved")
-    save_pipeline_state(state, context)
+    if save:
+        save_pipeline_state(state, context)
     return state, context
 
 
@@ -2346,8 +2853,13 @@ def _run_star_selection(context, image_id, settings):
     overrides = context.get("shared", {}).get("star_overrides")
     _progress.progress("choosing zeropoint, PSF, ensemble and astrometry stars "
                        "({} sources)".format(len(master)))
+    # Each image is screened with its own settings (per-image overrides).
+    image_settings = {
+        str(record.get("image_id")): record.get("settings") or settings
+        for record in records
+    }
     master, measurements, summaries = select_comparison_and_psf_stars(
-        master, measurements, settings, overrides
+        master, measurements, settings, overrides, image_settings=image_settings
     )
     flagged = any(item.get("flags") for item in summaries) or any(
         entry.get("error") or not entry.get("matched")
@@ -2405,6 +2917,13 @@ def _run_alignment(context, image_id, settings):
         validate_fixed_target_projection,
     )
 
+    # Start from the astrometry WCS of every image: a previous alignment
+    # replaced record["wcs"] with the aligned one, and aligning that again
+    # would add the correction twice.
+    for image in context["images"].values():
+        astrometry = (image.get("products") or {}).get("astrometry") or {}
+        if astrometry.get("wcs") is not None:
+            image["record"]["wcs"] = astrometry["wcs"]
     records = _records_for_stage(context, "usability")
     selection = context["shared"]["star_selection"]
     decisions = context["shared"]["usability"]["decisions"]
@@ -2506,7 +3025,7 @@ def _run_calibration(context, image_id, settings):
 
 
 def _run_templates(context, image_id, settings):
-    from .subtraction import acquire_template
+    from .subtraction import acquire_template, template_footprint_coverage
 
     if not settings.get("subtraction", {}).get("enabled", False):
         return {"templates": {}, "status": "SKIPPED", "skipped": "disabled"}
@@ -2521,13 +3040,28 @@ def _run_templates(context, image_id, settings):
         settings = merge_settings(settings, {"subtraction": {
             "cache_directory": str(Path(context["_state"]["run_directory"]) / cache)}})
     templates = {}
+    status, flags = "PASS", []
+    minimum = float(settings.get("subtraction", {}).get("minimum_footprint_coverage", 0.999))
     for filter_name in filters:
         _progress.progress("template for filter {}".format(filter_name))
         templates[filter_name] = acquire_template(
             records, filter_name, settings, template_paths=supplied,
             downloader=context.get("shared", {}).get("template_downloader"),
         )
-    return {"templates": templates, "status": "PASS"}
+        # Where the images of this filter fall on its template (and whether
+        # they land on real template data everywhere).
+        footprints = template_footprint_coverage(
+            templates[filter_name],
+            [record for record in records
+             if str(record.get("metadata", {}).get("filter")) == filter_name])
+        templates[filter_name]["science_footprints"] = footprints
+        for item in footprints:
+            coverage = item.get("coverage_fraction")
+            if coverage is not None and coverage < minimum:
+                status = "WARN"
+                if "TEMPLATE_FOOTPRINT_INCOMPLETE" not in flags:
+                    flags.append("TEMPLATE_FOOTPRINT_INCOMPLETE")
+    return {"templates": templates, "status": status, "flags": flags}
 
 
 def _run_subtraction(context, image_id, settings):
@@ -2643,34 +3177,16 @@ def _processed_header(ccd, wcs, metadata, extra):
 def _processed_image_products(context, settings):
     """Per-image processed arrays, headers and mask components for the outputs.
 
-    The processed image is the working image after the background stage
-    (cut to the usable area, masked, fringe-corrected, background-subtracted)
-    on its native pixels, with the WCS refined by astrometry and relative
-    alignment. When enabled, a copy resampled onto the alignment reference
-    grid is added for visual comparison of epochs.
+    The processed image is the final cleaned image: the working image after
+    the background stage (cut to the usable area, masked, cosmic rays and
+    fringes handled, background-subtracted) on its native pixels, with the
+    WCS refined by astrometry and aligned to the reference image.
     """
 
-    from .alignment import _reproject_derived_array
-
     state = context["_state"]
-    products = (settings or {}).get("output", {})
-    from .output import output_product_enabled
-
-    want_registered = output_product_enabled(settings, "registered_image")
     shared = context.get("shared", {})
     alignment = shared.get("alignment") or {}
     alignments = {str(item.get("image_id")): item for item in alignment.get("alignments") or []}
-    reference = next((item for item in alignments.values() if item.get("is_reference")), None)
-    reference_grid = None
-    if reference is not None and reference.get("wcs") is not None:
-        reference_image = context["images"].get(str(reference["image_id"]))
-        if reference_image is not None:
-            reference_ccd = (reference_image.get("stage_ccd") or {}).get("background")
-            if reference_ccd is None:
-                reference_ccd = reference_image["record"].get("ccd")
-            if reference_ccd is not None:
-                reference_grid = (reference["wcs"], np.shape(reference_ccd.data),
-                                  str(reference["image_id"]))
     zeropoints = (shared.get("calibration") or {}).get("zeropoints")
     items = []
     for number, (image_id, image) in enumerate(context["images"].items(), 1):
@@ -2752,25 +3268,7 @@ def _processed_image_products(context, settings):
             "background": model,
             "background_rms": rms,
             "uncertainty": uncertainty,
-            "registered": None,
         }
-        combined = getattr(ccd, "mask", None)
-        if want_registered and reference_grid is not None and wcs is not None and \
-                state["images"][image_id].get("status") != "REJECTED":
-            reference_wcs, shape, reference_id = reference_grid
-            try:
-                plane, valid = _reproject_derived_array(
-                    np.asarray(ccd.data, dtype=float), wcs, reference_wcs, shape,
-                    combined, int(products.get("registered_order", 1)), 256)
-                plane[~valid] = np.nan
-                registered_header = _processed_header(ccd, reference_wcs, metadata, extra)
-                registered_header["REGREF"] = (reference_id[:68], "grid of this reference image")
-                registered_header.add_history(
-                    "redphot: processed image resampled onto the alignment reference grid "
-                    "for display only; photometry used the native pixels.")
-                item["registered"] = {"data": plane, "header": registered_header}
-            except Exception as error:
-                item["registered_error"] = "{}: {}".format(type(error).__name__, error)
         items.append(item)
     return items
 
@@ -2860,12 +3358,8 @@ def _run_outputs(context, image_id, settings):
         if output_product_enabled(settings, "image_pdfs") else {}
     )
     processed = []
-    if output_product_enabled(settings, "processed_image") or \
-            output_product_enabled(settings, "registered_image"):
+    if output_product_enabled(settings, "processed_image"):
         processed = _processed_image_products(context, settings)
-        if not output_product_enabled(settings, "registered_image"):
-            for item in processed:
-                item["registered"] = None
     return assemble_output_products(
         all_records, sources=selection.get("master"),
         batch_products=shared.get("batch_consistency"),
@@ -2911,6 +3405,7 @@ __all__ = [
     "build_preferred_light_curve",
     "collect_batch_measurements",
     "compare_photometry_methods",
+    "first_stage_reading",
     "initialize_pipeline",
     "load_pipeline_state",
     "mark_pipeline_stale",
@@ -2928,5 +3423,6 @@ __all__ = [
     "save_pipeline_state",
     "set_image_overrides",
     "skip_pipeline_stage",
+    "stage_reads_setting",
     "summarize_problem_groups",
 ]

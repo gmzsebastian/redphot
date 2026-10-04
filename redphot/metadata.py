@@ -314,11 +314,8 @@ def _resolve_exposure_and_times(hdulist, metadata, settings, conflicts, flags):
     )
     time_tolerance = float(metadata_settings.get("time_tolerance_s", 2.0))
 
+    reference = str(metadata_settings.get("time_reference", "start")).lower()
     start = _parse_iso_time(metadata.get("date_obs"), scale=scale)
-    end_header = _parse_end_time(metadata.get("date_end"), start, scale=scale)
-    elapsed = _seconds_between(start, end_header)
-    if elapsed is not None and elapsed <= 0:
-        elapsed = None
 
     exposure_candidates = collect_header_candidates(
         hdulist, settings, "exposure_time"
@@ -328,6 +325,70 @@ def _resolve_exposure_and_times(hdulist, metadata, settings, conflicts, flags):
         value = _as_float(candidate["value"])
         if value is not None and value > 0:
             numeric_candidates.append((value, candidate))
+
+    mjd_candidates = collect_header_candidates(hdulist, settings, "mjd")
+    mjd_source = metadata.get("_sources", {}).get("mjd", {})
+    primary_mjd_candidate = None
+    for candidate in mjd_candidates:
+        if (
+            candidate["hdu"] == mjd_source.get("hdu")
+            and candidate["keyword"].upper()
+            == str(mjd_source.get("keyword", "")).upper()
+        ):
+            primary_mjd_candidate = candidate
+            break
+    if primary_mjd_candidate is None and mjd_candidates:
+        primary_mjd_candidate = mjd_candidates[0]
+
+    mjd_header_time = None
+    if primary_mjd_candidate is not None:
+        mjd_header_time = _time_from_mjd_candidate(
+            primary_mjd_candidate, scale=scale
+        )
+
+    # DATE-OBS and the MJD card disagree (e.g. a DATE-OBS holding only the
+    # date, read as midnight): the MJD card is a single unambiguous number,
+    # so it decides the start time.
+    preliminary_exposure = _as_float(metadata.get("exposure_time"))
+    if preliminary_exposure is None and numeric_candidates:
+        preliminary_exposure = numeric_candidates[-1][0]
+    mjd_start = mjd_header_time
+    if mjd_start is not None and preliminary_exposure is not None:
+        if reference == "mid":
+            mjd_start = mjd_start - preliminary_exposure / 2.0 * u.s
+        elif reference == "end":
+            mjd_start = mjd_start - preliminary_exposure * u.s
+    if (
+        start is not None
+        and mjd_start is not None
+        and metadata_settings.get("prefer_mjd_on_time_conflict", True)
+        and abs(_seconds_between(start, mjd_start)) > time_tolerance
+    ):
+        _add_flag(flags, "TIME_CONFLICT")
+        conflicts.append(
+            {
+                "field": "mjd",
+                "kind": "date_obs_vs_mjd_card",
+                "hdu": primary_mjd_candidate["hdu"],
+                "keyword": primary_mjd_candidate["keyword"],
+                "value": primary_mjd_candidate["value"],
+                "difference_s": abs(_seconds_between(start, mjd_start)),
+                "resolution": "used {}".format(primary_mjd_candidate["keyword"]),
+                "date_obs": metadata.get("date_obs"),
+            }
+        )
+        metadata["date_obs_header"] = metadata.get("date_obs")
+        start = mjd_start
+        metadata.setdefault("_sources", {})["date_start"] = {
+            "hdu": primary_mjd_candidate["hdu"],
+            "keyword": primary_mjd_candidate["keyword"],
+            "resolution": "mjd_preferred_on_conflict",
+        }
+
+    end_header = _parse_end_time(metadata.get("date_end"), start, scale=scale)
+    elapsed = _seconds_between(start, end_header)
+    if elapsed is not None and elapsed <= 0:
+        elapsed = None
 
     selected_exposure = _as_float(metadata.get("exposure_time"))
     selected_source = metadata.get("_sources", {}).get("exposure_time")
@@ -394,27 +455,6 @@ def _resolve_exposure_and_times(hdulist, metadata, settings, conflicts, flags):
             }
         )
 
-    mjd_candidates = collect_header_candidates(hdulist, settings, "mjd")
-    mjd_source = metadata.get("_sources", {}).get("mjd", {})
-    primary_mjd_candidate = None
-    for candidate in mjd_candidates:
-        if (
-            candidate["hdu"] == mjd_source.get("hdu")
-            and candidate["keyword"].upper()
-            == str(mjd_source.get("keyword", "")).upper()
-        ):
-            primary_mjd_candidate = candidate
-            break
-    if primary_mjd_candidate is None and mjd_candidates:
-        primary_mjd_candidate = mjd_candidates[0]
-
-    mjd_header_time = None
-    if primary_mjd_candidate is not None:
-        mjd_header_time = _time_from_mjd_candidate(
-            primary_mjd_candidate, scale=scale
-        )
-
-    reference = str(metadata_settings.get("time_reference", "start")).lower()
     if start is None and mjd_header_time is not None:
         start = mjd_header_time
         if selected_exposure is not None:

@@ -27,6 +27,20 @@ value and its HDU, warns on conflicts, and cross-checks exposure time against
 start/end timestamps. Telescope pointing, header target coordinates, WCS
 center, user coordinates, and the final frozen target position remain separate.
 
+Other instruments
+-----------------
+
+Images from instruments without a profile (LDSS3c, IMACS, Binospec, ...) use
+the general defaults. When their header has no saturation keyword, the
+saturation level falls back to ``metadata.fallback_values.saturation``
+(50,000, the KeplerCam value); the Read figure marks it as a default. Set
+``metadata.saturation_override`` per image when the real level differs.
+
+When ``DATE-OBS`` and the MJD card disagree (for example a ``DATE-OBS`` that
+holds only the date), the start time is taken from the MJD card
+(``metadata.prefer_mjd_on_time_conflict``) and the conflict is listed in the
+Read figure.
+
 Both instruments
 ----------------
 

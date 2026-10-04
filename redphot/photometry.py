@@ -2148,11 +2148,14 @@ def _instrumental_magnitude(flux, uncertainty, exposure):
     return float(magnitude), None if error is None else float(error)
 
 
-def _calibration_records(measurements, catalogs, settings):
-    """Build calibration-star records from valid role assignments and catalog data."""
+def _calibration_records(measurements, catalogs, settings, image_settings=None):
+    """Build calibration-star records from valid role assignments and catalog data.
 
-    calibration = settings.get("calibration", {})
-    excluded_flags = set(calibration.get("excluded_measurement_flags", []))
+    ``image_settings`` maps image IDs to that image's settings (per-image
+    overrides of the ``calibration`` section); other images use ``settings``.
+    """
+
+    image_settings = image_settings or {}
     records = []
     available = list(catalogs)
     for index, row in enumerate(measurements):
@@ -2160,11 +2163,14 @@ def _calibration_records(measurements, catalogs, settings):
         if "calibration" not in roles.split(";"):
             continue
         image_id = str(row["image_id"])
+        local = image_settings.get(image_id) or settings
+        calibration = local.get("calibration", {})
+        excluded_flags = set(calibration.get("excluded_measurement_flags", []))
         method = str(row["method"])
         filter_name = normalize_filter_name(_science_row_value(row, "filter"))
-        routed, band = route_calibration_catalog(filter_name, settings, available)
+        routed, band = route_calibration_catalog(filter_name, local, available)
         source_id = str(row["source_id"])
-        entry = _catalog_entry(catalogs, source_id, routed, band, settings)
+        entry = _catalog_entry(catalogs, source_id, routed, band, local)
         reasons = []
         flux = _finite_float(_science_row_value(row, "flux"))
         flux_error = _finite_float(_science_row_value(row, "flux_uncertainty"))
@@ -2324,15 +2330,23 @@ def _solve_zeropoint_group(records, indices, unstable_pairs, settings):
     values = np.asarray(
         [records[index]["individual_zeropoint"] for index in accepted], dtype=float
     )
-    variances = []
+    errors = []
     for index in accepted:
         record = records[index]
-        error = np.hypot(
+        errors.append(max(float(np.hypot(
             record["instrumental_magnitude_uncertainty"] or 0.0,
             record["catalog_magnitude_error"] or 0.0,
-        )
-        variances.append(max(error, 1.0e-4) ** 2)
-    weights = 1.0 / np.asarray(variances)
+        )), 1.0e-4))
+    errors = np.asarray(errors, dtype=float)
+    # Star-to-star scatter beyond the formal errors (catalog systematics,
+    # color terms, PSF variations) is added to every star's variance. Without
+    # it the brightest stars, whose formal errors are tiny, set the weighted
+    # mean alone, and any nonlinearity at the bright end biases the zeropoint.
+    intrinsic = 0.0
+    if calibration.get("add_intrinsic_scatter", True) and len(values) > 2:
+        observed = _robust_scatter(values) or 0.0
+        intrinsic = float(np.sqrt(max(observed ** 2 - float(np.median(errors)) ** 2, 0.0)))
+    weights = 1.0 / (errors ** 2 + intrinsic ** 2)
     zeropoint = float(np.sum(weights * values) / np.sum(weights))
     scatter = _robust_scatter(values)
     formal = float(np.sqrt(1.0 / np.sum(weights)))
@@ -2345,6 +2359,7 @@ def _solve_zeropoint_group(records, indices, unstable_pairs, settings):
             "zeropoint_mag": zeropoint,
             "zeropoint_uncertainty_mag": uncertainty,
             "zeropoint_scatter_mag": scatter,
+            "intrinsic_scatter_mag": intrinsic,
             "status": "PASS",
             "airmass": float(np.median([
                 records[index]["airmass"] for index in accepted
@@ -2376,10 +2391,11 @@ def _solve_zeropoint_group(records, indices, unstable_pairs, settings):
     return solution
 
 
-def _solve_all_zeropoints(records, settings, unstable_pairs=None):
+def _solve_all_zeropoints(records, settings, unstable_pairs=None, image_settings=None):
     """Solve every image and method group, updating calibration-star records."""
 
     unstable_pairs = unstable_pairs or set()
+    image_settings = image_settings or {}
     groups = {}
     for index, record in enumerate(records):
         key = (record["image_id"], record["method"])
@@ -2388,7 +2404,8 @@ def _solve_all_zeropoints(records, settings, unstable_pairs=None):
     for key in sorted(groups):
         solutions.append(
             _solve_zeropoint_group(
-                records, groups[key], unstable_pairs, settings
+                records, groups[key], unstable_pairs,
+                image_settings.get(str(key[0])) or settings,
             )
         )
     return solutions
@@ -2413,16 +2430,17 @@ def _unstable_calibration_stars(records, settings):
     }
 
 
-def _aperture_corrections(measurements, settings):
+def _aperture_corrections(measurements, settings, image_settings=None):
     """Calculate robust method-to-reference aperture corrections per image."""
 
-    calibration = settings.get("calibration", {})
-    reference = calibration.get("reference_aperture_method", "large_aperture")
-    minimum = int(calibration.get("minimum_aperture_correction_stars", 3))
+    image_settings = image_settings or {}
     rows = []
     image_ids = list(dict.fromkeys(str(value) for value in measurements["image_id"]))
     methods = list(dict.fromkeys(str(value) for value in measurements["method"]))
     for image_id in image_ids:
+        calibration = (image_settings.get(image_id) or settings).get("calibration", {})
+        reference = calibration.get("reference_aperture_method", "large_aperture")
+        minimum = int(calibration.get("minimum_aperture_correction_stars", 3))
         image_rows = measurements[np.asarray(measurements["image_id"], dtype=str) == image_id]
         by_source = {}
         for row in image_rows:
@@ -2847,7 +2865,8 @@ def _limit_products(
 
 
 def _calibrated_measurements(
-    measurements, catalogs, solutions, calibration_records, corrections, limits, settings
+    measurements, catalogs, solutions, calibration_records, corrections, limits, settings,
+    image_settings=None,
 ):
     """Append instrumental and calibrated quantities without replacing fluxes."""
 
@@ -2877,10 +2896,12 @@ def _calibrated_measurements(
     magnitude_systems = []
     calibration_inliers = []
     flags = []
-    detection_sigma = float(settings.get("calibration", {}).get("detection_sigma", 3.0))
+    image_settings = image_settings or {}
     available = list(catalogs)
     for index, row in enumerate(output):
         image_id, method = str(row["image_id"]), str(row["method"])
+        local = image_settings.get(image_id) or settings
+        detection_sigma = float(local.get("calibration", {}).get("detection_sigma", 3.0))
         solution = solution_lookup.get((image_id, method))
         correction = correction_lookup.get((image_id, method))
         flux = _finite_float(_science_row_value(row, "flux"))
@@ -2902,9 +2923,9 @@ def _calibrated_measurements(
             else float(np.hypot(instrumental_error or 0.0, zeropoint_error or 0.0))
         )
         filter_name = normalize_filter_name(_science_row_value(row, "filter"))
-        routed, band = route_calibration_catalog(filter_name, settings, available)
+        routed, band = route_calibration_catalog(filter_name, local, available)
         entry = _catalog_entry(
-            catalogs, str(row["source_id"]), routed, band, settings
+            catalogs, str(row["source_id"]), routed, band, local
         ) if str(row["source_type"]) != "target" else None
         catalog_magnitude = None if entry is None else entry["catalog_magnitude"]
         numeric["instrumental_magnitude"].append(instrumental)
@@ -3002,12 +3023,21 @@ def calibrate_photometry(
         raise RuntimeError("Photometric calibration is disabled")
     measurements = Table(measurements, masked=True, copy=True)
     catalog_collection = _catalog_collection(catalogs)
-    records = _calibration_records(measurements, catalog_collection, settings)
+    # Per-image settings (overrides) for the zeropoint of each image; the
+    # checks across images (unstable stars, trends) use ``settings``.
+    image_settings = {
+        str(_image_id(record, index)): record.get("settings")
+        for index, record in enumerate(image_records or [])
+        if record.get("settings")
+    }
+    records = _calibration_records(
+        measurements, catalog_collection, settings, image_settings
+    )
     from .progress import progress
 
     progress("zeropoints for {} image/method combinations".format(
         len({(str(record.get("image_id")), str(record.get("method"))) for record in records})))
-    first_solutions = _solve_all_zeropoints(records, settings)
+    first_solutions = _solve_all_zeropoints(records, settings, None, image_settings)
     unstable = _unstable_calibration_stars(records, settings)
     if unstable:
         for record in records:
@@ -3019,12 +3049,12 @@ def calibrate_photometry(
                 if value and value != "ZEROPOINT_OUTLIER"
             ]
             record["rejection_reason"] = ";".join(reasons)
-        solutions_records = _solve_all_zeropoints(records, settings, unstable)
+        solutions_records = _solve_all_zeropoints(records, settings, unstable, image_settings)
     else:
         solutions_records = first_solutions
     zeropoints = _records_table(solutions_records)
     calibration_stars = _records_table(records)
-    corrections = _aperture_corrections(measurements, settings)
+    corrections = _aperture_corrections(measurements, settings, image_settings)
     correction_lookup = {
         (str(row["image_id"]), str(row["method"])): row for row in corrections
     }
@@ -3064,6 +3094,7 @@ def calibrate_photometry(
         corrections,
         limits,
         settings,
+        image_settings,
     )
     flux_unit = getattr(measurements["flux"], "unit", None)
     for table in (zeropoints, calibration_stars, corrections, trends, limits):
@@ -3358,12 +3389,38 @@ def _annotate_measurement_origin(table, image_kind, host_light_included):
     return result
 
 
-def _difference_comparison(science_table, difference_table):
-    """Compare target fluxes method by method without discarding either table."""
+def _difference_comparison(science_table, difference_table, zeropoints=None,
+                           limit_sigma=3.0):
+    """Compare target fluxes and magnitudes method by method.
+
+    Magnitudes use each method's zeropoint of that image; a flux below
+    ``limit_sigma`` times its uncertainty gets that limit instead
+    (``*_limit_mag``) and no magnitude.
+    """
 
     science = {str(row["method"]): row for row in _target_rows(science_table)}
     difference = {str(row["method"]): row for row in _target_rows(difference_table)}
     rows = []
+
+    def magnitudes(row, method):
+        if row is None:
+            return None, None, None
+        flux = _finite_float(row["flux"])
+        error = _finite_float(row["flux_uncertainty"])
+        exposure = _finite_float(_science_row_value(row, "exposure_time"))
+        zeropoint, zeropoint_error = _zeropoint_lookup(
+            zeropoints, row["image_id"], method) if zeropoints is not None else (None, None)
+        if zeropoint is None or exposure is None or exposure <= 0:
+            return None, None, None
+        if flux is not None and error not in {None, 0.0} and flux > limit_sigma * error:
+            magnitude = zeropoint - 2.5 * np.log10(flux / exposure)
+            magnitude_error = float(np.hypot(2.5 / np.log(10.0) * error / flux,
+                                             zeropoint_error or 0.0))
+            return float(magnitude), magnitude_error, None
+        if error not in {None, 0.0} and error > 0:
+            return None, None, float(zeropoint - 2.5 * np.log10(limit_sigma * error / exposure))
+        return None, None, None
+
     for method in sorted(set(science) | set(difference)):
         science_flux = _finite_float(science.get(method)["flux"]) if method in science else None
         science_error = _finite_float(science.get(method)["flux_uncertainty"]) if method in science else None
@@ -3377,6 +3434,9 @@ def _difference_comparison(science_table, difference_table):
             np.hypot(difference_error, science_error)
             if difference_error is not None and science_error is not None else None
         )
+        science_mag, science_mag_error, science_limit = magnitudes(science.get(method), method)
+        difference_mag, difference_mag_error, difference_limit = magnitudes(
+            difference.get(method), method)
         rows.append(
             {
                 "method": method,
@@ -3389,6 +3449,12 @@ def _difference_comparison(science_table, difference_table):
                     delta / combined_error if delta is not None and combined_error not in {None, 0.0}
                     else None
                 ),
+                "science_magnitude": science_mag,
+                "science_magnitude_uncertainty": science_mag_error,
+                "science_limit_mag": science_limit,
+                "difference_magnitude": difference_mag,
+                "difference_magnitude_uncertainty": difference_mag_error,
+                "difference_limit_mag": difference_limit,
             }
         )
     return _records_table(rows)
@@ -3677,11 +3743,14 @@ def perform_difference_image_photometry(
     if dipole["detected"]:
         difference_flags.append("DIFFERENCE_DIPOLE")
     science_table = _science_measurement_table(science_photometry)
-    comparison = _difference_comparison(science_table, difference_table)
-    if flux_unit is not None:
-        for name in comparison.colnames:
-            if "flux" in name or "uncertainty" in name or name == "difference_minus_science":
-                comparison[name].unit = flux_unit
+    comparison = _difference_comparison(science_table, difference_table, zeropoints,
+                                        limit_sigma=detection_sigma)
+    for name in comparison.colnames:
+        if "magnitude" in name or name.endswith("_mag"):
+            comparison[name].unit = u.mag
+        elif flux_unit is not None and (
+                "flux" in name or "uncertainty" in name or name == "difference_minus_science"):
+            comparison[name].unit = flux_unit
     inverted = False
     science_by_method = {str(row["method"]): row for row in _target_rows(science_table)}
     for row in _target_rows(difference_table):

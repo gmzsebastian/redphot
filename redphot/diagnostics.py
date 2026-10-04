@@ -159,6 +159,8 @@ def _styled(function):
 # ---------------------------------------------------------------------------
 
 def _finite(value):
+    if value is None or value is np.ma.masked or np.ma.is_masked(value):
+        return None
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -265,6 +267,14 @@ def _filter_color(name):
     return FILTER_COLORS.get(str(name), FILTER_COLORS.get(str(name).lower(), BLUE))
 
 
+def _pixel_unit(ccd):
+    """Pixel unit of an image as plain text ("adu" when none is set)."""
+
+    unit = getattr(ccd, "unit", None)
+    text = "" if unit is None else str(unit)
+    return text if text and text != "dimensionless" else "adu"
+
+
 def _image_label(metadata, fallback=None):
     metadata = metadata or {}
     return str(metadata.get("filename") or fallback or "image")
@@ -308,7 +318,7 @@ def _new_figure(title, subtitle=None, status=None, check=None, size=(16, 9.4),
 
     figure = plt.figure(figsize=size, layout="constrained")
     figure.get_layout_engine().set(w_pad=0.06, h_pad=0.06, wspace=0.04, hspace=0.06)
-    header_height = 0.105 * size[1] if check else 0.085 * size[1]
+    header_height = min(0.105 * size[1], 1.0) if check else min(0.085 * size[1], 0.82)
     outer = figure.add_gridspec(
         2, 1, height_ratios=[header_height, size[1] - header_height]
     )
@@ -615,22 +625,125 @@ def metric_panel(axis, rows, title="Measurements", flags=None, note=None):
         y -= 0.02
         axis.text(0.0, y, "Flags", ha="left", va="top", fontsize=8.5,
                   color=MUTED, fontweight="bold")
-        y -= 0.05
-        x = 0.0
-        for flag in flags:
-            label = str(flag)
-            width = 0.0125 * len(label) + 0.04
-            if x + width > 1.0:
-                x = 0.0
-                y -= 0.055
-            axis.text(x, y, label, ha="left", va="top", fontsize=7.3, color=INK,
-                      bbox=dict(boxstyle="round,pad=0.3,rounding_size=0.4",
-                                facecolor="#fff1e5" if "FAIL" not in label else "#ffebe9",
-                                edgecolor="none"))
-            x += width
+        _flag_chips(axis, flags, y - 0.05)
     if note:
         axis.text(0.0, 0.0, note, ha="left", va="bottom", fontsize=7.5,
                   color=FAINT, wrap=True)
+
+
+def _flag_chips(axis, flags, y, fontsize=7.3):
+    """Draw flags as rounded chips, wrapped to the panel width.
+
+    The chips are laid out when the figure is drawn (after the layout engine
+    has fixed the panel size), so they never overlap or run past the panel;
+    a flag longer than the panel is wrapped onto several lines in its chip.
+    """
+
+    axis.add_artist(_FlagChips(axis, [str(flag) for flag in flags], y, fontsize))
+
+
+def _flag_chip_artist():
+    from matplotlib.artist import Artist
+
+    class FlagChips(Artist):
+        def __init__(self, axis, flags, y, fontsize):
+            super().__init__()
+            self._axis_ref = axis
+            self._flags = flags
+            self._y = y
+            self._fontsize = fontsize
+            self.set_zorder(5)
+
+        def draw(self, renderer):
+            import textwrap
+
+            from matplotlib.text import Text
+            from matplotlib.transforms import IdentityTransform
+
+            if not self.get_visible() or not self._flags:
+                return
+            axis, figure = self._axis_ref, self._axis_ref.figure
+            box = axis.get_window_extent(renderer)
+            scale = figure.dpi / 72.0
+            pad = 0.3 * self._fontsize * scale            # chip padding in pixels
+            gap = 2 * pad + 4.0 * scale                     # chip-to-chip spacing
+            available = box.width - 2 * pad
+
+            def make(label, x, y):
+                text = Text(x, y, label, fontsize=self._fontsize, color=INK,
+                            ha="left", va="top", linespacing=1.15,
+                            bbox=dict(boxstyle="round,pad=0.3,rounding_size=0.4",
+                                      facecolor="#fff1e5" if "FAIL" not in label
+                                      else "#ffebe9", edgecolor="none"))
+                text.set_figure(figure)
+                text.set_transform(IdentityTransform())
+                return text
+
+            sample = "CONFLICT: DATE-OBS vs MJD 58848.24 0123456789 s apart"
+            probe = make(sample, 0, 0)
+            char = probe.get_window_extent(renderer).width / float(len(sample))
+            max_chars = max(10, int(available / max(char, 1e-3)))
+            x0 = box.x0 + pad
+            x, top = x0, box.y0 + self._y * box.height - pad
+            line_height = 0.0
+            for flag in self._flags:
+                label = "\n".join(textwrap.wrap(flag, max_chars, break_long_words=True)) or flag
+                text = make(label, 0, 0)
+                extent = text.get_window_extent(renderer)
+                if x > x0 and x + extent.width > box.x1 - pad:
+                    x = x0
+                    top -= line_height + gap
+                    line_height = 0.0
+                text.set_position((x, top))
+                text.draw(renderer)
+                x += extent.width + gap
+                line_height = max(line_height, extent.height)
+
+    return FlagChips
+
+
+class _LazyFlagChips:
+    """Build the chip artist class on first use (keeps matplotlib import lazy)."""
+
+    _cls = None
+
+    def __call__(self, *args, **kwargs):
+        if _LazyFlagChips._cls is None:
+            _LazyFlagChips._cls = _flag_chip_artist()
+        return _LazyFlagChips._cls(*args, **kwargs)
+
+
+_FlagChips = _LazyFlagChips()
+
+
+def _conflict_text(item):
+    """Short readable description of one metadata conflict."""
+
+    if not isinstance(item, dict):
+        return "CONFLICT: " + str(item)
+    field = item.get("field", "")
+    kind = item.get("kind", "")
+    if kind == "date_obs_vs_mjd_card":
+        text = "CONFLICT: DATE-OBS {} vs {} {}, {:.0f} s apart".format(
+            item.get("date_obs") or "", item.get("keyword", "MJD"),
+            _fmt(item.get("value"), "{:.5f}"), float(item.get("difference_s") or 0.0))
+        if item.get("resolution"):
+            text += " → {}".format(item["resolution"])
+        return text
+    if kind == "start_end_interval":
+        return "CONFLICT: exposure {} s vs start–end interval {} s".format(
+            _fmt(item.get("header_exposure_s"), "{:g}"),
+            _fmt(item.get("start_end_exposure_s"), "{:g}"))
+    if kind == "duplicate_card":
+        return "CONFLICT: {} has duplicate {} cards ({})".format(
+            field, item.get("keyword", ""),
+            ", ".join(str(value) for value in (item.get("values") or [])[:4]))
+    if kind == "alternative_keywords":
+        names = [str(source.get("keyword")) for source in item.get("sources") or []]
+        values = [str(value) for value in item.get("values") or []]
+        pairs = ["{}={}".format(name, value) for name, value in zip(names, values)][:4]
+        return "CONFLICT: {} differs between keywords ({})".format(field, ", ".join(pairs))
+    return "CONFLICT: {} ({})".format(field or "metadata", kind or "values differ")
 
 
 def _check_status(value, warn, fail, direction="high"):
@@ -909,6 +1022,10 @@ def plot_stage_overview(stage_title, rows, metrics, output_path=None, show=False
             axis.tick_params(axis="y", length=0)
         axis.invert_yaxis()
         unit = metric.get("unit")
+        if not unit and metric.get("unit_key"):
+            units = {str(row.get(metric["unit_key"])) for row in rows
+                     if row.get(metric["unit_key"])}
+            unit = units.pop() if len(units) == 1 else None
         axis.set_title(metric["label"] + (" [{}]".format(unit) if unit else ""))
         if finite.size and offset:
             span = max(finite.max() - finite.min(), 1e-3 * abs(finite.max()))
@@ -1018,13 +1135,15 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
         ("Object", metadata.get("object") or "—", None),
         ("Filter", metadata.get("filter") or "—",
          None if metadata.get("filter") else "FAIL"),
-        ("Exposure", _fmt(metadata.get("exposure_time"), "{:g}", "s"), None),
+        ("Exposure Time", _fmt(metadata.get("exposure_time"), "{:g}", "s"), None),
         ("Mid-exposure", str(metadata.get("date_mid_utc") or metadata.get("date_obs") or "—")[:19], None),
         ("MJD (mid)", _fmt(metadata.get("mjd_mid"), "{:.5f}"), None),
         ("Airmass", _fmt(metadata.get("airmass"), "{:.3f}"), None),
         ("Gain", _fmt(metadata.get("gain"), "{:.3g}", "e⁻/adu"), None),
         ("Read noise", _fmt(metadata.get("read_noise"), "{:.3g}", "e⁻"), None),
-        ("Saturation", _fmt(metadata.get("saturation"), "{:.0f}"), None),
+        ("Saturation", _fmt(metadata.get("saturation"), "{:.0f}"), None,
+         "default (no header keyword)"
+         if "fallback" in ((metadata.get("_sources") or {}).get("saturation") or {}) else None),
         ("Pixel scale", _fmt(metadata.get("pixel_scale"), "{:.3f}", "″/px"), None),
         ("Image size", "{} × {}".format(metadata.get("shape_x", "—"), metadata.get("shape_y", "—")), None),
         ("Data HDU", str(metadata.get("data_hdu", "—")), None),
@@ -1038,8 +1157,7 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
     ]
     problems = list(metadata.get("quality_flags") or []) + [
         "MISSING:" + str(name) for name in metadata.get("missing_metadata") or []
-    ] + ["CONFLICT:" + str(item.get("name", item)) if isinstance(item, dict) else "CONFLICT:" + str(item)
-         for item in metadata.get("metadata_conflicts") or []]
+    ] + [_conflict_text(item) for item in metadata.get("metadata_conflicts") or []]
     metric_panel(table, rows, "Header and metadata", flags=problems)
     return _finish(figure, output_path, show)
 
@@ -1408,8 +1526,8 @@ def plot_cosmic_ray_diagnostics(ccd, products, info, metadata=None,
                                 output_path=None, show=False, status=None):
     """Cosmic-ray mask on the image, the target neighborhood and the densest region.
 
-    Pixels that were already masked by earlier stages (saturation, trails,
-    edges) are shown in magenta, so you can see which areas no longer matter.
+    Masked pixels from earlier stages (saturation, trails, edges) are shown
+    in magenta, labeled "masked pixels" as on every later figure.
     """
 
     metadata = metadata or {}
@@ -1433,11 +1551,11 @@ def plot_cosmic_ray_diagnostics(ccd, products, info, metadata=None,
         "Cosmic rays  ·  " + _image_label(metadata), _image_subtitle(metadata),
         status or ("WARN" if info.get("flags") else "PASS"),
         "pink detections should be sharp single hits, never the cores of stars; magenta "
-        "areas were already masked by earlier stages.",
+        "masked pixels come from earlier stages and are not searched.",
         rows=2, columns=3, width_ratios=[1.3, 0.85, 0.9], size=(16.5, 9.0))
     axis = figure.add_subplot(grid[:, 0])
     show_sky(axis, data, "Cosmic rays on the frame")
-    overlay_pixel_mask(axis, existing, text="already masked")
+    overlay_pixel_mask(axis, existing)
     overlay_mask(axis, mask, PINK, 0.95)
     if mask is not None and np.any(mask):
         axis.plot([], [], "s", color=PINK, markersize=7,
@@ -1464,7 +1582,7 @@ def plot_cosmic_ray_diagnostics(ccd, products, info, metadata=None,
         ("Flagged pixels", _fmt(info.get("cosmic_pixel_count"), "{:.0f}"), None),
         ("Flagged fraction", _fmt(None if info.get("cosmic_pixel_fraction") is None
                                   else 100 * info["cosmic_pixel_fraction"], "{:.3f}", "%"), None),
-        ("Already masked", _fmt(None if existing is None else 100 * existing.mean(), "{:.1f}", "%"),
+        ("Masked pixels", _fmt(None if existing is None else 100 * existing.mean(), "{:.2f}", "%"),
          None, "earlier stages; not searched"),
         ("Touches target", str(info.get("target_overlap")), "WARN" if info.get("target_overlap") else None,
          "detections on the target were not masked ({} px)".format(info.get("target_protected_pixels"))
@@ -1559,14 +1677,33 @@ def plot_background_diagnostics(ccd, products, info, metadata=None, output_path=
         base_mask = _ccd_mask(ccd, data)
     else:
         base_mask = np.asarray(base_mask, dtype=bool)
+    halos = products.get("bright_star_mask")
+    if halos is not None and data is not None and np.shape(halos) == data.shape:
+        halos = np.asarray(halos, dtype=bool)
+    else:
+        halos = None
     if source_mask is not None and data is not None and np.shape(source_mask) == data.shape:
         sources_only = np.asarray(source_mask, dtype=bool)
         if base_mask is not None:
             sources_only = sources_only & ~base_mask
+        if halos is not None:
+            sources_only = sources_only & ~halos
         overlay_mask(input_axis, sources_only, AMBER, 0.35)
         if sources_only.any():
             input_axis.plot([], [], "s", color=AMBER, alpha=0.6, markersize=7,
                             label="sources (grown) {:.1f}%".format(100 * sources_only.mean()))
+    bright = [star for star in (info.get("source_mask") or {}).get("bright_stars") or []
+              if _finite(star.get("halo_radius_pixels")) is not None
+              and star["halo_radius_pixels"] > (star.get("segment_radius_pixels") or 0)]
+    if halos is not None and halos.any():
+        from matplotlib.patches import Circle
+
+        overlay_mask(input_axis, halos, BLUE, 0.30)
+        for star in bright:
+            input_axis.add_patch(Circle((star["x"], star["y"]), star["halo_radius_pixels"],
+                                        fill=False, edgecolor=BLUE, linewidth=0.9))
+        input_axis.plot([], [], "s", color=BLUE, alpha=0.6, markersize=7,
+                        label="bright-star halos {:.1f}%".format(100 * halos.mean()))
     overlay_pixel_mask(input_axis, base_mask)
     _image_legend(input_axis, fontsize=7)
 
@@ -1702,8 +1839,12 @@ def plot_background_diagnostics(ccd, products, info, metadata=None, output_path=
                                          info.get("mesh_count", "—"))),
         ("Masked as sources", _fmt(None if source_mask_info.get("combined_mask_fraction") is None
                                    else 100 * source_mask_info["combined_mask_fraction"], "{:.1f}", "%"), None),
-        ("Sky level (median)", _fmt(sky, "{:.1f}"), None),
-        ("Sky RMS (median)", _fmt(noise, "{:.2f}"), None),
+        ("Bright-star halos", "{} masked".format(len(bright)) if bright else "none", None,
+         "radius {} px".format(", ".join("{:.0f}".format(star["halo_radius_pixels"])
+                                         for star in bright[:4]) + (" …" if len(bright) > 4 else ""))
+         if bright else None),
+        ("Sky level (median)", _fmt(sky, "{:.1f}", _pixel_unit(ccd)), None),
+        ("Sky RMS (median)", _fmt(noise, "{:.2f}", _pixel_unit(ccd)), None),
         ("Gradient before", _fmt(before.get("peak_to_peak"), "{:.3g}"), None),
         ("Gradient after", _fmt(after.get("peak_to_peak"), "{:.3g}"), None),
         ("Gradient removed", _fmt(None if reduction is None else 100 * reduction, "{:.0f}", "%"), None),
@@ -1844,14 +1985,36 @@ def plot_image_quality_diagnostics(ccd, sources, segmentation=None, info=None,
     brightness = figure.add_subplot(grid[1, 2])
     brightness.set_title("FWHM versus brightness")
     flux = _column(sources, "flux")
+    broadened = _bool_column(sources, "broadened")
+    broadening = info.get("fwhm_broadening") or {}
+    onset = _finite(broadening.get("onset_flux"))
     if count:
         positive = np.isfinite(flux) & (flux > 0) & np.isfinite(fwhm)
-        brightness.scatter(flux[positive & ~good], fwhm[positive & ~good], s=8,
-                           color=AMBER, alpha=0.7, label="Gaussian fit, not used")
+        brightness.scatter(flux[positive & ~good & ~broadened], fwhm[positive & ~good & ~broadened],
+                           s=8, color=AMBER, alpha=0.7, label="Gaussian fit, not used")
         brightness.scatter(flux[positive & good], fwhm[positive & good], s=8, color=TEAL,
                            alpha=0.8, label="Gaussian fit, seeing sample")
+        if np.any(positive & broadened & ~saturated):
+            chosen = positive & broadened & ~saturated
+            brightness.scatter(flux[chosen], fwhm[chosen], s=14, color=PINK, alpha=0.9,
+                               label="broadened: not used for seeing, PSF or zeropoint")
         brightness.scatter(flux[positive & saturated], fwhm[positive & saturated], s=16,
                            marker="x", color=RED, linewidths=0.8, label="saturated")
+        scale = 1.0
+        if unit == "″" and _finite(info.get("fwhm_pixels")) and _finite(info.get("fwhm_arcsec")):
+            scale = float(info["fwhm_arcsec"]) / float(info["fwhm_pixels"])
+        curve_flux = np.asarray(broadening.get("curve_flux") or [], dtype=float)
+        curve_fwhm = np.asarray(broadening.get("curve_fwhm") or [], dtype=float) * scale
+        if curve_flux.size:
+            brightness.plot(curve_flux, curve_fwhm, color=INK, linewidth=1.0,
+                            label="running median")
+        if onset is not None:
+            peak_text = ""
+            if _finite(broadening.get("onset_level")) is not None:
+                peak_text = ", peak ≈ {:,.0f} {}".format(broadening["onset_level"],
+                                                       _pixel_unit(ccd))
+            brightness.axvline(onset, color=PINK, linestyle="--", linewidth=1.1,
+                               label="FWHM rises above {:.2g}{}".format(onset, peak_text))
         brightness.set_xscale("log")
         from matplotlib.ticker import NullFormatter
 
@@ -1860,7 +2023,7 @@ def plot_image_quality_diagnostics(ccd, sources, segmentation=None, info=None,
             brightness.set_ylim(0, np.percentile(sample, 99) * 2.0)
         brightness.set_xlabel("segment flux")
         brightness.set_ylabel("FWHM [{}]".format(unit.strip() or "arcsec"))
-        _legend(brightness, loc="upper left")
+        _legend(brightness, loc="upper left", fontsize=6.8)
         _grid(brightness)
     else:
         _empty(brightness, "No sources")
@@ -1895,9 +2058,19 @@ def plot_image_quality_diagnostics(ccd, sources, segmentation=None, info=None,
             "maximum_masked_fraction_fail", "high", "{:.1f}", "%", 100.0),
         row("Trail pixels", "trail_fraction", "maximum_trail_fraction_warn",
             "maximum_trail_fraction_fail", "high", "{:.2f}", "%", 100.0),
-        ("Sky level", _fmt(info.get("background"), "{:.1f}"), None),
-        ("Sky RMS", _fmt(info.get("background_rms"), "{:.2f}"), None),
+        ("Sky level", _fmt(info.get("background"), "{:.1f}", _pixel_unit(ccd)), None),
+        ("Sky RMS", _fmt(info.get("background_rms"), "{:.2f}", _pixel_unit(ccd)), None),
         ("Saturated sources", _fmt(info.get("saturated_source_count"), "{:.0f}"), None),
+        ("FWHM rises with flux",
+         "no" if onset is None else "above {:.2g}".format(onset),
+         None if onset is None else "WARN",
+         ("{} stars; peak ≈ {} {} at the onset".format(
+             broadening.get("broadened_count"),
+             _fmt(broadening.get("onset_level"), "{:,.0f}"), _pixel_unit(ccd))
+          if onset is not None else
+          "flat up to peak ≈ {} {} (sky incl.)".format(
+              _fmt(broadening.get("checked_level"), "{:,.0f}"), _pixel_unit(ccd))
+          if _finite(broadening.get("checked_level")) is not None else None)),
     ]
     metric_panel(figure.add_subplot(grid[:, 3]), rows, "Image quality", flags=flags)
     return _finish(figure, output_path, show)
@@ -2215,7 +2388,7 @@ def plot_star_selection_diagnostics(ccd, measurements, image_id, summary=None,
 @_styled
 def plot_image_usability_diagnostics(ccd, decision, star_residuals=None, metadata=None,
                                      output_path=None, show=False, status=None):
-    """Quick zeropoint, transparency, depth, and the effective review decision."""
+    """Quick zeropoint (with the quick depths), transparency, and the review decision."""
 
     metadata = metadata or {}
     decision = decision or {}
@@ -2273,8 +2446,8 @@ def plot_image_usability_diagnostics(ccd, decision, star_residuals=None, metadat
     else:
         _empty(spatial, "No stellar residuals")
 
-    zeropoints = figure.add_subplot(grid[1, 0])
-    zeropoints.set_title("Per-star quick zeropoint")
+    zeropoints = figure.add_subplot(grid[1, 0:2])
+    zeropoints.set_title("Per-star quick zeropoint and quick limiting depth")
     if rows is not None and len(rows):
         magnitude = _column(rows, "catalog_magnitude")
         zeropoint = _column(rows, "quick_zeropoint_mag")
@@ -2293,39 +2466,33 @@ def plot_image_usability_diagnostics(ccd, decision, star_residuals=None, metadat
         if reference is not None:
             zeropoints.axhline(reference, color=AMBER, linestyle="--", linewidth=1.0,
                                label="best epoch {:.3f}".format(reference))
+        # The quick limiting depths as vertical lines on the magnitude axis.
+        depths = []
+        for region, color in (("global", BLUE), ("local", VIOLET)):
+            for sigma, value in (decision.get("{}_depths_mag".format(region)) or {}).items():
+                if _finite(value) is not None:
+                    depths.append((float(value), color, ":" if str(sigma).startswith("3") else "-",
+                                   "{} {} depth {:.2f}".format(region, str(sigma).replace("sigma", "σ"),
+                                                               float(value))))
+        for value, color, style, label in depths:
+            zeropoints.axvline(value, color=color, linestyle=style, linewidth=1.1, label=label)
+        expected = _finite(decision.get("expected_target_magnitude"))
+        if expected is not None:
+            zeropoints.axvline(expected, color=RED, linestyle="--", linewidth=1.0,
+                               label="expected target {:.2f}".format(expected))
+        finite_magnitudes = magnitude[np.isfinite(magnitude)]
+        if finite_magnitudes.size or depths:
+            low = min([float(np.min(finite_magnitudes))] if finite_magnitudes.size else
+                      [value for value, *_ in depths])
+            high = max(([float(np.max(finite_magnitudes))] if finite_magnitudes.size else [])
+                       + [value for value, *_ in depths] + ([expected] if expected else []))
+            zeropoints.set_xlim(low - 0.4, high + 0.4)
         zeropoints.set_xlabel("catalog magnitude")
         zeropoints.set_ylabel("zeropoint [mag]")
-        _legend(zeropoints, loc="lower left", ncol=2)
+        _legend(zeropoints, loc="lower left", ncol=3, fontsize=7)
         _grid(zeropoints)
     else:
         _empty(zeropoints, "No zeropoint stars")
-
-    depth = figure.add_subplot(grid[1, 1])
-    depth.set_title("Quick limiting depth")
-    labels, values, colors = [], [], []
-    for region, color in (("global", BLUE), ("local", VIOLET)):
-        for sigma, value in (decision.get("{}_depths_mag".format(region)) or {}).items():
-            if _finite(value) is not None:
-                labels.append("{} {}".format(region, sigma))
-                values.append(float(value))
-                colors.append(color)
-    if values:
-        positions = np.arange(len(values))
-        depth.bar(positions, values, color=colors, width=0.6)
-        for position, value in zip(positions, values):
-            depth.annotate("{:.2f}".format(value), (position, value), xytext=(0, 3),
-                           textcoords="offset points", ha="center", va="bottom",
-                           fontsize=7.5, color=INK)
-        expected = _finite(decision.get("expected_target_magnitude"))
-        if expected is not None:
-            depth.axhline(expected, color=RED, linestyle="--", label="expected target")
-        depth.set_xticks(positions)
-        depth.set_xticklabels(labels)
-        depth.set_ylim(max(values) + 1.0, min(values) - 1.5)
-        depth.set_ylabel("limiting magnitude")
-        _grid(depth, "y")
-    else:
-        _empty(depth, "Depth unavailable")
 
     check_rows = []
     for check in decision.get("checks") or []:
@@ -2342,6 +2509,8 @@ def plot_image_usability_diagnostics(ccd, decision, star_residuals=None, metadat
         ("Catalog recovery", _fmt(None if decision.get("catalog_recovery_fraction") is None
                                   else 100 * decision["catalog_recovery_fraction"], "{:.0f}", "%"), None),
         ("Seeing", _fmt(decision.get("fwhm_arcsec"), "{:.2f}", "″"), None),
+        ("QC anchor", "recovered" if decision.get("qc_star_recovered")
+         else str(decision.get("qc_star_unavailable") or "not recovered"), None),
         ("Use image", "yes" if decision.get("use_image") else "no",
          "PASS" if decision.get("use_image") else "FAIL"),
     ] + check_rows
@@ -2888,24 +3057,67 @@ def plot_alignment_target_diagnostics(stacks, target_solution, target_candidates
             _image_legend(axis)
 
     offsets = figure.add_subplot(grid[1, 0])
-    offsets.set_title("Per-image centroids around the frozen position")
+    offsets.set_title("Target centroids around the frozen position")
     if target_candidates is not None and len(target_candidates) and final is not None:
         ra, dec = _column(target_candidates, "ra_deg"), _column(target_candidates, "dec_deg")
         good = np.isfinite(ra) & np.isfinite(dec)
         coordinates = SkyCoord(ra[good] * u.deg, dec[good] * u.deg)
         dx, dy = final.spherical_offsets_to(coordinates)
+        dx, dy = dx.arcsec, dy.arcsec
         used = _bool_column(target_candidates, "used_in_solution")[good]
         accepted = _bool_column(target_candidates, "accepted")[good]
         names = _str_column(target_candidates, "source")[good]
-        offsets.scatter(dx.arcsec[~accepted], dy.arcsec[~accepted], marker="x", color=RED, s=30,
-                        label="rejected")
-        offsets.scatter(dx.arcsec[accepted & ~used], dy.arcsec[accepted & ~used], s=26,
-                        facecolors="none", edgecolors=BLUE, label="accepted")
-        offsets.scatter(dx.arcsec[used], dy.arcsec[used], s=26, color=TEAL, label="used")
-        for xi, yi, label in zip(dx.arcsec, dy.arcsec, names):
-            offsets.annotate(str(label).split(":")[-1][:10], (xi, yi), xytext=(3, 3),
-                             textcoords="offset points", fontsize=6, color=MUTED)
-        span = max(0.5, float(np.nanmax(np.abs(np.concatenate([dx.arcsec, dy.arcsec])))) * 1.25)
+        filters = _str_column(target_candidates, "filter")[good]
+        # Shape says what was centroided (prior, stack, single image); color
+        # its filter; fill whether it was used; a red cross marks rejection.
+        kinds = []
+        for name in names:
+            text = str(name)
+            if text.startswith("stack:multifilter"):
+                kinds.append("multifilter")
+            elif text.startswith("stack:"):
+                kinds.append("stack")
+            elif text.startswith("image:"):
+                kinds.append("image")
+            else:
+                kinds.append("prior")
+        kinds = np.asarray(kinds)
+        shapes = {"prior": ("*", 150, "prior position"),
+                  "multifilter": ("D", 70, "multifilter stack"),
+                  "stack": ("s", 64, "one-filter stack"),
+                  "image": ("o", 30, "single image")}
+        for index in range(len(dx)):
+            marker, size, _ = shapes[kinds[index]]
+            if kinds[index] == "prior":
+                color = AMBER
+            elif kinds[index] == "multifilter":
+                color = INK
+            else:
+                color = _filter_color(filters[index])
+            offsets.scatter([dx[index]], [dy[index]], marker=marker, s=size,
+                            facecolors=color if used[index] else "white",
+                            edgecolors=color, linewidths=1.2, zorder=3)
+            if not accepted[index]:
+                offsets.scatter([dx[index]], [dy[index]], marker="x", s=size * 0.9, color=RED,
+                                linewidths=1.1, zorder=4)
+            text = str(names[index]).split(":", 1)[-1]
+            if kinds[index] == "image":
+                text = _short_image_name(text, 14).split(".")[0]
+            elif kinds[index] == "stack":
+                text = "{} stack".format(text)
+            elif kinds[index] == "prior":
+                text = text.replace("_", " ")
+            offsets.annotate(text, (dx[index], dy[index]), xytext=(5, 4),
+                             textcoords="offset points", fontsize=6.5, color=MUTED)
+        for kind in ("prior", "multifilter", "stack", "image"):
+            if np.any(kinds == kind):
+                marker, size, label = shapes[kind]
+                offsets.scatter([], [], marker=marker, s=size, facecolors="white",
+                                edgecolors=MUTED, linewidths=1.1, label=label)
+        offsets.scatter([], [], marker="o", s=30, color=MUTED, label="filled: used")
+        if np.any(~accepted):
+            offsets.scatter([], [], marker="x", s=30, color=RED, label="rejected")
+        span = max(0.5, float(np.nanmax(np.abs(np.concatenate([dx, dy])))) * 1.3)
         offsets.set_xlim(-span, span)
         offsets.set_ylim(-span, span)
         offsets.set_aspect("equal")
@@ -2913,7 +3125,7 @@ def plot_alignment_target_diagnostics(stacks, target_solution, target_candidates
         offsets.axvline(0, color=RULE)
         offsets.set_xlabel("ΔRA cos δ [arcsec]")
         offsets.set_ylabel("ΔDec [arcsec]")
-        _legend(offsets, loc="upper right")
+        _legend(offsets, loc="upper right", fontsize=6.5, markerscale=0.9)
     else:
         _empty(offsets, "No centroid candidates")
 
@@ -3643,8 +3855,12 @@ def plot_calibration_image_diagnostics(products, image_id, metadata=None, output
 
 @_styled
 def plot_subtraction_diagnostics(result, science_record=None, output_path=None, show=False,
-                                 metadata=None, status=None):
-    """Science, aligned template, difference, and subtraction quality."""
+                                 metadata=None, status=None, target=None):
+    """Science, aligned template, difference (whole frame and at the target), quality.
+
+    ``target`` is the frozen target position ``(x, y)`` on the science grid;
+    when given, a second row zooms on it in all three images.
+    """
 
     result = result or {}
     metadata = metadata or (science_record or {}).get("metadata") or {"filename": result.get("image_id")}
@@ -3654,7 +3870,8 @@ def plot_subtraction_diagnostics(result, science_record=None, output_path=None, 
         _image_subtitle(metadata), status,
         "stars vanish in the difference (no dipoles or rings) and the noise there matches "
         "the expectation; the transient remains.",
-        rows=2, columns=4, size=(18, 9.4), width_ratios=[1, 1, 1, 0.85],
+        rows=3, columns=4, size=(18, 13.4), width_ratios=[1, 1, 1, 0.85],
+        height_ratios=[1.0, 0.82, 0.78],
     )
     science = None
     science_mask = None
@@ -3687,15 +3904,72 @@ def plot_subtraction_diagnostics(result, science_record=None, output_path=None, 
     difference_axis = figure.add_subplot(grid[0, 2])
     show_map(figure, difference_axis, difference, "Difference",
              symmetric=True, limit=None if not noise else 5 * noise, label="flux", labels=False)
+    combined = None
     if difference is not None:
-        combined = None
         for mask in (science_mask, template_mask):
             if mask is not None and np.shape(mask) == np.shape(difference):
                 combined = np.asarray(mask, dtype=bool) if combined is None else combined | mask
         overlay_pixel_mask(difference_axis, combined)
         _image_legend(difference_axis, fontsize=7)
+    target_x, target_y = (None, None) if target is None else target
+    if _finite(target_x) is not None and _finite(target_y) is not None:
+        for axis in (science_axis, template_axis, difference_axis):
+            mark_target(axis, target_x, target_y, radius=12)
 
-    histogram = figure.add_subplot(grid[1, 0])
+    # Zoom on the target in all three images.
+    fwhm = _finite(((science_record or {}).get("quality") or {}).get("fwhm_pixels")) or 4.0
+    half = int(max(20, np.ceil(8 * fwhm)))
+    zooms = ((science, science_mask, "Science at the target", "sky"),
+             (aligned, template_mask, "Template at the target", "sky"),
+             (difference, None, "Difference at the target", "difference"))
+    for column, (image, mask, title, kind) in enumerate(zooms):
+        axis = figure.add_subplot(grid[1, column])
+        if image is None or _finite(target_x) is None or _finite(target_y) is None:
+            _empty(axis, "Target position not available", title)
+            continue
+        ny, nx = np.shape(image)
+        x0, x1 = int(max(0, target_x - half)), int(min(nx, target_x + half + 1))
+        y0, y1 = int(max(0, target_y - half)), int(min(ny, target_y + half + 1))
+        if x1 <= x0 or y1 <= y0:
+            _empty(axis, "Target outside the image", title)
+            continue
+        cut = np.asarray(image, dtype=float)[y0:y1, x0:x1]
+        extent = (x0 - 0.5, x1 - 0.5, y0 - 0.5, y1 - 0.5)
+        if kind == "difference":
+            bound = 5 * noise if noise else _symmetric_limit(cut)
+            artist = axis.imshow(cut, cmap=DIVERGING_CMAP, vmin=-bound, vmax=bound,
+                                 origin="lower", interpolation="nearest", extent=extent)
+            axis.set_title(title)
+            _image_axes(axis, labels=False)
+            _colorbar(figure, artist, axis, "flux")
+            if combined is not None:
+                overlay_pixel_mask(axis, np.asarray(combined)[y0:y1, x0:x1], extent=extent)
+        else:
+            # z-scale for the sky, then an asinh stretch up to the transient's
+            # own peak: the sky noise and the host stay visible and a bright
+            # transient shows its shape instead of a white disk.
+            low, high = zscale_limits(cut)
+            peak = high
+            core = int(max(2, np.ceil(1.5 * fwhm)))
+            cx, cy = int(round(target_x)), int(round(target_y))
+            center = np.asarray(image, dtype=float)[max(0, cy - core):cy + core + 1,
+                                                    max(0, cx - core):cx + core + 1]
+            if center.size and np.any(np.isfinite(center)):
+                peak = max(high, float(np.nanmax(center)))
+            soft = max(high - low, 1e-6)
+            show_sky(axis, np.arcsinh((cut - low) / soft), title, extent=extent,
+                     labels=False, limits=(0.0, float(np.arcsinh((peak - low) / soft))))
+            if mask is not None and np.shape(mask) == np.shape(image):
+                overlay_pixel_mask(axis, np.asarray(mask, dtype=bool)[y0:y1, x0:x1],
+                                   extent=extent,
+                                   text="no template data" if kind == "sky" and column == 1
+                                   else "masked pixels")
+        mark_target(axis, target_x, target_y, radius=max(3.0, 2.2 * fwhm))
+        axis.set_xlim(extent[0], extent[1])
+        axis.set_ylim(extent[2], extent[3])
+        _image_legend(axis, fontsize=6.5)
+
+    histogram = figure.add_subplot(grid[2, 0])
     histogram.set_title("Difference pixels ÷ robust σ")
     if difference is not None and noise:
         values = _sample(difference) / noise
@@ -3710,7 +3984,7 @@ def plot_subtraction_diagnostics(result, science_record=None, output_path=None, 
         _empty(histogram, "No difference image")
 
     residuals = quality.get("star_residuals")
-    stars = figure.add_subplot(grid[1, 1])
+    stars = figure.add_subplot(grid[2, 1])
     stars.set_title("Residual fraction on quality stars")
     if residuals is not None and len(residuals):
         stars.scatter(_column(residuals, "science_flux"), _column(residuals, "residual_fraction"),
@@ -3725,7 +3999,7 @@ def plot_subtraction_diagnostics(result, science_record=None, output_path=None, 
 
     blank = np.asarray(quality.get("blank_aperture_fluxes", []), dtype=float)
     blank = blank[np.isfinite(blank)]
-    blank_axis = figure.add_subplot(grid[1, 2])
+    blank_axis = figure.add_subplot(grid[2, 2])
     blank_axis.set_title("Blank-aperture fluxes")
     if blank.size:
         blank_axis.hist(blank, bins=min(30, max(5, blank.size // 2)), color=VIOLET, alpha=0.75)
@@ -3748,6 +4022,77 @@ def plot_subtraction_diagnostics(result, science_record=None, output_path=None, 
     if result.get("error"):
         rows.append(("Error", str(result["error"])[:60], "FAIL"))
     metric_panel(figure.add_subplot(grid[:, 3]), rows, "Subtraction", flags=result.get("flags"))
+    return _finish(figure, output_path, show)
+
+
+@_styled
+def plot_template_footprints(templates, output_path=None, show=False, status=None,
+                             flags=None):
+    """Each filter's template with the outline of every science image using it.
+
+    The outlines (from each image's WCS) should all sit on real template data:
+    an outline over the gray (no data) region means part of that image has no
+    template to subtract.
+    """
+
+    from matplotlib.colors import to_rgba
+
+    templates = {name: value for name, value in (templates or {}).items()
+                 if isinstance(value, dict) and value.get("data") is not None}
+    names = sorted(templates)
+    panels = max(1, len(names))
+    figure, grid = _new_figure(
+        "Templates  ·  science footprints", "{} template(s): {}".format(
+            len(names), ", ".join(names) or "—"), status,
+        "every image outline lies inside real template data (no gray, no-data region "
+        "inside an outline); outlines in red do not.",
+        rows=1, columns=panels + 1, size=(5.2 * panels + 4.2, 6.8),
+        width_ratios=[1.0] * panels + [0.9],
+    )
+    palette = [BLUE, TEAL, AMBER, VIOLET, PINK, GREEN, "#0ea5e9", "#a16207", "#be185d",
+               "#4d7c0f", SLATE, "#7c2d12"]
+    rows = []
+    for column, name in enumerate(names):
+        axis = figure.add_subplot(grid[0, column])
+        template = templates[name]
+        data = _data(template.get("data"))
+        acquisition = template.get("acquisition") or {}
+        survey = acquisition.get("survey") or template.get("source") or "template"
+        show_sky(axis, data, "{} band  ·  {}{}".format(
+            name, survey, " (cache)" if acquisition.get("from_cache") else ""), labels=False)
+        mask = template.get("mask")
+        invalid = ~np.isfinite(data) if data is not None else None
+        if mask is not None and invalid is not None and np.shape(mask) == np.shape(data):
+            invalid = invalid | np.asarray(mask, dtype=bool)
+        if invalid is not None and invalid.any():
+            overlay_mask(axis, invalid, SLATE, 0.85)
+            axis.plot([], [], "s", color=SLATE, markersize=7,
+                      label="no template data ({:.1f}%)".format(100 * invalid.mean()))
+        for index, item in enumerate(template.get("science_footprints") or []):
+            outline_x = np.asarray(item.get("outline_x") or [], dtype=float)
+            outline_y = np.asarray(item.get("outline_y") or [], dtype=float)
+            coverage = _finite(item.get("coverage_fraction"))
+            short = _short_image_name(item.get("image_id"), 18).split(".")[0]
+            complete = coverage is not None and coverage >= 0.999
+            color = palette[index % len(palette)] if complete else RED
+            if outline_x.size:
+                axis.plot(np.append(outline_x, outline_x[0]), np.append(outline_y, outline_y[0]),
+                          color=color, linewidth=1.3 if complete else 1.8,
+                          linestyle="-" if complete else "--",
+                          label="{} {}".format(short, "" if complete else
+                                               "({:.1f}% covered)".format(100 * (coverage or 0))))
+                axis.fill(outline_x, outline_y, color=to_rgba(color, 0.04))
+            rows.append(("{} · {}".format(name, short),
+                         _fmt(None if coverage is None else 100 * coverage, "{:.1f}", "%"),
+                         None if coverage is None else "PASS" if complete else "WARN"))
+        if data is not None:
+            axis.set_xlim(-0.5, data.shape[1] - 0.5)
+            axis.set_ylim(-0.5, data.shape[0] - 0.5)
+        _image_legend(axis, loc="upper right", fontsize=6.3)
+    if not names:
+        _empty(figure.add_subplot(grid[0, 0]), "No templates")
+    metric_panel(figure.add_subplot(grid[0, panels]), rows or [("Images", "—", None)],
+                 "Template coverage of each image", flags=flags)
     return _finish(figure, output_path, show)
 
 
@@ -3790,28 +4135,72 @@ def plot_difference_photometry_diagnostics(result, output_path=None, show=False,
     show_map(figure, figure.add_subplot(grid[0, 2]), diagnostics.get("residual"),
              "Difference − model", symmetric=True, labels=False)
     comparison = result.get("comparison")
-    flux_axis = figure.add_subplot(grid[1, 1:3])
-    flux_axis.set_title("Science vs difference flux by method")
-    if comparison is not None and len(comparison):
+    magnitude_axis = figure.add_subplot(grid[1, 1:3])
+    magnitude_axis.set_title("Science vs difference magnitude by method")
+    has_magnitudes = comparison is not None and len(comparison) and any(
+        np.any(np.isfinite(_column(comparison, name)))
+        for name in ("science_magnitude", "difference_magnitude",
+                     "science_limit_mag", "difference_limit_mag"))
+    if has_magnitudes:
         methods = list(_str_column(comparison, "method"))
         positions = np.arange(len(methods))
-        flux_axis.errorbar(positions - 0.1, _column(comparison, "science_flux"),
-                           yerr=_column(comparison, "science_uncertainty"), fmt="o", color=FAINT,
-                           capsize=3, label="science (host included)")
-        flux_axis.errorbar(positions + 0.1, _column(comparison, "difference_flux"),
-                           yerr=_column(comparison, "difference_uncertainty"), fmt="o", color=BLUE,
-                           capsize=3, label="difference (host removed)")
-        flux_axis.set_xticks(positions)
-        flux_axis.set_xticklabels([name.replace("_", " ") for name in methods])
-        flux_axis.axhline(0, color=RULE)
-        _legend(flux_axis, loc="best")
-        _grid(flux_axis, "y")
+        plotted = []
+        for kind, offset, color, label in (
+                ("science", -0.1, FAINT, "science (host included)"),
+                ("difference", 0.1, BLUE, "difference (host removed)")):
+            value = _column(comparison, "{}_magnitude".format(kind))
+            error = _column(comparison, "{}_magnitude_uncertainty".format(kind))
+            limit = _column(comparison, "{}_limit_mag".format(kind))
+            detected = np.isfinite(value)
+            if detected.any():
+                magnitude_axis.errorbar(positions[detected] + offset, value[detected],
+                                        yerr=np.nan_to_num(error[detected]), fmt="o",
+                                        color=color, capsize=3, label=label)
+                plotted.extend(value[detected] + np.nan_to_num(error[detected]))
+                plotted.extend(value[detected] - np.nan_to_num(error[detected]))
+                for position, magnitude in zip(positions[detected] + offset, value[detected]):
+                    magnitude_axis.annotate("{:.2f}".format(magnitude), (position, magnitude),
+                                            xytext=(7, 0), textcoords="offset points",
+                                            va="center", fontsize=7, color=color)
+            undetected = ~detected & np.isfinite(limit)
+            if undetected.any():
+                # Inverted axis (bright up): an upper limit points down.
+                magnitude_axis.scatter(positions[undetected] + offset, limit[undetected],
+                                       marker="v", s=46, color=color,
+                                       label="{} 3σ limit".format(kind))
+                plotted.extend(limit[undetected])
+        magnitude_axis.set_xticks(positions)
+        magnitude_axis.set_xticklabels([name.replace("_", " ") for name in methods])
+        plotted = np.asarray(plotted, dtype=float)
+        plotted = plotted[np.isfinite(plotted)]
+        if plotted.size:
+            span = max(0.3, float(np.ptp(plotted)))
+            magnitude_axis.set_ylim(float(plotted.max()) + 0.25 * span,
+                                    float(plotted.min()) - 0.25 * span)
+        magnitude_axis.set_xlim(-0.5, len(methods) - 0.5)
+        magnitude_axis.set_ylabel("calibrated magnitude")
+        _legend(magnitude_axis, loc="best", fontsize=7)
+        _grid(magnitude_axis, "y")
     else:
-        _empty(flux_axis, "No paired measurements")
+        _empty(magnitude_axis, "No calibrated measurements")
     preferred = result.get("preferred_result") or {}
     dipole = result.get("dipole") or {}
+    preferred_magnitude = None
+    if comparison is not None and len(comparison) and preferred.get("method"):
+        methods = list(_str_column(comparison, "method"))
+        if preferred["method"] in methods:
+            index = methods.index(preferred["method"])
+            kind = preferred.get("image_kind", "difference")
+            value = _column(comparison, "{}_magnitude".format(kind))[index]
+            error = _column(comparison, "{}_magnitude_uncertainty".format(kind))[index]
+            limit = _column(comparison, "{}_limit_mag".format(kind))[index]
+            if np.isfinite(value):
+                preferred_magnitude = "{:.3f} ± {:.3f}".format(value, np.nan_to_num(error))
+            elif np.isfinite(limit):
+                preferred_magnitude = "> {:.2f} (3σ)".format(limit)
     rows = [
         ("Preferred", "{} / {}".format(preferred.get("image_kind", "—"), preferred.get("method", "—")), None),
+        ("Magnitude", preferred_magnitude or "—", None),
         ("Classification", str(preferred.get("classification", "—")), None),
         ("S/N", _fmt(preferred.get("snr"), "{:.1f}"), _check_status(preferred.get("snr"), 5.0, 3.0, "low")),
         ("Difference PSF", str(result.get("difference_psf_source", "—")), None),
@@ -3946,6 +4335,7 @@ __all__ = [
     "plot_region_diagnostics",
     "plot_science_photometry_diagnostics",
     "plot_stage_overview",
+    "plot_template_footprints",
     "plot_stage_status",
     "plot_star_selection_diagnostics",
     "plot_subtraction_diagnostics",

@@ -3735,6 +3735,262 @@ def _background_region_mask(ccd, metadata, settings, target, region):
     }
 
 
+def _robust_plane(x, y, values, iterations=5, clip=3.0):
+    """Sigma-clipped least-squares plane ``a x + b y + c`` and its robust scatter."""
+
+    design = np.column_stack((x, y, np.ones(values.size)))
+    keep = np.isfinite(values)
+    coefficients = np.array([0.0, 0.0, float(np.nanmedian(values))])
+    scatter = None
+    for _ in range(iterations):
+        if np.count_nonzero(keep) < 10:
+            break
+        coefficients, _, _, _ = np.linalg.lstsq(design[keep], values[keep], rcond=None)
+        residual = values - design @ coefficients
+        center = float(np.median(residual[keep]))
+        scatter = float(1.4826 * np.median(np.abs(residual[keep] - center)))
+        if not np.isfinite(scatter) or scatter <= 0:
+            break
+        updated = np.isfinite(residual) & (np.abs(residual - center) < clip * scatter)
+        if np.array_equal(updated, keep):
+            break
+        keep = updated
+    return coefficients, scatter
+
+
+def make_bright_star_halo_mask(data, segmentation, source_mask, base_mask, settings=None,
+                               saturation=None):
+    """Mask the extended halos of the few brightest (or saturated) stars.
+
+    The ordinary source mask grows every segment by the same number of
+    pixels. Around bright, saturated stars the light stays above the sky far
+    beyond that (scattered light, wings), and the background boxes there are
+    then measured on halo light, so the background model absorbs part of the
+    star. For each of the ``background.bright_star_count`` brightest stars
+    (a saturated star's masked core, with every segment around it, counts as
+    one star and its core light counts in the ranking), this walks outward in
+    annuli through the pixels that are not masked yet and measures the median
+    excess over the local sky until it drops below
+    ``background.bright_star_halo_sigma`` times the sky RMS, or until the
+    excess stops falling (a plateau is sky structure, not star light); a
+    circle of that radius is masked. The local sky is a plane fitted to an
+    outer reference annulus around the star, so a sky gradient does not bias
+    the walk.
+
+    Returns
+    -------
+    mask : numpy.ndarray of bool
+        Union of the halo circles (beyond the ordinary source mask).
+    stars : list of dict
+        One entry per examined star: center, segment radius, halo radius,
+        local sky and RMS, whether the walk converged, and the profile.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    options = settings.get("background", {})
+    data = np.asarray(data, dtype=float)
+    shape = data.shape
+    halo_mask = np.zeros(shape, dtype=bool)
+    stars = []
+    if not options.get("bright_star_mask_enabled", True):
+        return halo_mask, stars
+    segmentation = np.asarray(segmentation)
+    labels = np.unique(segmentation)
+    labels = labels[labels > 0]
+    if labels.size == 0:
+        return halo_mask, stars
+    ndimage = _try_ndimage()
+    if ndimage is None:
+        return halo_mask, stars
+
+    base_mask = np.asarray(base_mask, dtype=bool)
+    usable = ~base_mask & np.isfinite(data)
+    if np.count_nonzero(usable) < 100:
+        return halo_mask, stars
+    sky_level = float(np.median(data[usable]))
+    positive = np.where(usable, data - sky_level, 0.0)
+    # Saturated cores (and their grown region) are masked by the masks stage,
+    # so a saturated star's segment is a ring around a masked hole. Each
+    # masked region holding saturated pixels is attached to the segments
+    # touching it, and its pixels count in the star's brightness.
+    core_labels = np.zeros(shape, dtype=np.int32)
+    if saturation is not None and np.isfinite(saturation):
+        hot = np.isfinite(data) & (data >= float(saturation))
+        if hot.any():
+            # Only masked pixels near saturated ones: a core touching a masked
+            # border or bad column must not take that whole region with it.
+            near = ndimage.distance_transform_edt(~hot) <= float(
+                options.get("bright_star_core_radius_pixels", 40.0))
+            regions, _ = ndimage.label((base_mask & near) | hot)
+            touched = np.unique(regions[hot])
+            touched = touched[touched > 0]
+            core_labels = np.where(np.isin(regions, touched), regions, 0).astype(np.int32)
+    core_flux = {}
+    if core_labels.any():
+        core_values = np.where(np.isfinite(data), np.clip(data - sky_level, 0.0, None), 0.0)
+        core_ids = np.unique(core_labels)
+        core_ids = core_ids[core_ids > 0]
+        core_flux = dict(zip(core_ids.tolist(), np.atleast_1d(
+            ndimage.sum(core_values, core_labels, core_ids)).tolist()))
+    flux = np.asarray(ndimage.sum(positive, segmentation, labels), dtype=float)
+    flux_by_label = dict(zip(labels.tolist(), flux.tolist()))
+    # One entry per star: a saturated core with every segment around it, or a
+    # single unsaturated segment.
+    stars_found = {}
+    claimed = set()
+    if core_flux:
+        grown = ndimage.grey_dilation(core_labels, size=(7, 7))
+        pairs = np.unique(np.column_stack((segmentation[grown > 0], grown[grown > 0])), axis=0)
+        for label, core in pairs:
+            if label > 0 and core > 0:
+                key = ("core", int(core))
+                star = stars_found.setdefault(key, {"labels": set(), "cores": {int(core)}})
+                star["labels"].add(int(label))
+                claimed.add(int(label))
+    for label in labels.tolist():
+        if label not in claimed:
+            stars_found[("segment", int(label))] = {"labels": {int(label)}, "cores": set()}
+    ranked = []
+    for key, star in stars_found.items():
+        total = sum(flux_by_label.get(label, 0.0) for label in star["labels"])
+        total += sum(core_flux.get(core, 0.0) for core in star["cores"])
+        ranked.append((total, key, star))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    count = int(options.get("bright_star_count", 5))
+    objects = ndimage.find_objects(segmentation)
+    core_objects = ndimage.find_objects(core_labels) if core_labels.any() else []
+    chosen = []
+    for total, key, star in ranked[: max(0, count)]:
+        boxes = [objects[label - 1] for label in star["labels"]
+                 if label - 1 < len(objects) and objects[label - 1] is not None]
+        boxes += [core_objects[core - 1] for core in star["cores"]
+                  if core - 1 < len(core_objects) and core_objects[core - 1] is not None]
+        if not boxes:
+            continue
+        box = (slice(min(item[0].start for item in boxes), max(item[0].stop for item in boxes)),
+               slice(min(item[1].start for item in boxes), max(item[1].stop for item in boxes)))
+        segment = np.isin(segmentation[box], list(star["labels"]))
+        region = segment.copy()
+        if star["cores"]:
+            region |= np.isin(core_labels[box], list(star["cores"]))
+        region = ndimage.binary_fill_holes(region)
+        chosen.append((float(total), key, box, region, segment, bool(star["cores"])))
+
+    threshold = float(options.get("bright_star_halo_sigma", 0.25))
+    maximum_radius = float(options.get("bright_star_maximum_radius_pixels", 400.0))
+    reference = options.get("bright_star_sky_annulus_fraction", [0.75, 1.0])
+    minimum_step = float(options.get("bright_star_step_pixels", 8.0))
+    step_fraction = float(options.get("bright_star_step_fraction", 0.10))
+    minimum_pixels = int(options.get("bright_star_minimum_annulus_pixels", 30))
+    flattening_ratio = float(options.get("bright_star_flattening_ratio", 0.75))
+    flattening_scale = float(options.get("bright_star_flattening_radius_factor", 1.5))
+    available = usable & ~np.asarray(source_mask, dtype=bool)
+    yy_full, xx_full = np.indices(shape)
+
+    for total, label, box, region, segment, saturated in chosen:
+        # Center from the unmasked segment pixels: around a saturated star
+        # they are the symmetric wings, unaffected by bleed trails in the core.
+        weighted = segment & ~base_mask[box]
+        if not weighted.any():
+            weighted = region
+        local_y, local_x = np.nonzero(weighted)
+        weights = np.clip(data[box][weighted] - sky_level, 0.0, None)
+        weights[~np.isfinite(weights)] = 0.0
+        y_offset, x_offset = box[0].start, box[1].start
+        if np.sum(weights) > 0:
+            xc = float(np.sum(weights * local_x) / np.sum(weights)) + x_offset
+            yc = float(np.sum(weights * local_y) / np.sum(weights)) + y_offset
+        else:
+            xc = float(np.mean(local_x)) + x_offset
+            yc = float(np.mean(local_y)) + y_offset
+        segment_radius = float(np.sqrt(np.count_nonzero(region) / np.pi))
+        if halo_mask[min(shape[0] - 1, max(0, int(round(yc)))),
+                     min(shape[1] - 1, max(0, int(round(xc))))]:
+            # Inside the halo of a brighter star, already masked.
+            stars.append({"label": "{}:{}".format(*label), "x": xc, "y": yc,
+                          "saturated": bool(saturated), "segment_flux": total,
+                          "segment_radius_pixels": segment_radius,
+                          "halo_radius_pixels": None, "converged": True,
+                          "stop": "inside_brighter_halo", "sky": None, "sky_rms": None,
+                          "profile": []})
+            continue
+        outer = maximum_radius * float(reference[1])
+        y0, y1 = max(0, int(yc - outer) - 1), min(shape[0], int(yc + outer) + 2)
+        x0, x1 = max(0, int(xc - outer) - 1), min(shape[1], int(xc + outer) + 2)
+        window = (slice(y0, y1), slice(x0, x1))
+        radius_map = np.hypot(xx_full[window] - xc, yy_full[window] - yc)
+        pixels = available[window] & ~halo_mask[window]
+        values = data[window]
+        sky_ring = pixels & (radius_map >= maximum_radius * float(reference[0])) & \
+            (radius_map < outer)
+        entry = {"label": "{}:{}".format(*label), "x": xc, "y": yc, "saturated": bool(saturated),
+                 "segment_flux": total, "segment_radius_pixels": segment_radius,
+                 "halo_radius_pixels": None, "converged": False, "stop": None,
+                 "sky": None, "sky_rms": None, "profile": []}
+        if np.count_nonzero(sky_ring) >= max(minimum_pixels, 50):
+            coefficients, rms = _robust_plane(
+                xx_full[window][sky_ring], yy_full[window][sky_ring], values[sky_ring])
+            plane = coefficients[0] * xx_full[window] + coefficients[1] * yy_full[window] \
+                + coefficients[2]
+        else:
+            ring = pixels & (radius_map >= segment_radius)
+            if np.count_nonzero(ring) < minimum_pixels:
+                stars.append(entry)
+                continue
+            center = float(np.median(values[ring]))
+            rms = float(1.4826 * np.median(np.abs(values[ring] - center)))
+            plane = np.full(values.shape, center)
+        if rms is None or not np.isfinite(rms) or rms <= 0:
+            stars.append(entry)
+            continue
+        entry["sky"] = float(coefficients[0] * xc + coefficients[1] * yc + coefficients[2]) \
+            if np.count_nonzero(sky_ring) >= max(minimum_pixels, 50) else float(plane.flat[0])
+        entry["sky_rms"] = float(rms)
+        limit = maximum_radius * float(reference[0])
+        edges = [segment_radius]
+        while edges[-1] < limit:
+            edges.append(edges[-1] + max(minimum_step, step_fraction * edges[-1]))
+        edges = np.asarray(edges)
+        inside = pixels & (radius_map >= edges[0]) & (radius_map < edges[-1])
+        bins = np.digitize(radius_map[inside], edges) - 1
+        residuals = (values - plane)[inside]
+        order = np.argsort(bins, kind="stable")
+        bins, residuals = bins[order], residuals[order]
+        starts = np.searchsorted(bins, np.arange(len(edges) - 1))
+        stops = np.searchsorted(bins, np.arange(len(edges) - 1), side="right")
+        halo_radius = segment_radius
+        for index in range(len(edges) - 1):
+            if stops[index] - starts[index] < minimum_pixels:
+                continue
+            excess = float(np.median(residuals[starts[index]:stops[index]]))
+            middle = 0.5 * (edges[index] + edges[index + 1])
+            entry["profile"].append((float(edges[index]), float(edges[index + 1]),
+                                     excess / rms))
+            if excess < threshold * rms:
+                entry["converged"] = True
+                entry["stop"] = "below_threshold"
+                break
+            # A halo keeps falling outward; an excess that no longer falls
+            # (a plateau) is large-scale sky structure, which the background
+            # model should follow, not star light.
+            earlier = [row[2] for row in entry["profile"][:-1]
+                       if 0.5 * (row[0] + row[1]) <= middle / flattening_scale]
+            if earlier and excess / rms > flattening_ratio * earlier[-1]:
+                entry["converged"] = True
+                entry["stop"] = "profile_flat"
+                break
+            halo_radius = float(edges[index + 1])
+        if not entry["converged"]:
+            entry["stop"] = "maximum_radius"
+            halo_radius = max(halo_radius, float(min(edges[-1], limit)))
+        entry["halo_radius_pixels"] = float(halo_radius)
+        if halo_radius > segment_radius:
+            halo_mask[window] |= radius_map <= halo_radius
+        stars.append(entry)
+    return halo_mask, stars
+
+
 def make_background_source_mask(ccd, metadata=None, settings=None, target=None):
     """Build an expanded source mask with target and optional host protection.
 
@@ -3830,6 +4086,18 @@ def make_background_source_mask(ccd, metadata=None, settings=None, target=None):
                         segment_image.make_source_mask(size=grow_size), dtype=bool
                     )
 
+    bright_mask = np.zeros(shape, dtype=bool)
+    bright_stars = []
+    if source_count and background_settings.get("bright_star_mask_enabled", True):
+        saturation = settings.get("masks", {}).get("saturation_level")
+        if saturation is None and metadata is not None:
+            saturation = _as_float(metadata.get("saturation"))
+        bright_mask, bright_stars = make_bright_star_halo_mask(
+            data, segmentation, source_mask, base_mask, settings,
+            saturation=_as_float(saturation),
+        )
+        bright_mask &= ~source_mask
+
     target_mask = np.zeros(shape, dtype=bool)
     target_info = None
     if background_settings.get("protect_target", True):
@@ -3859,12 +4127,13 @@ def make_background_source_mask(ccd, metadata=None, settings=None, target=None):
         )
 
     protected = source_mask | target_mask | host_mask
-    combined = base_mask | protected
+    combined = base_mask | protected | bright_mask
     products = {
         "base_mask": base_mask,
         "detected_source_mask": source_mask,
         "target_mask": target_mask,
         "host_mask": host_mask,
+        "bright_star_mask": bright_mask,
         "protected_source_mask": protected,
         "background_mask": combined,
         "segmentation": segmentation,
@@ -3877,6 +4146,12 @@ def make_background_source_mask(ccd, metadata=None, settings=None, target=None):
         "target": target_info,
         "host": host_info,
         "source_mask_fraction": float(protected.mean()),
+        "bright_star_mask_fraction": float(bright_mask.mean()),
+        "bright_stars": [
+            {key: value for key, value in star.items() if key != "profile"}
+            | {"profile": [list(row) for row in star.get("profile", [])]}
+            for star in bright_stars
+        ],
         "combined_mask_fraction": float(combined.mean()),
     }
     return combined, products, info
@@ -4083,6 +4358,7 @@ def model_background(ccd, metadata=None, settings=None, target=None):
         "target_mask": empty_mask,
         "host_mask": empty_mask,
         "protected_source_mask": empty_mask,
+        "bright_star_mask": empty_mask,
         "background_mask": empty_mask,
         "segmentation": np.zeros(data.shape, dtype=np.int32),
         "background": None,
@@ -4387,6 +4663,7 @@ def _empty_source_table():
         ("ellipticity", float),
         ("orientation_deg", float),
         ("saturated", bool),
+        ("broadened", bool),
         ("near_edge", bool),
         ("good_for_seeing", bool),
     )
@@ -4454,6 +4731,92 @@ def _fit_gaussian_fwhm(data, mask, segmentation, label, x, y, guess, half_size):
         return np.nan
     fwhm = 2.3548 * float(np.sqrt(abs(gaussian.x_stddev.value * gaussian.y_stddev.value)))
     return fwhm if np.isfinite(fwhm) and 0.5 < fwhm < 2.0 * half_size else np.nan
+
+
+def fwhm_brightness_onset(flux, fwhm, peak, fitted, settings=None, sky=None):
+    """Find the flux above which the fitted FWHM grows with brightness.
+
+    Seeing does not depend on brightness, so a FWHM that rises for the
+    brightest unsaturated stars means their cores are nonlinear (or
+    saturated below the assumed saturation level). Those stars bias the
+    seeing, the PSF, and the zeropoint.
+
+    The fitted stars are ordered by flux; the reference FWHM is the median of
+    the fainter half, and a running median over ``k`` consecutive stars is
+    walked down from the brightest end while it stays above
+    ``(1 + source_detection.broadening_fraction)`` times the reference. The
+    onset is the flux at the center of the faintest such window, provided at
+    least ``broadening_minimum_stars`` stars lie above it.
+
+    Returns
+    -------
+    dict
+        ``onset_flux`` (``None`` when there is no rise), ``onset_peak`` (median
+        peak above sky of the stars at the onset), ``onset_level`` (that peak
+        plus the sky, comparable to the saturation level), ``reference_fwhm``,
+        the number of stars above the onset, and the running-median curve
+        (``curve_flux``, ``curve_fwhm``) for the diagnostics.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    detection = settings.get("source_detection", {})
+    result = {"onset_flux": None, "onset_peak": None, "onset_level": None,
+              "checked_peak": None, "checked_level": None,
+              "reference_fwhm": None, "broadened_count": 0, "fitted_stars": 0,
+              "fraction": float(detection.get("broadening_fraction", 0.05)),
+              "curve_flux": [], "curve_fwhm": []}
+    if not detection.get("detect_brightness_broadening", True):
+        return result
+    flux = np.asarray(flux, dtype=float)
+    fwhm = np.asarray(fwhm, dtype=float)
+    peak = np.asarray(peak, dtype=float)
+    usable = np.asarray(fitted, dtype=bool) & np.isfinite(flux) & (flux > 0) \
+        & np.isfinite(fwhm) & (fwhm > 0)
+    count = int(np.count_nonzero(usable))
+    result["fitted_stars"] = count
+    minimum = int(detection.get("broadening_minimum_stars", 3))
+    if count < max(15, 3 * minimum):
+        return result
+    indices = np.flatnonzero(usable)
+    indices = indices[np.argsort(flux[indices])]
+    sorted_flux, sorted_fwhm = flux[indices], fwhm[indices]
+    # How far up the linear range was checked: the brightest fitted stars.
+    brightest = indices[-max(1, minimum):]
+    if np.any(np.isfinite(peak[brightest])):
+        result["checked_peak"] = float(np.nanmax(peak[brightest]))
+        result["checked_level"] = None if sky is None else result["checked_peak"] + float(sky)
+    reference = float(np.median(sorted_fwhm[: max(8, count // 2)]))
+    result["reference_fwhm"] = reference
+    window = max(minimum, int(np.ceil(count / 15.0)))
+    medians = np.array([np.median(sorted_fwhm[start:start + window])
+                        for start in range(count - window + 1)])
+    centers = np.array([np.median(sorted_flux[start:start + window])
+                        for start in range(count - window + 1)])
+    result["curve_flux"] = centers.tolist()
+    result["curve_fwhm"] = medians.tolist()
+    limit = reference * (1.0 + result["fraction"])
+    start = len(medians) - 1
+    if medians[start] <= limit:
+        return result
+    while start > 0 and medians[start - 1] > limit:
+        start -= 1
+    # Only a rise at the bright end counts, not a broad faint-end bump.
+    if start < count // 2:
+        return result
+    onset = float(centers[start])
+    above = int(np.count_nonzero(sorted_flux >= onset))
+    if above < minimum:
+        return result
+    near = indices[start:start + window]
+    onset_peak = float(np.nanmedian(peak[near])) if np.any(np.isfinite(peak[near])) else None
+    result.update({
+        "onset_flux": onset,
+        "onset_peak": onset_peak,
+        "onset_level": None if onset_peak is None or sky is None else onset_peak + float(sky),
+        "broadened_count": above,
+    })
+    return result
 
 
 def measure_gaussian_fwhm(data, mask, segmentation, labels, x, y, candidates,
@@ -4959,7 +5322,7 @@ def detect_sources_and_measure_quality(
             # Seeing comes from Gaussian fits to bright, unsaturated stars:
             # segment moment widths grow with brightness (bigger footprints),
             # so they are kept only as ``moment_fwhm_pixels`` for reference.
-            candidates = (
+            fittable = (
                 np.isfinite(ellipticity)
                 & np.isfinite(snr)
                 & (snr >= float(detection_settings.get("seeing_minimum_snr", 20.0)))
@@ -4971,13 +5334,16 @@ def detect_sources_and_measure_quality(
                 & ~near_edge
                 & ~saturated
             )
+            candidates = fittable.copy()
             if saturation_level is not None:
                 candidates &= peak < 0.8 * float(saturation_level)
-            snr_order = np.argsort(np.where(candidates, -snr, np.inf))
+            # Stars just below saturation are fitted too (not for the seeing):
+            # they show where the FWHM starts to grow with brightness.
+            snr_order = np.argsort(np.where(fittable, -snr, np.inf))
             ranked = np.zeros(snr.shape, dtype=bool)
             fwhm_pixels = np.full(snr.shape, np.nan)
-            if np.any(candidates):
-                ordered = snr_order[: int(np.count_nonzero(candidates))]
+            if np.any(fittable):
+                ordered = snr_order[: int(np.count_nonzero(fittable))]
                 ranked_fwhm, seeing_fit_info = measure_gaussian_fwhm(
                     source_data, mask, segmentation_array, labels[ordered],
                     x[ordered], y[ordered], np.ones(ordered.size, dtype=bool),
@@ -4987,6 +5353,16 @@ def detect_sources_and_measure_quality(
                 ranked[ordered] = True
             else:
                 seeing_fit_info = {"attempted": 0, "fitted": 0, "half_size_pixels": None}
+            broadening = fwhm_brightness_onset(
+                flux, fwhm_pixels, peak, fittable, settings,
+                sky=float(detection_median) if np.isfinite(detection_median) else None,
+            )
+            broadened = (
+                np.isfinite(flux) & (flux >= broadening["onset_flux"])
+                if broadening.get("onset_flux") is not None
+                else np.zeros(flux.shape, dtype=bool)
+            )
+            candidates &= ~broadened
             pixel_scale = _pixel_scale_arcsec(ccd, metadata, settings)
             if pixel_scale is None:
                 fwhm_arcsec = np.full(fwhm_pixels.shape, np.nan)
@@ -5023,6 +5399,7 @@ def detect_sources_and_measure_quality(
                 "ellipticity": ellipticity[order],
                 "orientation_deg": orientation[order],
                 "saturated": saturated[order],
+                "broadened": broadened[order],
                 "near_edge": near_edge[order],
                 "good_for_seeing": good[order],
             }
@@ -5039,6 +5416,8 @@ def detect_sources_and_measure_quality(
             ):
                 sources[name].unit = unit
 
+    if "broadening" not in locals():
+        broadening = {"onset_flux": None, "fitted_stars": 0}
     source_count = len(sources)
     if source_count:
         seeing_selection = np.asarray(sources["good_for_seeing"], dtype=bool)
@@ -5137,6 +5516,7 @@ def detect_sources_and_measure_quality(
         "mean_orientation_deg": mean_orientation,
         "globally_elongated": globally_elongated,
         "saturated_source_count": saturated_source_count,
+        "fwhm_broadening": broadening,
         "masked_pixel_fraction": masked_fraction,
         "finite_pixel_fraction": finite_fraction,
         "trail_fraction": trail_fraction,
@@ -5245,6 +5625,21 @@ def detect_sources_and_measure_quality(
         result = _add_quality_check(checks, flags, *specification)
         status = _combine_quality_status(status, result)
 
+    if broadening.get("onset_flux") is not None:
+        # Unsaturated stars brighter than this are wider than the faint ones
+        # (nonlinearity below the saturation level): they are kept out of the
+        # seeing, the PSF, and the zeropoint, and the image is flagged.
+        checks.append({
+            "metric": "fwhm_broadening_onset_flux",
+            "value": float(broadening["onset_flux"]),
+            "threshold": None,
+            "direction": "high",
+            "status": "WARN",
+            "flag": "BRIGHT_STARS_BROADENED",
+        })
+        if "BRIGHT_STARS_BROADENED" not in flags:
+            flags.append("BRIGHT_STARS_BROADENED")
+        status = _combine_quality_status(status, "WARN")
     tracking_value = elongated_fraction if globally_elongated else None
     result = _add_quality_check(
         checks,
@@ -5474,6 +5869,63 @@ def _image_measurements(measurements, image_id):
     return measurements[
         np.asarray(measurements["image_id"], dtype=str) == str(image_id)
     ]
+
+
+def _record_celestial_wcs(record):
+    """The best celestial WCS of an image record (alignment, astrometry, CCD)."""
+
+    for value in (record.get("wcs"), (record.get("alignment") or {}).get("wcs"),
+                  (record.get("astrometry") or {}).get("refined_wcs"),
+                  getattr(record.get("ccd"), "wcs", None)):
+        if value is not None and getattr(value, "has_celestial", False):
+            return value.celestial
+    return None
+
+
+def _qc_anchor_unavailable(record, anchor_id, measurements, image_records, radius=3):
+    """Why a missing QC anchor could not be measured here, or ``None``.
+
+    The anchor is chosen per filter from all images; in a frame with another
+    field of view it can fall outside the frame (``"outside image"``), and a
+    bright anchor saturates (and is masked, so never detected) in a deeper
+    frame (``"saturated"``). Neither says anything about the image quality.
+    The anchor's sky position comes from an image that measured it.
+    """
+
+    wcs = _record_celestial_wcs(record)
+    if anchor_id is None or wcs is None or measurements is None or not len(measurements):
+        return None
+    shape = record.get("shape")
+    if shape is None and record.get("ccd") is not None:
+        shape = np.shape(record["ccd"].data)
+    if shape is None:
+        return None
+    saturation = (record.get("masks") or {}).get("saturation")
+    rows = measurements[np.asarray(measurements["persistent_id"], dtype=str) == str(anchor_id)]
+    lookup = {_usability_image_id(item, index): item for index, item in enumerate(image_records)}
+    for row in rows:
+        other = lookup.get(str(row["image_id"]))
+        other_wcs = None if other is None else _record_celestial_wcs(other)
+        if other_wcs is None:
+            continue
+        try:
+            sky = other_wcs.pixel_to_world(float(row["x"]), float(row["y"]))
+            x, y = wcs.world_to_pixel(sky)
+            x, y = float(x), float(y)
+        except Exception:
+            continue
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        if x < 0 or y < 0 or x > shape[1] - 1 or y > shape[0] - 1:
+            return "outside image"
+        if saturation is not None and np.shape(saturation) == tuple(shape):
+            xi, yi = int(round(x)), int(round(y))
+            window = np.asarray(saturation, dtype=bool)[
+                max(0, yi - radius):yi + radius + 1, max(0, xi - radius):xi + radius + 1]
+            if window.any():
+                return "saturated"
+        return None
+    return None
 
 
 def _catalog_recovery(record, rows, settings):
@@ -5790,6 +6242,8 @@ def _usability_reason(flag, status):
         "TARGET_MASKED": "the target aperture overlaps a mask or detector artifact",
         "TARGET_TRAIL": "a detected trail overlaps the target aperture",
         "TARGET_COSMIC_RAY": "a cosmic-ray mask overlaps the target aperture",
+        "BRIGHT_STARS_BROADENED": "the brightest unsaturated stars are wider than the faint "
+                                  "ones (nonlinear); they are kept out of the zeropoint",
     }
     return "{}: {}".format(status, descriptions.get(flag, flag.lower().replace("_", " ")))
 
@@ -6111,7 +6565,11 @@ def assess_image_usability(image_records, measurements, settings=None,
                 "zeropoint_scatter_mag", calibration.get("zeropoint_scatter_mag"),
                 threshold, "high"
             )
-        if usability.get("require_qc_anchor", True) and not decision["qc_star_recovered"]:
+        if not decision["qc_star_recovered"]:
+            decision["qc_star_unavailable"] = _qc_anchor_unavailable(
+                record, qc_anchor_id, measurements, image_records)
+        if usability.get("require_qc_anchor", True) and not decision["qc_star_recovered"] \
+                and not decision.get("qc_star_unavailable"):
             _append_usability_result(
                 decision, usability.get("missing_qc_anchor_status", "WARN"),
                 "QC_STAR_NOT_RECOVERED", "qc_star_recovered", 0.0, 1.0, "low"
@@ -6493,6 +6951,8 @@ __all__ = [
     "make_line_defect_mask",
     "make_manual_mask",
     "make_saturation_mask",
+    "make_bright_star_halo_mask",
+    "fwhm_brightness_onset",
     "metadata_table",
     "model_background",
     "parse_fits_section",

@@ -53,8 +53,10 @@ are drawn as arrows at the edge with their value.
 Processed images
 ----------------
 
-``processed/<image>_processed.fits`` (one per image that reached the
-background stage):
+Each image's FITS products sit together in ``fits/``: its PSF model
+(``fits/<image>_psf_model.fits``), its difference image when subtraction
+ran, and the final processed image ``fits/<image>_processed.fits`` (one per
+image that reached the background stage):
 
 * primary HDU -- the processed image: cut to the usable area, masked pixels
   left in place, cosmic rays and fringes handled as configured, background
@@ -69,11 +71,9 @@ background stage):
 * ``BKG`` and ``BKGRMS`` -- the subtracted background model and its RMS.
 * ``ERR`` -- the 1σ uncertainty, when the image has one.
 
-``registered/<image>_registered.fits`` is the same processed image resampled
-(bilinear, ``output.registered_order``) onto the grid of the
-relative-alignment reference image, with masked pixels set to NaN, so all
-epochs can be blinked pixel for pixel. Photometry always uses the native
-pixels, never these.
+The processed image is the only image product: it is the cleaned image the
+photometry was measured on, with the WCS aligned to the reference image (no
+resampled copy is written).
 
 
 Per-stage diagnostics
@@ -96,6 +96,10 @@ As soon as each stage runs, RedPhot writes figures and a table into
   than ``target_position.alignment_check_images_across_max`` images the
   figure is turned (one row per image, sums at the bottom). The
   target-position figure is ``target_position.png``.
+* For templates, ``batch.png`` shows each filter's template with the outline
+  of every image that uses it (from its aligned WCS) and the fraction of each
+  image that lands on real template data; an outline over the no-data region
+  is drawn in red and the stage warns (``TEMPLATE_FOOTPRINT_INCOMPLETE``).
 * ``overview.png`` -- every image of the run for that stage, with status
   colors and the key numbers against their limits.
 * ``summary.csv`` -- one row per image: status, flags, and the same key

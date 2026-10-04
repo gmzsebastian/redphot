@@ -47,10 +47,9 @@ FITS_PRODUCTS = (
     "subtraction_kernel",
 )
 
-# Products written outside the per-derivative FITS folder: the final
-# light-curve figure, one processed multi-extension FITS file per image, and
-# the same images resampled onto the alignment reference grid.
-SPECIAL_PRODUCTS = ("lightcurve_plot", "processed_image", "registered_image")
+# Products not written by the generic derivative writer: the final
+# light-curve figure and the processed multi-extension FITS file per image.
+SPECIAL_PRODUCTS = ("lightcurve_plot", "processed_image")
 
 _SMALL_PRODUCTS = {
     "images_table", "sources_table", "photometry_table", "lightcurve_table",
@@ -59,10 +58,21 @@ _SMALL_PRODUCTS = {
 
 _STANDARD_PRODUCTS = _SMALL_PRODUCTS | {
     "image_pdfs", "batch_pdf", "psf_model", "difference_image",
-    "processed_image", "registered_image",
+    "processed_image",
 }
 
 _ALL_PRODUCTS = _STANDARD_PRODUCTS | set(FITS_PRODUCTS) | set(SPECIAL_PRODUCTS)
+
+
+def image_stem(image_id):
+    """File-name stem of an image: its ID without the FITS ending, made safe."""
+
+    text = str(image_id)
+    for ending in (".fits.fz", ".fits.gz", ".fits", ".fit", ".fz"):
+        if text.lower().endswith(ending):
+            text = text[: -len(ending)]
+            break
+    return _safe_name(text)
 
 
 def _safe_name(value):
@@ -388,7 +398,7 @@ def _summary_page(record, preferred_rows=None):
             ("Input file", str(_record_path(record) or "—").split("/")[-1], None),
             ("Filter", metadata.get("filter") or "—", None),
             ("MJD (mid)", _fmt(metadata.get("mjd_mid", metadata.get("mjd")), "{:.5f}"), None),
-            ("Exposure", _fmt(metadata.get("exposure_time"), "{:g}", "s"), None),
+            ("Exposure Time", _fmt(metadata.get("exposure_time"), "{:g}", "s"), None),
             ("Airmass", _fmt(metadata.get("airmass"), "{:.2f}"), None),
             ("Telescope / instrument", "{} / {}".format(metadata.get("telescope", "—"),
                                                        metadata.get("instrument", "—")), None),
@@ -613,7 +623,7 @@ def save_fits_derivatives(image_records, derivatives, output_directory, settings
                         except (TypeError, ValueError):
                             pass
             suffix = ".fits.gz" if policy["fits_compression"] == "gzip" else ".fits"
-            path = output / "{}_{}{}".format(_safe_name(image_id), name, suffix)
+            path = output / "{}_{}{}".format(image_stem(image_id), name, suffix)
             fits.writeto(path, array, header=header, overwrite=policy["overwrite"],
                          checksum=policy["include_checksums"])
             paths.append((name, str(path), str(image_id)))
@@ -646,22 +656,19 @@ _MASK_BIT_TEXT = {
 
 def save_processed_images(items, output_directory, policy=None, config_digest=None,
                           run_id=None):
-    """Write one processed multi-extension FITS file per image (and its registered copy).
+    """Write the final processed multi-extension FITS file of every image.
 
     Each item (built by the pipeline) carries the processed science array, its
     header (aligned WCS and processing keywords), the mask components, and
-    the background model and RMS. The files are::
+    the background model and RMS. The file sits next to the image's PSF model::
 
-        processed/<image>_processed.fits
-            [0] processed image: cut to the usable area, fringe-corrected,
-                background-subtracted, on its native pixels with the aligned WCS
+        fits/<image>_processed.fits
+            [0] processed image: cut to the usable area, masked pixels kept,
+                cosmic rays and fringes handled, background-subtracted, on its
+                native pixels with the WCS aligned to the reference image
             [MASK] bit mask (header lists the bits; 0 = pixel used)
             [BKG], [BKGRMS] subtracted background model and its RMS
             [ERR] 1σ uncertainty, when the image has one
-        registered/<image>_registered.fits
-            the processed image resampled onto the alignment reference grid
-            (masked pixels NaN), for blinking epochs; photometry is always
-            measured on the native pixels, never on these.
     """
 
     policy = policy or resolve_output_policy()
@@ -672,9 +679,9 @@ def save_processed_images(items, output_directory, policy=None, config_digest=No
         (lambda array: np.asarray(array, dtype=dtype))
     for item in items or []:
         image_id = str(item["image_id"])
-        stem = _safe_name(image_id.rsplit(".fits", 1)[0] if ".fits" in image_id else image_id)
+        stem = image_stem(image_id)
         if policy["products"].get("processed_image", False) and item.get("data") is not None:
-            folder = output / "processed"
+            folder = output / "fits"
             folder.mkdir(parents=True, exist_ok=True)
             header = item["header"].copy()
             header["RDPID"] = (str(run_id)[:68], "redphot run identifier")
@@ -705,19 +712,6 @@ def save_processed_images(items, output_directory, policy=None, config_digest=No
             fits.HDUList(hdus).writeto(path, overwrite=policy.get("overwrite", False),
                                        checksum=policy.get("include_checksums", True))
             entries.append(("processed_image", str(path), image_id))
-        registered = item.get("registered")
-        if policy["products"].get("registered_image", False) and registered is not None:
-            folder = output / "registered"
-            folder.mkdir(parents=True, exist_ok=True)
-            header = registered["header"].copy()
-            header["RDPID"] = (str(run_id)[:68], "redphot run identifier")
-            header["RDPCONF"] = (str(config_digest)[:32], "configuration SHA-256 prefix")
-            header["RDPPROD"] = ("registered_image", "redphot product")
-            path = folder / "{}_registered.fits".format(stem)
-            fits.PrimaryHDU(cast(registered["data"]), header=header).writeto(
-                path, overwrite=policy.get("overwrite", False),
-                checksum=policy.get("include_checksums", True))
-            entries.append(("registered_image", str(path), image_id))
     return entries
 
 
@@ -899,15 +893,12 @@ def assemble_output_products(
         except Exception as error:  # a figure must never stop the products
             paths["lightcurve_plot_error"] = "{}: {}".format(type(error).__name__, error)
 
-    if processed_images and (policy["products"].get("processed_image", False)
-                             or policy["products"].get("registered_image", False)):
+    if processed_images and policy["products"].get("processed_image", False):
         progress("processed FITS images ({})".format(len(processed_images)))
         processed_entries = save_processed_images(
             processed_images, output, policy, digest, run_id)
         paths["processed_images"] = [path for kind, path, _ in processed_entries
                                      if kind == "processed_image"]
-        paths["registered_images"] = [path for kind, path, _ in processed_entries
-                                      if kind == "registered_image"]
         entries.extend(processed_entries)
 
     if policy["products"].get("image_pdfs", False):
@@ -990,6 +981,7 @@ __all__ = [
     "SPECIAL_PRODUCTS",
     "save_light_curve_plot",
     "save_processed_images",
+    "image_stem",
     "TABLE_PRODUCTS",
     "add_lightcurve_traceability",
     "add_photometry_traceability",

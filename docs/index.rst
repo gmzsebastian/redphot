@@ -27,6 +27,7 @@ metadata and processing choices configurable. IRAF and PyRAF are not required.
    installation
    algorithms
    tutorials/running_pipeline
+   tutorials/step_by_step
    reference
    configuration
    api

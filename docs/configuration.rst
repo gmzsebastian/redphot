@@ -136,12 +136,15 @@ The main sections are deliberately aligned with the processing order:
 ``pipeline``
    Gate stages (decided automatically: FAIL rejected, PASS/WARN approved),
    progress messages (``verbose``), state saving, exception containment, and
-   resume policy.
+   resume policy. ``rerun_position_tolerance_mas`` (10): when alignment is
+   redone, a target position within this many milliarcseconds of the one the
+   kept results used does not redo the later steps of every image.
 
 ``diagnostics`` and ``output``
    Plot/report switches, output directory/overwrite behavior, storage profile,
-   per-product overrides, tables, the light-curve figure, processed and
-   registered FITS images, derivatives, logs, and manifest checksums.
+   per-product overrides, tables, the light-curve figure, the processed FITS
+   image and PSF model of each image, derivatives, logs, and manifest
+   checksums.
 
 Call ``validate_settings(settings)`` after constructing settings manually.
 ``resolve_settings`` performs validation automatically.
@@ -149,8 +152,21 @@ Call ``validate_settings(settings)`` after constructing settings manually.
 Changing a running image
 ------------------------
 
-Use ``set_image_overrides`` after a review. The controller stores the change
-and marks the affected stage and downstream dependencies ``STALE``.
+``redphot.steps.run_step`` and ``rerun_from`` change a setting by name for
+chosen images (see :ref:`change-one-setting`):
+
+.. code-block:: python
+
+   from redphot.steps import rerun_from
+
+   rerun_from(state, context, "background", images="difficult_epoch",
+              box_size=[96, 96])
+
+With nested settings, ``set_image_overrides`` does the same for one image. The
+controller stores the change and marks the first stage that reads it, and the
+later stages of that image, ``STALE``. Stages that work on all images together
+run again for the whole batch; the image stages after them are redone only for
+images whose part of the batch result changed.
 
 .. code-block:: python
 

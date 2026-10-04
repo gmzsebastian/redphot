@@ -169,6 +169,7 @@ QUALITY_FLAGS = {
         "TOO_FEW_SOURCES",
         "SEEING_POOR",
         "SEEING_SCATTER_HIGH",
+        "BRIGHT_STARS_BROADENED",
         "ELLIPTICITY_HIGH",
         "ELLIPTICITY_SCATTER_HIGH",
         "TRACKING_POOR",
@@ -221,6 +222,7 @@ QUALITY_FLAGS = {
     "subtraction": [
         "TEMPLATE_MISSING",
         "TEMPLATE_COVERAGE_INCOMPLETE",
+        "TEMPLATE_FOOTPRINT_INCOMPLETE",
         "TEMPLATE_FILTER_MISMATCH",
         "TEMPLATE_DEPTH_INSUFFICIENT",
         "TEMPLATE_SEEING_POOR",
@@ -317,7 +319,9 @@ DEFAULT_SETTINGS = {
             "site": None,
             "gain": None,
             "read_noise": None,
-            "saturation": None,
+            # Used when the header has no saturation keyword (LDSS3c, IMACS,
+            # Binospec, ... reductions); same level as the KeplerCam profile.
+            "saturation": 50000.0,
             "nonlinearity": None,
             "pixel_scale": None,
         },
@@ -335,6 +339,8 @@ DEFAULT_SETTINGS = {
         "exposure_time_tolerance_s": 1.0,
         "time_tolerance_s": 2.0,
         "time_reference": "start",
+        # When DATE-OBS and the MJD card disagree, take the start time from MJD.
+        "prefer_mjd_on_time_conflict": True,
         "convert_time_to_mid_exposure": True,
         "resolve_exposure_from_times": True,
         "derive_exposure_from_times": True,
@@ -531,6 +537,28 @@ DEFAULT_SETTINGS = {
         # measured.
         "source_mask_grow_fwhm": 1.5,
         "source_mask_kernel_fwhm": 1.0,
+        # Bright-star halos: for the bright_star_count brightest stars (their
+        # saturated cores included in the ranking), walk outward through
+        # unmasked pixels until the median excess over the local sky drops
+        # below bright_star_halo_sigma x sky RMS, and mask a circle of that
+        # radius. The local sky is a plane fitted to the annulus
+        # bright_star_sky_annulus_fraction x bright_star_maximum_radius_pixels.
+        # Other sources keep the fixed source_mask_grow_fwhm growth.
+        "bright_star_mask_enabled": True,
+        "bright_star_count": 5,
+        "bright_star_halo_sigma": 0.25,
+        "bright_star_maximum_radius_pixels": 400.0,
+        "bright_star_sky_annulus_fraction": [0.75, 1.0],
+        "bright_star_step_pixels": 8.0,
+        "bright_star_step_fraction": 0.10,
+        "bright_star_minimum_annulus_pixels": 30,
+        # Masked pixels within this distance of saturated ones form a star's core.
+        "bright_star_core_radius_pixels": 40.0,
+        # The walk also stops where the profile stops falling (excess above
+        # this ratio of the excess at 1/factor of the radius): a plateau is
+        # sky structure for the background model to follow, not star light.
+        "bright_star_flattening_ratio": 0.75,
+        "bright_star_flattening_radius_factor": 1.5,
         "protect_target": True,
         "target_protection_fwhm": 5.0,
         "protect_host": False,
@@ -567,6 +595,13 @@ DEFAULT_SETTINGS = {
         # this bright (S/N), fitting at most seeing_maximum_fits of them.
         "seeing_minimum_snr": 20.0,
         "seeing_maximum_fits": 300,
+        # Flag (BRIGHT_STARS_BROADENED) and exclude from the seeing, PSF and
+        # zeropoint the unsaturated stars brighter than the flux where the
+        # running-median FWHM rises more than broadening_fraction above the
+        # faint-star FWHM (nonlinear cores below the saturation level).
+        "detect_brightness_broadening": True,
+        "broadening_fraction": 0.05,
+        "broadening_minimum_stars": 3,
         "maximum_sources": 1000,
         "reject_saturated": True,
         "reject_masked": True,
@@ -977,6 +1012,10 @@ DEFAULT_SETTINGS = {
         ],
         "sigma_clip": 3.0,
         "maximum_iterations": 5,
+        # Add the star-to-star scatter beyond the formal errors to each star's
+        # variance in the weighted zeropoint, so the brightest stars (tiny
+        # formal errors) do not set it alone.
+        "add_intrinsic_scatter": True,
         "maximum_star_rms_mag": 0.10,
         "minimum_epochs_for_stability": 2,
         "maximum_catalog_separation_arcsec": 2.0,
@@ -1044,6 +1083,9 @@ DEFAULT_SETTINGS = {
         "allow_approximate_filter_match": False,
         "approximate_filter_matches": {},
         "minimum_coverage_fraction": 0.99,
+        # Templates stage: WARN (TEMPLATE_FOOTPRINT_INCOMPLETE) when less than
+        # this fraction of a science frame lands on real template data.
+        "minimum_footprint_coverage": 0.999,
         "minimum_template_depth_margin_mag": 0.5,
         "maximum_template_fwhm_ratio": 2.0,
         "maximum_template_saturated_fraction": 0.01,
@@ -1237,6 +1279,13 @@ DEFAULT_SETTINGS = {
         # Print progress (one line per stage, per image, and from inside the
         # slow steps) while a run is going.
         "verbose": True,
+        # When a step that works on all images is redone, later steps of an
+        # image are redone only if its part of the result changed. The fixed
+        # target position counts as unchanged while it stays within this many
+        # milliarcseconds of the position the kept results used (10 mas changes
+        # forced photometry by ~1e-4 mag in 1-2 arcsec seeing); 0 compares it
+        # exactly.
+        "rerun_position_tolerance_mas": 10.0,
     },
     "diagnostics": {
         "enabled": True,
@@ -1282,13 +1331,12 @@ DEFAULT_SETTINGS = {
             "manifest": True,
             # Final light curve with every photometry method (PNG + PDF).
             "lightcurve_plot": True,
-            # One multi-extension FITS file per image: the processed image
-            # (cut to the usable area, background-subtracted, aligned WCS)
-            # with MASK, BKG and BKGRMS extensions, in products/processed/.
+            # The final image product, one multi-extension FITS file per image
+            # in products/fits/ next to its PSF model: the cleaned image (cut
+            # to the usable area, masked, background-subtracted, native pixels
+            # with the WCS aligned to the reference) with MASK, BKG and BKGRMS
+            # extensions.
             "processed_image": True,
-            # The processed images resampled onto the alignment reference
-            # grid, for blinking epochs (products/registered/).
-            "registered_image": True,
             "cleaned_image": False,
             "fringe_corrected_image": False,
             "source_mask": False,
@@ -1315,8 +1363,6 @@ DEFAULT_SETTINGS = {
         "selected_stage_names": [],
         "fits_dtype": "float32",
         "fits_compression": "none",
-        # Interpolation order of the registered (common-grid) images.
-        "registered_order": 1,
         "include_checksums": True,
         "write_manifest": True,
         "save_intermediate_fits": False,

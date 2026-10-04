@@ -802,7 +802,7 @@ def test_failed_subtraction_draws_its_figure_not_a_blank_card(monkeypatch):
 
     drawn = {}
     monkeypatch.setattr(diagnostics, "plot_subtraction_diagnostics",
-                        lambda product, record, metadata=None, status=None:
+                        lambda product, record, metadata=None, status=None, target=None:
                         drawn.setdefault("status", status) or "figure")
     monkeypatch.setattr(diagnostics, "plot_stage_status",
                         lambda title, status, stem, subtitle, reason: ("card", reason))
@@ -839,7 +839,8 @@ def test_astrometry_matches_reach_star_selection(monkeypatch):
     monkeypatch.setattr(catalogs, "attach_photometric_references",
                         lambda *args, **kwargs: ({}, {"catalogs": {}}))
     monkeypatch.setattr(catalogs, "select_comparison_and_psf_stars",
-                        lambda master, measurements, settings, overrides: (master, measurements, []))
+                        lambda master, measurements, settings, overrides, image_settings=None:
+                        (master, measurements, []))
     record = {"image_id": "one", "metadata": {}, "sources": Table()}
     state = {"images": {"one": {"status": "PASS", "stages": {"astrometry": {"status": "PASS"}}}}}
     context = {"images": {"one": {"record": record, "products": {}}}, "shared": {}, "_state": state}
@@ -1438,7 +1439,7 @@ def test_background_boxes_span_the_frame_exactly():
     assert _effective_background_box((1025, 1040), settings)[1] == (64, 64)
 
 
-def test_processed_images_carry_mask_bits_background_and_registered_copy(tmp_path):
+def test_processed_images_carry_mask_bits_and_background_next_to_the_psf_model(tmp_path):
     from redphot.output import MASK_BITS, save_processed_images
 
     shape = (40, 50)
@@ -1455,13 +1456,15 @@ def test_processed_images_carry_mask_bits_background_and_registered_copy(tmp_pat
         "background": np.full(shape, 100.0),
         "background_rms": np.full(shape, 5.0),
         "uncertainty": None,
-        "registered": {"data": np.full(shape, np.nan), "header": header},
     }
     policy = resolve_output_policy(profile="standard")
     entries = save_processed_images([item], tmp_path, policy, "digest", "run")
     kinds = {kind for kind, _, _ in entries}
-    assert kinds == {"processed_image", "registered_image"}
+    # one final image per input (no resampled "registered" copy any more)
+    assert kinds == {"processed_image"}
+    assert "registered_image" not in policy["products"]
     processed = next(path for kind, path, _ in entries if kind == "processed_image")
+    assert Path(processed) == tmp_path / "fits" / "one_processed.fits"
     with fits.open(processed) as hdulist:
         assert [hdu.name for hdu in hdulist] == ["PRIMARY", "MASK", "BKG", "BKGRMS"]
         bits = hdulist["MASK"].data
@@ -1547,3 +1550,577 @@ def test_sip_terms_without_sip_ctype_are_declared(tmp_path):
     fixed = _sip_consistent_header(header.copy())
     assert fixed["CTYPE1"] == "RA---TAN-SIP" and fixed["CTYPE2"] == "DEC--TAN-SIP"
     assert _sip_consistent_header(_wcs_header((50, 50)))["CTYPE1"] == "RA---TAN"
+
+
+def _bright_star_field(seed=11):
+    """Sky plane + noise, a saturated star with a broad halo, and faint stars."""
+
+    rng = np.random.default_rng(seed)
+    ny, nx = 768, 768
+    yy, xx = np.indices((ny, nx))
+    sky = 1000.0 + 0.02 * xx - 0.01 * yy
+    star_x, star_y = 420.0, 400.0
+    radius = np.hypot(xx - star_x, yy - star_y)
+    halo = 400.0 / (1.0 + (radius / 25.0) ** 2)
+    core = 3.0e6 / (2 * np.pi * 2.0 ** 2) * np.exp(-0.5 * (radius / 2.0) ** 2)
+    data = sky + halo + core
+    for x, y in rng.uniform(40, 728, (25, 2)):
+        r2 = (xx - x) ** 2 + (yy - y) ** 2
+        data += 3000.0 / (2 * np.pi * 1.5 ** 2) * np.exp(-0.5 * r2 / 1.5 ** 2)
+    data += rng.normal(0.0, 20.0, data.shape)
+    saturated = data >= 50000.0
+    data = np.minimum(data, 65000.0)
+    # The masks stage masks the saturated core and its surroundings.
+    from scipy import ndimage
+
+    mask = ndimage.binary_dilation(saturated, iterations=6)
+    return data, mask, sky, (int(star_x), int(star_y))
+
+
+def test_bright_star_halo_is_masked_so_the_background_does_not_absorb_it():
+    data, mask, sky, (star_x, star_y) = _bright_star_field()
+    settings = get_default_settings()
+    settings["background"].update({"box_size": [64, 64], "filter_size": [3, 3]})
+    settings["source_detection"]["fwhm_guess_pixels"] = 4.0
+    metadata = {"saturation": 50000.0}
+    ccd = CCDData(data, unit="adu", mask=mask)
+
+    settings["background"]["bright_star_mask_enabled"] = False
+    _, old_products, old_info = model_background(ccd, metadata, settings)
+    settings["background"]["bright_star_mask_enabled"] = True
+    _, products, info = model_background(ccd, metadata, settings)
+
+    truth = sky[star_y, star_x]
+    old_bias = old_products["background"][star_y, star_x] - truth
+    new_bias = products["background"][star_y, star_x] - truth
+    assert old_bias > 20.0                      # the halo leaks into the model (1 RMS)
+    # what is left is the halo just outside the mask (~0.25 RMS there)
+    assert abs(new_bias) < 0.3 * 20.0 and abs(new_bias) < 0.3 * old_bias
+
+    stars = info["source_mask"]["bright_stars"]
+    assert len(stars) == settings["background"]["bright_star_count"]
+    main = stars[0]
+    assert main["saturated"] and main["converged"]
+    assert abs(main["x"] - star_x) < 2 and abs(main["y"] - star_y) < 2
+    # halo(r) = 400 / (1 + (r/25)^2) drops below 0.25 x 20 ADU at r ~ 220 px
+    assert 170.0 < main["halo_radius_pixels"] < 280.0
+    # faint stars keep (almost) the ordinary growth
+    for star in stars[1:]:
+        assert star["stop"] == "inside_brighter_halo" or \
+            star["halo_radius_pixels"] < star["segment_radius_pixels"] + 30.0
+    halo_mask = products["bright_star_mask"]
+    assert halo_mask[star_y, star_x + 150] and not halo_mask[star_y, star_x + 300]
+    # other sources are grown exactly as before
+    assert np.array_equal(products["detected_source_mask"],
+                          old_products["detected_source_mask"])
+    assert info["source_mask"]["combined_mask_fraction"] < \
+        old_info["source_mask"]["combined_mask_fraction"] + 0.25
+    # sky residuals still look like noise
+    keep = ~products["background_mask"]
+    normalized = (products["background_subtracted"] / products["background_rms"])[keep]
+    median = np.median(normalized)
+    width = 1.4826 * np.median(np.abs(normalized - median))
+    assert abs(median) < 0.1 and abs(width - 1.0) < 0.1
+
+
+def test_bright_star_halo_mask_can_be_switched_off_and_ignores_faint_fields():
+    rng = np.random.default_rng(5)
+    data = rng.normal(500.0, 10.0, (256, 256))
+    yy, xx = np.indices(data.shape)
+    data += 800.0 * np.exp(-0.5 * ((xx - 128) ** 2 + (yy - 128) ** 2) / 2.0 ** 2)
+    settings = get_default_settings()
+    settings["background"]["box_size"] = [64, 64]
+    _, products, info = model_background(CCDData(data, unit="adu"), {}, settings)
+    star = info["source_mask"]["bright_stars"][0]
+    # a modest star has no halo above 0.25 RMS: nothing beyond its segment
+    assert star["halo_radius_pixels"] <= star["segment_radius_pixels"] + 10.0
+    settings["background"]["bright_star_mask_enabled"] = False
+    _, products, info = model_background(CCDData(data, unit="adu"), {}, settings)
+    assert not products["bright_star_mask"].any()
+    assert info["source_mask"]["bright_stars"] == []
+
+
+def test_date_obs_without_time_defers_to_the_mjd_card(tmp_path):
+    """Regression (IMACS): DATE-OBS = '2019-12-31' was read as midnight."""
+
+    path = tmp_path / "imacs.fits"
+    header = _wcs_header((64, 64))
+    header.update({"DATE-OBS": "2019-12-31", "MJD": 58848.24338999996, "EXPTIME": 10.0,
+                   "FILTER": "r", "OBJECT": "AT_TEST"})
+    fits.PrimaryHDU(np.full((64, 64), 100.0, dtype=np.float32), header=header).writeto(path)
+    settings = resolve_settings()
+    _, metadata = read_fits_image(path, settings)
+    assert metadata["mjd_start"] == pytest.approx(58848.24339, abs=1e-6)
+    assert metadata["mjd_mid"] == pytest.approx(58848.24339 + 5.0 / 86400.0, abs=1e-6)
+    assert metadata["date_mid_utc"].startswith("2019-12-31T05:50:3")
+    assert "TIME_CONFLICT" in metadata["quality_flags"]
+    conflict = metadata["metadata_conflicts"][0]
+    assert conflict["kind"] == "date_obs_vs_mjd_card" and conflict["resolution"] == "used MJD"
+    # switched off, DATE-OBS keeps deciding (and the conflict is still reported)
+    settings["metadata"]["prefer_mjd_on_time_conflict"] = False
+    _, metadata = read_fits_image(path, settings)
+    assert metadata["mjd_start"] == pytest.approx(58848.0)
+    assert "TIME_CONFLICT" in metadata["quality_flags"]
+
+
+def test_images_without_a_saturation_keyword_default_to_50000(tmp_path):
+    path = tmp_path / "ldss3.fits"
+    header = _wcs_header((64, 64))
+    header.update({"MJD": 58898.1, "EXPTIME": 300.0, "FILTER": "g", "OBJECT": "AT_TEST",
+                   "GAIN": 1.65})
+    fits.PrimaryHDU(np.full((64, 64), 100.0, dtype=np.float32), header=header).writeto(path)
+    settings = resolve_settings(run_settings={"metadata": {"instrument_override": "LDSS3c"}})
+    _, metadata = read_fits_image(path, settings)
+    assert metadata["saturation"] == pytest.approx(50000.0)
+    assert "fallback" in metadata["_sources"]["saturation"]
+    assert "SATURATION_MISSING" not in metadata["quality_flags"]
+    # a header value still wins
+    header["SATURATE"] = 65000.0
+    fits.PrimaryHDU(np.full((64, 64), 100.0, dtype=np.float32), header=header).writeto(
+        path, overwrite=True)
+    _, metadata = read_fits_image(path, settings)
+    assert metadata["saturation"] == pytest.approx(65000.0)
+
+
+def test_fwhm_rise_with_brightness_is_found_and_flat_seeing_is_not():
+    from redphot.image import fwhm_brightness_onset
+
+    rng = np.random.default_rng(4)
+    flux = np.geomspace(1e3, 1e7, 200)
+    flat = 3.0 + rng.normal(0.0, 0.08, flux.size)
+    peak = flux / 30.0
+    result = fwhm_brightness_onset(flux, flat, peak, np.ones(flux.size, bool),
+                                   get_default_settings(), sky=1000.0)
+    assert result["onset_flux"] is None and result["reference_fwhm"] == pytest.approx(3.0, abs=0.05)
+    # stars brighter than 5e5 grow wider with flux (nonlinear cores)
+    rising = flat * np.where(flux > 5e5, (flux / 5e5) ** 0.25, 1.0)
+    result = fwhm_brightness_onset(flux, rising, peak, np.ones(flux.size, bool),
+                                   get_default_settings(), sky=1000.0)
+    assert 5e5 < result["onset_flux"] < 3e6
+    assert result["broadened_count"] >= 3
+    assert result["onset_level"] == pytest.approx(result["onset_peak"] + 1000.0)
+    # a single bright outlier is not a trend
+    single = flat.copy()
+    single[-1] = 6.0
+    result = fwhm_brightness_onset(flux, single, peak, np.ones(flux.size, bool),
+                                   get_default_settings())
+    assert result["onset_flux"] is None
+
+
+def test_broadened_stars_are_kept_out_of_the_zeropoint_and_psf():
+    from redphot.catalogs import _role_candidates, _screen_measurements
+
+    rows = []
+    for index, broadened in enumerate((False, True)):
+        rows.append({
+            "persistent_id": "s{}".format(index), "image_id": "a", "filter": "g",
+            "magnitude": 17.0, "magnitude_error": 0.01, "edge_distance_pixels": 500.0,
+            "near_edge": False, "saturated": False, "broadened": broadened,
+            "saturation_distance_pixels": np.inf, "masked": False, "trail_overlap": False,
+            "trail_distance_pixels": np.inf, "snr": 500.0, "ellipticity": 0.05,
+            "fwhm_pixels": 3.0, "neighbor_distance_pixels": 100.0, "image_fwhm_pixels": 3.0,
+            "detector_x_fraction": 0.5, "detector_y_fraction": 0.5,
+        })
+    from redphot.catalogs import _measurement_table
+
+    measurements = _measurement_table(rows)
+    master = Table({"persistent_id": ["s0", "s1"], "catalog_rejection_reasons": ["", ""]})
+    screened = _screen_measurements(master, measurements, get_default_settings())
+    assert list(screened["rejection_reasons"]) == ["", "NONLINEAR"]
+    settings = get_default_settings()
+    for role in ("calibration", "psf"):
+        assert list(_role_candidates(screened, role, settings)) == [True, False]
+    assert list(_role_candidates(screened, "astrometry", settings)) == [True, True]
+
+
+def test_zeropoint_is_not_set_by_the_brightest_stars_alone():
+    from redphot.photometry import _solve_zeropoint_group
+
+    settings = get_default_settings()
+    records = []
+    rng = np.random.default_rng(8)
+    for index in range(60):
+        bright = index < 6
+        records.append({
+            "image_id": "a", "method": "psf", "filter": "g", "routed_catalog": "ps1",
+            "magnitude_band": "g", "magnitude_system": "AB", "source_id": str(index),
+            "input_accepted": True, "rejection_reason": "",
+            # bright stars: tiny formal errors and a +0.1 mag offset (nonlinear)
+            "individual_zeropoint": 27.0 + (0.10 if bright else rng.normal(0.0, 0.05)),
+            "instrumental_magnitude_uncertainty": 0.001 if bright else 0.02,
+            "catalog_magnitude_error": 0.002 if bright else 0.01,
+            "snr": 1000.0 if bright else 50.0, "airmass": 1.2,
+        })
+    solution = _solve_zeropoint_group(records, list(range(60)), set(), settings)
+    assert solution["zeropoint_mag"] == pytest.approx(27.0, abs=0.03)
+    assert solution["intrinsic_scatter_mag"] > 0.03
+    settings["calibration"]["add_intrinsic_scatter"] = False
+    old = _solve_zeropoint_group(records, list(range(60)), set(), settings)
+    assert old["zeropoint_mag"] > 27.05      # the old weighting followed the bright stars
+
+
+def test_template_footprints_report_how_much_of_each_image_has_template_data():
+    from redphot.subtraction import template_footprint_coverage
+
+    template_shape = (200, 200)
+    template_wcs = WCS(_wcs_header(template_shape))
+    data = np.ones(template_shape)
+    data[:, 150:] = np.nan                       # right quarter has no data
+    data[95:105, 95:105] = np.nan                # a masked star core: not a gap
+    template = {"data": data, "mask": ~np.isfinite(data), "wcs": template_wcs}
+    inside = WCS(_wcs_header((40, 40)))          # centered on the template
+    shifted_header = _wcs_header((40, 40))
+    shifted_header["CRPIX1"] -= 50               # half of it over the gap
+    records = [
+        {"image_id": "inside", "data": np.zeros((40, 40)), "wcs": inside,
+         "metadata": {"filter": "r"}},
+        {"image_id": "edge", "data": np.zeros((40, 40)), "wcs": WCS(shifted_header),
+         "metadata": {"filter": "r"}},
+    ]
+    coverage = template_footprint_coverage(template, records)
+    assert coverage[0]["coverage_fraction"] == pytest.approx(1.0)
+    assert 0.3 < coverage[1]["coverage_fraction"] < 0.7
+    assert len(coverage[0]["outline_x"]) == 100
+    from redphot.diagnostics import plot_template_footprints
+    import matplotlib.pyplot as plt
+
+    template["science_footprints"] = coverage
+    figure = plot_template_footprints({"r": template}, status="WARN",
+                                      flags=["TEMPLATE_FOOTPRINT_INCOMPLETE"])
+    plt.close(figure)
+
+
+def test_difference_comparison_reports_magnitudes_and_limits():
+    from redphot.photometry import _difference_comparison
+
+    def table(fluxes, errors):
+        return Table({
+            "image_id": ["a"] * len(fluxes), "source_type": ["target"] * len(fluxes),
+            "method": ["psf", "large_aperture"][: len(fluxes)], "flux": fluxes,
+            "flux_uncertainty": errors, "exposure_time": [100.0] * len(fluxes),
+        })
+
+    zeropoints = Table({"image_id": ["a", "a"], "method": ["psf", "large_aperture"],
+                        "zeropoint_mag": [25.0, 25.1], "zeropoint_uncertainty_mag": [0.01, 0.01]})
+    comparison = _difference_comparison(table([10000.0, 12000.0], [100.0, 150.0]),
+                                        table([5000.0, 200.0], [100.0, 150.0]), zeropoints)
+    rows = {str(row["method"]): row for row in comparison}
+    assert rows["psf"]["science_magnitude"] == pytest.approx(25.0 - 2.5 * np.log10(100.0))
+    assert rows["psf"]["difference_magnitude"] == pytest.approx(25.0 - 2.5 * np.log10(50.0))
+    # 200 ± 150 is below 3σ: no magnitude, a 3σ limit instead
+    assert np.ma.is_masked(rows["large_aperture"]["difference_magnitude"])
+    assert rows["large_aperture"]["difference_limit_mag"] == pytest.approx(
+        25.1 - 2.5 * np.log10(3 * 150.0 / 100.0))
+
+
+def test_cached_template_is_reused_when_the_field_center_moves_slightly(tmp_path):
+    """Regression: a 0.04" shift of the refined WCS changed the cache name."""
+
+    from astropy.coordinates import SkyCoord
+    from redphot.subtraction import _find_cached_template, _template_cache_path
+
+    footprint = {"center": SkyCoord(103.60011, 17.49246, unit="deg"),
+                 "width_arcmin": 15.65, "height_arcmin": 15.64}
+    cached = _template_cache_path(tmp_path, "ps1", "g", footprint)
+    cached.write_bytes(b"")
+    moved = dict(footprint, center=SkyCoord(103.60010, 17.49246, unit="deg"))
+    assert _template_cache_path(tmp_path, "ps1", "g", moved) != cached
+    assert _find_cached_template(tmp_path, "ps1", "g", moved) == cached
+    # another band, or a field that is not covered, is not reused
+    assert _find_cached_template(tmp_path, "ps1", "r", moved) is None
+    far = dict(footprint, center=SkyCoord(103.70, 17.49246, unit="deg"))
+    assert _find_cached_template(tmp_path, "ps1", "g", far) is None
+    bigger = dict(footprint, width_arcmin=20.0)
+    assert _find_cached_template(tmp_path, "ps1", "g", bigger) is None
+
+
+def test_stages_know_which_settings_they_read():
+    from redphot.pipeline import first_stage_reading, stage_reads_setting
+
+    assert first_stage_reading({"psf": {"maximum_stars": 30}}) == "star_selection"
+    assert first_stage_reading({"psf": {"box_size_pixels": 31}}) == "psf"
+    assert first_stage_reading({"masks": {"cosmic_rays": {"objlim": 10}}}) == "cosmic_rays"
+    assert first_stage_reading({"masks": {"saturation_level": 45000}}) == "masks"
+    assert first_stage_reading(
+        {"image_quality": {"usability": {"zeropoint_scatter_warn_mag": 0.2}}}) == "usability"
+    assert first_stage_reading(
+        {"catalogs": {"comparison_stars": {"minimum_snr": 20}}}) == "star_selection"
+    assert first_stage_reading({"background": {"box_size": [64, 64]}}) == "background"
+    assert not stage_reads_setting("masks", "masks.cosmic_rays.enabled")
+    assert stage_reads_setting("masks", "masks")
+    assert not stage_reads_setting("astrometry", "catalogs.comparison_stars.minimum_snr")
+    assert stage_reads_setting("astrometry", "catalogs.search_radius_arcmin")
+
+
+def test_step_parameters_are_found_by_name():
+    from redphot.steps import find_setting, step_name, step_overrides
+
+    assert step_name(9) == "star_selection"
+    assert step_name("09_star_selection") == "star_selection"
+    assert step_name("sources") == "source_quality"
+    assert find_setting(9, "minimum_snr") == "catalogs.comparison_stars.minimum_snr"
+    assert find_setting(9, "maximum_stars") == "psf.maximum_stars"
+    assert find_setting("cosmic_rays", "enabled") == "masks.cosmic_rays.enabled"
+    assert find_setting("subtraction", "enabled") == "subtraction.enabled"
+    assert find_setting("subtraction", "kernel_order") == "subtraction.hotpants.kernel_order"
+    assert find_setting("usability", "enabled") == "image_quality.usability.enabled"
+    assert find_setting("read", "saturation_override") == "metadata.saturation_override"
+    with pytest.raises(ValueError, match="background.box_size"):
+        find_setting("star_selection", "box_size")
+    with pytest.raises(ValueError, match="minimum_snr"):
+        find_setting("star_selection", "minimum_sn")
+    assert step_overrides("background", {"box_size": [64, 64]}) == {
+        "background": {"box_size": [64, 64]}}
+    assert step_overrides(9, {"psf": {"maximum_stars": 12}, "minimum_snr": 20}) == {
+        "psf": {"maximum_stars": 12},
+        "catalogs": {"comparison_stars": {"minimum_snr": 20}}}
+
+
+def _per_image_functions():
+    """Synthetic stages whose batch results follow each image's own settings."""
+
+    functions = _stage_functions()
+
+    def active(context, required):
+        state = context["_state"]
+        return [
+            image_id for image_id, image in state["images"].items()
+            if image.get("status") != "REJECTED"
+            and image.get("stages", {}).get(required, {}).get("status")
+            in {"PASS", "WARN", "APPROVED"}
+        ]
+
+    def star_selection(context, image_id, settings):
+        rows = []
+        for identifier in active(context, "astrometry"):
+            local = context["images"][identifier]["settings"]
+            cut = local["catalogs"]["comparison_stars"]["minimum_snr"]
+            rows.append({"image_id": identifier, "persistent_id": "star", "cut": float(cut)})
+        summaries = [{"image_id": row["image_id"], "status": "PASS"} for row in rows]
+        return {"status": "PASS", "measurements": Table(rows=rows), "summaries": summaries}
+
+    def usability(context, image_id, settings):
+        decisions = [{"image_id": identifier, "status": "PASS"}
+                     for identifier in active(context, "astrometry")]
+        return {"status": "PASS", "decisions": decisions}
+
+    def alignment(context, image_id, settings):
+        alignments = [{"image_id": identifier, "status": "PASS"}
+                      for identifier in active(context, "usability")]
+        return {"status": "PASS", "alignments": alignments,
+                "target_solution": {"ra_deg": 10.0, "dec_deg": 20.0}}
+
+    def calibration(context, image_id, settings):
+        rows = [{"image_id": identifier, "zeropoint_mag": 25.0}
+                for identifier in active(context, "science_photometry")]
+        return {"status": "PASS", "zeropoints": Table(rows=rows)}
+
+    def templates(context, image_id, settings):
+        return {"status": "PASS", "templates": {"r": {"data": np.zeros((4, 4))}},
+                "flags": []}
+
+    functions.update(star_selection=star_selection, usability=usability,
+                     alignment=alignment, calibration=calibration, templates=templates)
+    return functions
+
+
+def test_rerun_from_changes_only_the_selected_images(tmp_path, monkeypatch, capsys):
+    import redphot.pipeline as pipeline
+    from redphot.steps import rerun_from, run_step, start_run
+
+    functions = _per_image_functions()
+    monkeypatch.setattr(pipeline, "_default_stage_functions", lambda: dict(functions))
+    files = []
+    for name in ("one.fits", "two.fits", "three.fits"):
+        _write_lco(tmp_path / name)
+        files.append(tmp_path / name)
+    state, context = start_run(files, tmp_path / "run", settings=NO_PLOTS)
+    pipeline.run_pipeline_through(state, context)
+    one, two, three = "one.fits", "two.fits", "three.fits"
+    assert list(state["images"]) == [one, three, two]  # sorted by name
+    calls = context["shared"]["calls"]
+    before = dict(calls)
+
+    # Step 9 with a new comparison-star cut for image two only (number 3).
+    rerun_from(state, context, 9, images=[3], minimum_snr=20)
+    assert state["images"][two]["overrides"] == {
+        "catalogs": {"comparison_stars": {"minimum_snr": 20}}}
+    assert state["images"][one]["overrides"] == {}
+    rows = context["shared"]["star_selection"]["measurements"]
+    assert {row["image_id"]: row["cut"] for row in rows} == {one: 10.0, two: 20.0, three: 10.0}
+    changed = {key for key in calls if calls[key] != before.get(key)}
+    # Image 2 redid the image steps after step 9; images 1 and 3 kept theirs,
+    # and no image redid steps 1-8.
+    assert changed == {two + ":psf", two + ":science_photometry", two + ":subtraction",
+                       two + ":difference_photometry"}
+    assert state["batch_stages"]["outputs"]["status"] == "PASS"
+
+    # Nothing is out of date afterwards: a full pass reruns nothing.
+    before = dict(calls)
+    pipeline.run_pipeline_through(state, context)
+    assert dict(calls) == before
+    state, context = pipeline.load_pipeline_state(tmp_path / "run")
+    pipeline.refresh_pipeline_staleness(state, context)
+    pipeline.run_pipeline_through(state, context)
+    assert context["shared"]["calls"] == before
+
+    # One image step with a changed setting runs only for that image.
+    calls = context["shared"]["calls"]
+    before = dict(calls)
+    run_step(state, context, "background", images="two", box_size=[64, 64])
+    assert {key for key in calls if calls[key] != before.get(key)} == {two + ":background"}
+    assert state["images"][two]["stages"]["astrometry"]["status"] == "STALE"
+    assert state["images"][one]["stages"]["astrometry"]["status"] == "PASS"
+    assert state["batch_stages"]["star_selection"]["status"] == "STALE"
+    assert "out of date now" in capsys.readouterr().out
+
+    # Settings of steps that use one value for all images cannot be per image.
+    with pytest.raises(ValueError, match="same settings for every image"):
+        run_step(state, context, "alignment", images=[1], relative_alignment_sigma_clip=4.0)
+
+
+def test_reloaded_run_keeps_the_image_order(tmp_path):
+    for name in ("b_image.fits", "A_image.fits", "c_image.fits"):
+        _write_lco(tmp_path / name)
+    state, context = initialize_pipeline(
+        [tmp_path / "c_image.fits", tmp_path / "b_image.fits", tmp_path / "A_image.fits"],
+        settings=NO_PLOTS, run_directory=tmp_path / "run")
+    order = list(state["images"])
+    from redphot.pipeline import save_pipeline_state
+
+    save_pipeline_state(state, context)
+    state, context = load_pipeline_state(tmp_path / "run")
+    assert list(state["images"]) == order
+    # Runs saved before the order was stored follow the checkpoint's order.
+    state.pop("image_order")
+    state["images"] = dict(sorted(state["images"].items()))
+    save_pipeline_state(state, context)
+    state, context = load_pipeline_state(tmp_path / "run")
+    assert list(state["images"]) == order
+
+
+def test_checkpoint_keeps_wcs_numbers_exact():
+    import io
+    import pickle
+
+    from astropy.wcs import Sip
+    from redphot.pipeline import _CheckpointPickler
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN-SIP", "DEC--TAN-SIP"]
+    wcs.wcs.crval = [103.59625693146123456, 17.491836103548765]
+    wcs.wcs.crpix = [468.680954065171234, 512.123456789012345]
+    wcs.wcs.cd = np.array([[-1.2345678901234567e-4, 2.345678901234567e-7],
+                           [3.456789012345678e-7, 1.2345678901234567e-4]])
+    a = np.zeros((3, 3))
+    b = np.zeros((3, 3))
+    a[2, 0], b[0, 2] = 1.234567890123456e-6, -2.345678901234567e-6
+    wcs.sip = Sip(a, b, None, None, wcs.wcs.crpix)
+    wcs.pixel_shape = (1000, 1100)
+    wcs.wcs.set()
+    buffer = io.BytesIO()
+    _CheckpointPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump({"wcs": wcs})
+    copy = pickle.loads(buffer.getvalue())["wcs"]
+    x, y = np.meshgrid(np.linspace(0, 999, 7), np.linspace(0, 1099, 5))
+    for first, second in zip(wcs.all_pix2world(x, y, 0), copy.all_pix2world(x, y, 0)):
+        assert np.array_equal(first, second)
+    assert copy.pixel_shape == (1000, 1100)
+    # Astropy's own pickling rounds the numbers (the reason for the pickler).
+    plain = pickle.loads(pickle.dumps(wcs))
+    assert not np.array_equal(plain.wcs.crpix, wcs.wcs.crpix)
+
+
+def test_wcs_refinement_applies_rotation_for_pc_headers():
+    """A similarity fit changes the matrix whatever form the header uses."""
+
+    from redphot.catalogs import _compose_similarity_wcs
+
+    angle = np.deg2rad(0.2)
+    transform = 1.001 * np.array([[np.cos(angle), -np.sin(angle)],
+                                  [np.sin(angle), np.cos(angle)]])
+    translation = np.array([1.5, -2.0])
+    matrix = np.array([[-1.0e-4, 1.0e-7], [2.0e-7, 1.0e-4]])
+    results = {}
+    for form in ("cd", "pc", "both"):
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        wcs.wcs.crval = [103.6, 17.5]
+        wcs.wcs.crpix = [500.0, 480.0]
+        if form in ("pc", "both"):
+            wcs.wcs.pc = matrix / 1.0e-4
+            wcs.wcs.cdelt = [1.0e-4, 1.0e-4]
+        if form in ("cd", "both"):
+            wcs.wcs.cd = matrix
+        wcs.wcs.set()
+        refined = _compose_similarity_wcs(wcs, transform, translation)
+        x, y = np.meshgrid(np.linspace(0, 999, 5), np.linspace(0, 999, 5))
+        results[form] = np.array(refined.pixel_to_world_values(x, y))
+        # The refined WCS puts each pixel where the original puts the
+        # transformed pixel.
+        moved = transform @ np.vstack([x.ravel(), y.ravel()]) + translation[:, None]
+        expected = np.array(wcs.pixel_to_world_values(moved[0], moved[1]))
+        assert np.allclose(results[form].reshape(2, -1), expected, atol=1e-9, rtol=0)
+    assert np.allclose(results["pc"], results["cd"], atol=1e-10, rtol=0)
+    assert np.allclose(results["both"], results["cd"], atol=1e-10, rtol=0)
+
+
+def test_settings_resolved_by_the_read_stage_do_not_redo_the_run(tmp_path):
+    """The read stage picks the instrument profile; a second pass keeps everything."""
+
+    from redphot.config import merge_settings
+
+    first, second, functions, state, context = _two_image_run(tmp_path)
+    plain_read = functions["read"]
+
+    def read_with_profile(context, image_id, settings):
+        # Like _run_read: settings re-resolved for the instrument in the header.
+        image = context["images"][image_id]
+        image["settings"] = merge_settings(image["settings"],
+                                           {"metadata": {"gain_override": 1.5}})
+        image["record"]["settings"] = image["settings"]
+        return plain_read(context, image_id, settings)
+
+    functions["read"] = read_with_profile
+    run_pipeline_through(state, context, stage_functions=functions)
+    calls = dict(context["shared"]["calls"])
+    run_pipeline_through(state, context, stage_functions=functions)
+    assert context["shared"]["calls"] == calls
+
+
+def test_star_screening_uses_each_images_settings():
+    from redphot.catalogs import _screen_measurements
+    from redphot.config import merge_settings
+
+    master = Table({"persistent_id": ["star"], "catalog_rejection_reasons": [""]})
+    row = {"persistent_id": "star", "image_fwhm_pixels": 3.0, "magnitude": 17.0,
+           "magnitude_error": 0.01, "edge_distance_pixels": 200.0, "near_edge": False,
+           "saturated": False, "saturation_distance_pixels": 500.0, "masked": False,
+           "trail_distance_pixels": 500.0, "trail_overlap": False, "snr": 15.0,
+           "ellipticity": 0.05, "fwhm_pixels": 3.0, "neighbor_distance_pixels": 100.0,
+           "detector_x_fraction": 0.5, "detector_y_fraction": 0.5}
+    measurements = Table(rows=[dict(row, image_id="a"), dict(row, image_id="b")], masked=True)
+    settings = get_default_settings()
+    strict = merge_settings(settings, {"catalogs": {"comparison_stars": {"minimum_snr": 20}}})
+    screened = _screen_measurements(master, measurements, settings, {"b": strict})
+    assert list(screened["image_accepted"]) == [True, False]
+    assert "SNR_LOW" in screened["rejection_reasons"][1]
+
+
+def test_target_moves_below_the_tolerance_keep_other_images():
+    from redphot.pipeline import _shared_digest_part
+
+    def part(ra_deg, tolerance, previous=None):
+        result = {"target_solution": {"ra_deg": ra_deg, "dec_deg": 17.49198, "frozen": True,
+                                      "version": "target-v1", "uncertainty_arcsec": 0.06}}
+        settings = {"pipeline": {"rerun_position_tolerance_mas": tolerance}}
+        return _shared_digest_part("alignment", result, settings, ["target_solution"],
+                                   previous)
+
+    base = 103.5962980
+    first, position = part(base, 10.0)
+    assert position == [base, 17.49198]
+    mas = 1.0 / 3.6e6 / np.cos(np.deg2rad(17.49198))
+    assert part(base + 2 * mas, 10.0, position)[0] == first      # 2 mas: kept
+    assert part(base + 9 * mas, 10.0, position)[0] == first      # 9 mas: kept
+    assert part(base + 12 * mas, 10.0, position)[0] != first     # 12 mas: redone
+    assert part(base + 2 * mas, 0.0, position)[0] != first       # exact comparison

@@ -817,7 +817,14 @@ def _compose_similarity_wcs(original_wcs, transform, translation):
     new_matrix = old_matrix @ transform
     constant = old_matrix @ (translation + 1.0 - old_crpix)
     new_crpix = 1.0 - np.linalg.solve(new_matrix, constant)
-    refined.wcs.cd = new_matrix
+    # WCSLIB uses PCi_j (with CDELTi) whenever a WCS has them, even when CDi_j
+    # is set as well, so assigning only CD left the rotation and scale of the
+    # fit out for headers that carry PC (KeplerCam, LDSS3c). Write the new
+    # matrix as PC with CDELT = 1 and drop any CD.
+    if refined.wcs.has_cd():
+        del refined.wcs.cd
+    refined.wcs.pc = new_matrix
+    refined.wcs.cdelt = np.ones(len(new_crpix))
     refined.wcs.crpix = new_crpix
     refined.wcs.set()
     return refined
@@ -1695,6 +1702,7 @@ def _measurement_table(rows):
     integer_fields = ("source_index", "catalog_index", "source_label")
     boolean_fields = (
         "saturated",
+        "broadened",
         "near_edge",
         "masked",
         "trail_overlap",
@@ -2065,6 +2073,9 @@ def build_master_source_table(image_records, settings=None):
                     "saturated": bool(
                         _optional_value(sources, "saturated", source_index, False)
                     ),
+                    "broadened": bool(
+                        _optional_value(sources, "broadened", source_index, False)
+                    ),
                     "near_edge": bool(
                         _optional_value(sources, "near_edge", source_index, False)
                     ),
@@ -2085,7 +2096,7 @@ def build_master_source_table(image_records, settings=None):
                 [row["x"] for row in image_rows],
                 [row["y"] for row in image_rows],
                 image_fwhm if image_fwhm is not None else image_rows[0]["image_fwhm_pixels"],
-                settings,
+                record.get("settings") or settings,
             )
             for index, row in enumerate(image_rows):
                 for name, values in apertures.items():
@@ -2247,19 +2258,26 @@ def _inside_excluded_detector_region(row, regions):
     return False
 
 
-def _screen_measurements(master, measurements, settings):
-    """Apply filter-specific catalog and detector-level screening."""
+def _screen_measurements(master, measurements, settings, image_settings=None):
+    """Apply filter-specific catalog and detector-level screening.
+
+    ``image_settings`` maps image IDs to the settings of that image (per-image
+    overrides); images not in it use ``settings``.
+    """
 
     output = Table(measurements, masked=True, copy=True)
-    star_settings = settings.get("catalogs", {}).get("comparison_stars", {})
+    image_settings = image_settings or {}
     master_reasons = {
         str(row["persistent_id"]): _reason_set(row["catalog_rejection_reasons"])
         for row in master
     }
-    regions = star_settings.get("excluded_detector_regions", [])
     accepted = []
     reason_values = []
     for row in output:
+        star_settings = (
+            image_settings.get(str(row["image_id"])) or settings
+        ).get("catalogs", {}).get("comparison_stars", {})
+        regions = star_settings.get("excluded_detector_regions", [])
         reasons = set(master_reasons.get(str(row["persistent_id"]), set()))
         fwhm = float(row["image_fwhm_pixels"])
         magnitude = None if np.ma.is_masked(row["magnitude"]) else float(row["magnitude"])
@@ -2286,6 +2304,10 @@ def _screen_measurements(master, measurements, settings):
             reasons.add("NEAR_EDGE")
         if bool(row["saturated"]):
             reasons.add("SATURATED")
+        elif "broadened" in output.colnames and bool(row["broadened"]):
+            # Brighter than the flux where the FWHM starts to grow with
+            # brightness (source_quality): a nonlinear core.
+            reasons.add("NONLINEAR")
         saturation_distance = (
             np.inf
             if np.ma.is_masked(row["saturation_distance_pixels"])
@@ -2357,6 +2379,7 @@ def _role_candidates(measurements, role, settings):
         },
         "psf": safety
         | {
+            "NONLINEAR",
             "SNR_LOW",
             "NOT_POINT_SOURCE",
             "MORPHOLOGY_UNKNOWN",
@@ -2518,12 +2541,19 @@ def _apply_selection_overrides(master, measurements, settings, overrides):
     return resolved
 
 
-def select_comparison_and_psf_stars(master, measurements, settings=None, overrides=None):
+def select_comparison_and_psf_stars(master, measurements, settings=None, overrides=None,
+                                    image_settings=None):
     """Screen sources, assign independent roles, and enforce spatial coverage.
 
     Contamination rejects only the affected star in the affected image. It does
     not reject the image itself. Global and per-image overrides use persistent
     source IDs and can independently add or remove role assignments.
+
+    ``image_settings`` maps image IDs to that image's settings, so per-image
+    overrides of ``catalogs.comparison_stars`` and ``psf.maximum_stars`` /
+    ``psf.minimum_stars`` apply to that image only. The catalog-level screening
+    of the master table (proper motion, RUWE, colour, ...) always uses
+    ``settings``.
 
     Returns
     -------
@@ -2537,9 +2567,9 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
 
     if settings is None:
         settings = get_default_settings()
+    image_settings = image_settings or {}
     master = _screen_master_catalog(master, settings)
-    measurements = _screen_measurements(master, measurements, settings)
-    star_settings = settings.get("catalogs", {}).get("comparison_stars", {})
+    measurements = _screen_measurements(master, measurements, settings, image_settings)
     image_ids = list(dict.fromkeys(str(value) for value in measurements["image_id"]))
     total_images = max(1, len(image_ids))
     detection_fraction = {
@@ -2554,8 +2584,10 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
         / total_images
         for persistent_id in master["persistent_id"]
     }
-    grid = star_settings.get("spatial_grid", [3, 3])
     for image_id in image_ids:
+        local = image_settings.get(image_id) or settings
+        star_settings = local.get("catalogs", {}).get("comparison_stars", {})
+        grid = star_settings.get("spatial_grid", [3, 3])
         image_mask = np.asarray(measurements["image_id"] == image_id)
         image_indices = np.flatnonzero(image_mask)
         image_table = measurements[image_indices]
@@ -2577,12 +2609,12 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
         calibration_score = snr / (1.0 + 20.0 * magnitude_error)
         qc_score = -magnitude + 1.0e-4 * np.log1p(snr)
 
-        astrometry_candidates = _role_candidates(image_table, "astrometry", settings)
-        psf_candidates = _role_candidates(image_table, "psf", settings)
+        astrometry_candidates = _role_candidates(image_table, "astrometry", local)
+        psf_candidates = _role_candidates(image_table, "psf", local)
         calibration_candidates = _role_candidates(
-            image_table, "calibration", settings
+            image_table, "calibration", local
         )
-        ensemble_candidates = _role_candidates(image_table, "ensemble", settings)
+        ensemble_candidates = _role_candidates(image_table, "ensemble", local)
         ensemble_candidates &= np.array(
             [
                 detection_fraction[str(value)]
@@ -2591,12 +2623,12 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
             ],
             dtype=bool,
         )
-        qc_candidates = _role_candidates(image_table, "qc_anchor", settings)
+        qc_candidates = _role_candidates(image_table, "qc_anchor", local)
 
         psf_selected = _spatially_distributed_selection(
             image_table,
             psf_candidates,
-            int(settings.get("psf", {}).get("maximum_stars", 20)),
+            int(local.get("psf", {}).get("maximum_stars", 20)),
             grid,
             psf_score,
         )
@@ -2645,13 +2677,15 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
 
     summaries = []
     for image_id in image_ids:
+        local = image_settings.get(image_id) or settings
+        star_settings = local.get("catalogs", {}).get("comparison_stars", {})
         rows = measurements[np.asarray(measurements["image_id"] == image_id)]
         counts = {
             role: int(np.count_nonzero(rows["role_{}".format(role)]))
             for role in ROLE_NAMES
         }
         flags = []
-        if counts["psf"] < int(settings.get("psf", {}).get("minimum_stars", 5)):
+        if counts["psf"] < int(local.get("psf", {}).get("minimum_stars", 5)):
             flags.append("TOO_FEW_PSF_STARS")
         if counts["calibration"] < int(
             star_settings.get("minimum_catalog_stars", 3)

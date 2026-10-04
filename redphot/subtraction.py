@@ -581,6 +581,42 @@ def _template_cache_path(cache, survey, filter_name, footprint):
         footprint["width_arcmin"], footprint["height_arcmin"])
 
 
+def _find_cached_template(cache, survey, filter_name, footprint, tolerance_arcmin=0.1):
+    """An existing cached template of this survey and band that covers the field.
+
+    The exact cache name changes when a refined WCS moves the field center by
+    a fraction of an arcsecond, so any cached file of the same survey and
+    band whose field (from its name) contains the requested one is reused.
+    The exact name is preferred; otherwise the smallest covering file.
+    """
+
+    exact = _template_cache_path(cache, survey, filter_name, footprint)
+    if exact.exists():
+        return exact
+    cache = Path(cache)
+    if not cache.is_dir():
+        return None
+    pattern = re.compile(r"^{}_{}_(\d+\.\d+)([+-]\d+\.\d+)_(\d+\.\d+)x(\d+\.\d+)"
+                         r"arcmin_template\.fits$".format(re.escape(str(survey)),
+                                                         re.escape(str(filter_name))))
+    frame = SkyOffsetFrame(origin=footprint["center"])
+    best = None
+    for path in cache.iterdir():
+        match = pattern.match(path.name)
+        if match is None:
+            continue
+        ra, dec, width, height = (float(value) for value in match.groups())
+        offset = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs").transform_to(frame)
+        dx = abs(offset.lon.to_value(u.arcmin))
+        dy = abs(offset.lat.to_value(u.arcmin))
+        if dx + 0.5 * footprint["width_arcmin"] <= 0.5 * width + tolerance_arcmin and \
+                dy + 0.5 * footprint["height_arcmin"] <= 0.5 * height + tolerance_arcmin:
+            area = width * height
+            if best is None or area < best[0]:
+                best = (area, path)
+    return None if best is None else best[1]
+
+
 def _polynomial_terms(x, y, order, center, half_size):
     """Polynomial terms 1, u, v, u^2, uv, v^2, ... of normalized coordinates."""
 
@@ -776,8 +812,12 @@ def acquire_template(image_records, filter_name=None, settings=None,
         mosaic = None
         for survey in surveys:
             cache_path = _template_cache_path(cache, survey, filter_name, footprint)
+            cached = _find_cached_template(cache, survey, filter_name, footprint) \
+                if subtraction.get("use_cached_templates", True) else None
+            if cached is not None:
+                cache_path = cached
             try:
-                if subtraction.get("use_cached_templates", True) and cache_path.exists():
+                if cached is not None:
                     progress("{} {} template from cache: {}".format(survey, filter_name,
                                                                     cache_path.name))
                     tiles = [read_template(cache_path, {"filter": filter_name,
@@ -821,6 +861,81 @@ def acquire_template(image_records, filter_name=None, settings=None,
     mosaic["requested_footprint"] = footprint
     mosaic.setdefault("metadata", {})["survey"] = acquisition["survey"]
     return mosaic
+
+
+def template_footprint_coverage(template, image_records, samples=60, minimum_gap_pixels=2500):
+    """Where each science frame falls on a template, and how much of it has data.
+
+    Each science frame's outline and a ``samples`` x ``samples`` grid of points
+    inside it are carried through the science WCS and the template WCS onto
+    template pixels; the coverage is the fraction of those points that land
+    on template data. Masked pixels inside the survey data (star cores) are
+    ignored: only no-data regions touching the template edge or larger than
+    ``minimum_gap_pixels`` count.
+
+    Returns
+    -------
+    list of dict
+        One entry per image: ``image_id``, ``filter``, the outline in template
+        pixels (``outline_x``, ``outline_y``) and ``coverage_fraction``
+        (``None`` when the image has no usable WCS).
+    """
+
+    wcs = template.get("wcs")
+    data = np.asarray(template.get("data"), dtype=float)
+    mask = template.get("mask")
+    valid = np.isfinite(data)
+    if mask is not None and np.shape(mask) == data.shape:
+        valid &= ~np.asarray(mask, dtype=bool)
+    # Masked pixels inside the survey data (e.g. saturated star cores) are not
+    # a footprint problem; only no-data regions that reach the edge of the
+    # template, or are large (missing survey cells), count.
+    labels, count = ndimage.label(~valid)
+    if count:
+        border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+        sizes = np.bincount(labels.ravel(), minlength=count + 1)
+        keep = sizes >= int(minimum_gap_pixels)
+        keep[border] = True
+        keep[0] = False
+        valid = ~keep[labels]
+    results = []
+    for index, record in enumerate(image_records):
+        entry = {"image_id": _image_id(record, index),
+                 "filter": normalize_filter_name((record.get("metadata") or {}).get("filter")),
+                 "outline_x": [], "outline_y": [], "coverage_fraction": None}
+        science_wcs = _record_wcs(record)
+        try:
+            shape = _record_data(record).shape
+        except ValueError:
+            shape = None
+        if wcs is None or science_wcs is None or shape is None:
+            results.append(entry)
+            continue
+        ny, nx = shape
+        edge = np.linspace(0.0, 1.0, 25)
+        outline_x = np.concatenate([edge * nx, np.full(25, nx), (1 - edge) * nx, np.zeros(25)]) - 0.5
+        outline_y = np.concatenate([np.zeros(25), edge * ny, np.full(25, ny), (1 - edge) * ny]) - 0.5
+        grid_y, grid_x = np.meshgrid(np.linspace(0, ny - 1, samples),
+                                     np.linspace(0, nx - 1, samples), indexing="ij")
+        try:
+            sky = science_wcs.pixel_to_world(np.concatenate([outline_x, grid_x.ravel()]),
+                                             np.concatenate([outline_y, grid_y.ravel()]))
+            tx, ty = wcs.world_to_pixel(sky)
+        except Exception:
+            results.append(entry)
+            continue
+        tx, ty = np.asarray(tx, dtype=float), np.asarray(ty, dtype=float)
+        count = outline_x.size
+        entry["outline_x"] = tx[:count].tolist()
+        entry["outline_y"] = ty[:count].tolist()
+        gx, gy = np.rint(tx[count:]).astype(int), np.rint(ty[count:]).astype(int)
+        inside = (gx >= 0) & (gy >= 0) & (gx < data.shape[1]) & (gy < data.shape[0]) \
+            & np.isfinite(tx[count:]) & np.isfinite(ty[count:])
+        covered = np.zeros(gx.size, dtype=bool)
+        covered[inside] = valid[gy[inside], gx[inside]]
+        entry["coverage_fraction"] = float(np.mean(covered))
+        results.append(entry)
+    return results
 
 
 def validate_template(template, image_records, settings=None, filter_name=None):
@@ -1668,8 +1783,8 @@ def evaluate_subtraction(science_record, aligned_template, difference,
     For every quality star (``quality_stars``, see :func:`_quality_positions`)
     inside an aperture of 1.5 FWHM:
 
-    * ``residual_fraction`` = |difference flux| / science flux;
-    * ``dipole_fraction`` = |first moment of the difference about the star| /
+    * ``residual_fraction`` = abs(difference flux) / science flux;
+    * ``dipole_fraction`` = abs(first moment of the difference about the star) /
       (science flux x FWHM): the misregistration between science and
       matched template in units of the FWHM (a symmetric ring from a
       seeing mismatch has no first moment). Only stars whose dipole is
@@ -1777,7 +1892,7 @@ def evaluate_subtraction(science_record, aligned_template, difference,
         blank_rms / expected_noise
         if blank_rms is not None and expected_noise not in {None, 0.0} else None
     )
-    residual = float(np.median(table["residual_fraction"])) if len(table) else None
+    residual = float(np.median([row[5] for row in rows])) if rows else None
     measured = [row for row in rows if row[7] <= noise_limit]
     dipole = float(np.median([row[6] for row in measured])) if measured else None
     flux_bias = (
@@ -2108,6 +2223,7 @@ def save_subtraction_products(result, output_directory, settings=None,
 
 
 __all__ = [
+    "template_footprint_coverage",
     "acquire_template",
     "align_template_to_science",
     "choose_hotpants_parameters",
