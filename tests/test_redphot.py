@@ -1269,7 +1269,7 @@ def test_region_figure_keeps_its_layout_and_marks_unused_lines():
     # Constrained layout really ran (the default left margin would be 0.125).
     assert min(axis.get_position().x0 for axis in figure.axes) < 0.06
     texts = [child.get_text() for axis in figure.axes for child in axis.texts]
-    assert any("columns 0–7 not used" in text for text in texts)
+    assert any("Columns 0–7 not used" in text for text in texts)
     plt.close(figure)
 
 

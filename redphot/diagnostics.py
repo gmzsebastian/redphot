@@ -295,7 +295,7 @@ def _image_subtitle(metadata):
     if metadata.get("exposure_time") is not None:
         parts.append("{} s".format(_fmt(metadata["exposure_time"], "{:g}")))
     if metadata.get("airmass") is not None:
-        parts.append("airmass {}".format(_fmt(metadata["airmass"], "{:.2f}")))
+        parts.append("Airmass {}".format(_fmt(metadata["airmass"], "{:.2f}")))
     instrument = metadata.get("instrument") or metadata.get("telescope")
     if instrument:
         parts.append(str(instrument))
@@ -479,7 +479,7 @@ def _ccd_mask(ccd, data=None):
 
 
 def overlay_pixel_mask(axis, mask, alpha=0.5, label=True, extent=None,
-                       text="masked pixels"):
+                       text="Masked pixels"):
     """Tint masked pixels in ``MASKED_COLOR`` and add a legend entry.
 
     Used on every image drawn after the masks stage, so it is always visible
@@ -504,7 +504,7 @@ def overlay_pixel_mask(axis, mask, alpha=0.5, label=True, extent=None,
                   label="{} ({:.2f}%)".format(text, 100.0 * mask.mean()))
 
 
-def mark_target(axis, x, y, radius=14, color=TEAL, label="target"):
+def mark_target(axis, x, y, radius=14, color=TEAL, label="Target"):
     """Mark a position with an open ring and four ticks (does not hide it)."""
 
     from matplotlib.patches import Circle
@@ -780,10 +780,10 @@ def _threshold_lines(axis, warn=None, fail=None, orientation="vertical"):
     draw = axis.axvline if orientation == "vertical" else axis.axhline
     if _finite(warn) is not None:
         draw(float(warn), color=STATUS_COLORS["WARN"], linestyle="--", linewidth=1.0,
-             label="warn limit")
+             label="Warn limit")
     if _finite(fail) is not None:
         draw(float(fail), color=STATUS_COLORS["FAIL"], linestyle="--", linewidth=1.0,
-             label="fail limit")
+             label="Fail limit")
 
 
 def _mosaic(cube, columns=None, gap=2, normalize=True):
@@ -845,7 +845,7 @@ def _compress_ranges(values, limit=6):
 
     values = sorted(int(value) for value in values or [])
     if not values:
-        return "none"
+        return "None"
     ranges = []
     start = previous = values[0]
     for value in values[1:]:
@@ -861,6 +861,21 @@ def _compress_ranges(values, limit=6):
     if len(ranges) > limit:
         text += " (+{} more)".format(len(ranges) - limit)
     return text
+
+
+def _source_note(metadata, field):
+    """Where a metadata value came from: the header keyword, or the input."""
+
+    source = (metadata.get("_sources") or {}).get(field) or {}
+    if metadata.get(field) in (None, ""):
+        return "Not in header or settings"
+    if source.get("keyword"):
+        return "From header ({})".format(source["keyword"])
+    if "fallback" in source:
+        return "Inferred from instrument profile (input)"
+    if "override" in source:
+        return "Set in settings (input)"
+    return None
 
 
 def _target_pixel(ccd, metadata):
@@ -880,33 +895,58 @@ def _target_pixel(ccd, metadata):
         return None, None
 
 
-def _compass(axis, ccd, length_fraction=0.09):
-    """Draw N/E arrows in the image corner from the WCS, when available."""
+def _compass(axis, ccd, length_fraction=0.12, color="lime"):
+    """Draw North/East arrows in the image corner from the WCS, when available.
+
+    The arrows and letters have a thin black outline so they stay visible on
+    both dark sky and bright stars.
+    """
+
+    import matplotlib.patheffects as effects
 
     wcs = getattr(ccd, "wcs", None)
     data = _data(ccd)
     if wcs is None or data is None:
         return
+    outline = [effects.Stroke(linewidth=3.2, foreground="black"), effects.Normal()]
     try:
-        celestial = wcs.celestial
-        ny, nx = data.shape
-        x0, y0 = 0.08 * nx, 0.08 * ny
-        sky = celestial.pixel_to_world(x0, y0)
-        step = length_fraction * min(nx, ny)
-        scale = np.mean(np.abs(np.diag(celestial.pixel_scale_matrix))) * 3600.0
         from astropy import units as u
 
+        celestial = wcs.celestial
+        ny, nx = data.shape
+        step = length_fraction * min(nx, ny)
+        # Pixel scale that also works for rotated images (the diagonal of the
+        # pixel-scale matrix goes to ~0 when the frame is rotated by ~90°).
+        from astropy.wcs.utils import proj_plane_pixel_scales
+
+        scale = float(np.mean(proj_plane_pixel_scales(celestial))) * 3600.0
+        # Arrow directions measured at the image center, then the compass is
+        # placed in the lower-left corner, shifted so both arrows (and their
+        # letters) stay inside the image whichever way East points.
+        cx, cy = nx / 2.0, ny / 2.0
+        center = celestial.pixel_to_world(cx, cy)
+        vectors = {}
         for name, offset in (("N", (0, 1)), ("E", (1, 0))):
-            moved = sky.spherical_offsets_by(
+            moved = center.spherical_offsets_by(
                 offset[0] * step * scale * u.arcsec, offset[1] * step * scale * u.arcsec
             )
-            x1, y1 = celestial.world_to_pixel(moved)
-            axis.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                          arrowprops=dict(arrowstyle="-|>", color="white",
-                                          linewidth=1.0, shrinkA=0, shrinkB=0))
-            axis.text(x1 + (x1 - x0) * 0.18, y1 + (y1 - y0) * 0.18, name,
-                      color="white", fontsize=7.5, ha="center", va="center",
-                      fontweight="bold")
+            px, py = celestial.world_to_pixel(moved)
+            vectors[name] = (float(px) - cx, float(py) - cy)
+        margin = 0.06 * min(nx, ny)
+        reach = 1.35
+        x0 = margin + max([0.0] + [-reach * dx for dx, dy in vectors.values()])
+        y0 = margin + max([0.0] + [-reach * dy for dx, dy in vectors.values()])
+        for name, (dx, dy) in vectors.items():
+            arrow = axis.annotate("", xy=(x0 + dx, y0 + dy), xytext=(x0, y0),
+                                  arrowprops=dict(arrowstyle="-|>,head_length=0.7,head_width=0.4",
+                                                  color=color, linewidth=2.0,
+                                                  shrinkA=0, shrinkB=0))
+            arrow.arrow_patch.set_path_effects(outline)
+            label = axis.text(x0 + 1.25 * dx, y0 + 1.25 * dy, name,
+                              color=color, fontsize=11, ha="center", va="center",
+                              fontweight="bold")
+            label.set_path_effects([effects.Stroke(linewidth=2.5, foreground="black"),
+                                    effects.Normal()])
     except Exception:
         return
 
@@ -1052,12 +1092,12 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
     status = status or metadata.get("metadata_status")
     figure, grid = _new_figure(
         "Read  ·  " + _image_label(metadata), _image_subtitle(metadata), status,
-        "the frame looks like reduced sky; filter, exposure, gain and saturation "
+        "The frame looks like reduced sky; filter, exposure, gain and saturation "
         "were read correctly; few non-finite pixels.",
         rows=2, columns=3, width_ratios=[1.35, 1.0, 0.95],
     )
     image_axis = figure.add_subplot(grid[:, 0])
-    show_sky(image_axis, data, "Frame as read (z-scale)")
+    show_sky(image_axis, data, "Raw Input Frame")
     nonfinite_count = None
     if data is not None:
         bad = ~np.isfinite(data)
@@ -1065,14 +1105,14 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
         overlay_mask(image_axis, bad, RED, 0.9)
         if bad.any():
             image_axis.plot([], [], "s", color=RED, markersize=6,
-                            label="non-finite values (NaN or inf): {:,} px".format(nonfinite_count))
+                            label="Non-finite values (NaN or inf): {:,} px".format(nonfinite_count))
         x, y = _target_pixel(ccd, metadata)
         mark_target(image_axis, x, y)
         _compass(image_axis, ccd)
         _image_legend(image_axis)
 
     histogram = figure.add_subplot(grid[0, 1])
-    histogram.set_title("Pixel values (log scale)")
+    histogram.set_title("Pixel values")
     values = _sample(data, 400000) if data is not None else np.array([])
     if values.size:
         saturation = _finite(metadata.get("saturation"))
@@ -1088,10 +1128,10 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
         sky, noise = _robust(values)
         if sky is not None and sky > 0:
             histogram.axvline(sky, color=INK, linewidth=1.0,
-                              label="median {:.0f}".format(sky))
+                              label="Median {:.0f}".format(sky))
         if saturation is not None:
             histogram.axvline(saturation, color=RED, linestyle="--", linewidth=1.0,
-                              label="saturation {:.0f}".format(saturation))
+                              label="Saturation {:.0f}".format(saturation))
         notes = []
         full = _data(ccd)
         if saturation is not None:
@@ -1102,8 +1142,8 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
         if notes:
             histogram.text(0.98, 0.96, "\n".join(notes), transform=histogram.transAxes,
                            ha="right", va="top", fontsize=7.5, color=MUTED)
-        histogram.set_xlabel("pixel value [{}]".format(getattr(ccd, "unit", "") or "adu"))
-        histogram.set_ylabel("pixels")
+        histogram.set_xlabel("Pixel value [{}]".format(getattr(ccd, "unit", "") or "adu"))
+        histogram.set_ylabel("Pixels")
         _legend(histogram, loc="upper left")
         _grid(histogram, "y")
     else:
@@ -1116,14 +1156,14 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
             columns = np.nanmedian(data, axis=0)
             rows = np.nanmedian(data, axis=1)
         profiles.plot(np.arange(columns.size), columns, color=BLUE, linewidth=1.0,
-                      label="column medians (vs x)")
+                      label="Column medians (vs x)")
         profiles.plot(np.arange(rows.size), rows, color=AMBER, linewidth=1.0,
-                      label="row medians (vs y)")
+                      label="Row medians (vs y)")
         center, spread = _robust(np.concatenate([columns, rows]))
         if center is not None and spread:
             profiles.set_ylim(center - 12 * spread, center + 12 * spread)
-        profiles.set_xlabel("pixel index")
-        profiles.set_ylabel("median value")
+        profiles.set_xlabel("Pixel index")
+        profiles.set_ylabel("Median value")
         _legend(profiles, loc="lower center")
         _grid(profiles)
     else:
@@ -1132,6 +1172,11 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
     table = figure.add_subplot(grid[:, 2])
     finite_fraction = _finite(metadata.get("finite_fraction"))
     rows = [
+        ("Telescope", metadata.get("telescope") or "—", None, _source_note(metadata, "telescope")),
+        ("Instrument", metadata.get("instrument") or "—", None, _source_note(metadata, "instrument")),
+        ("Detector", metadata.get("detector") or "—", None, _source_note(metadata, "detector")),
+        ("Site", metadata.get("site") or "—", None, _source_note(metadata, "site")),
+        (None, None, None),
         ("Object", metadata.get("object") or "—", None),
         ("Filter", metadata.get("filter") or "—",
          None if metadata.get("filter") else "FAIL"),
@@ -1142,12 +1187,12 @@ def plot_read_diagnostics(ccd, metadata, output_path=None, show=False, status=No
         ("Gain", _fmt(metadata.get("gain"), "{:.3g}", "e⁻/adu"), None),
         ("Read noise", _fmt(metadata.get("read_noise"), "{:.3g}", "e⁻"), None),
         ("Saturation", _fmt(metadata.get("saturation"), "{:.0f}"), None,
-         "default (no header keyword)"
+         "Default (no header keyword)"
          if "fallback" in ((metadata.get("_sources") or {}).get("saturation") or {}) else None),
         ("Pixel scale", _fmt(metadata.get("pixel_scale"), "{:.3f}", "″/px"), None),
         ("Image size", "{} × {}".format(metadata.get("shape_x", "—"), metadata.get("shape_y", "—")), None),
         ("Data HDU", str(metadata.get("data_hdu", "—")), None),
-        ("WCS", "valid" if metadata.get("wcs_valid") else "missing",
+        ("WCS", "Valid" if metadata.get("wcs_valid") else "Missing",
          "PASS" if metadata.get("wcs_valid") else "WARN"),
         ("Finite pixels", _fmt(None if finite_fraction is None else 100 * finite_fraction, "{:.2f}", "%"),
          _check_status(finite_fraction, 0.99, 0.90, "low")),
@@ -1181,7 +1226,7 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
     status = status or ("WARN" if flags else "PASS")
     figure, grid = _new_figure(
         "Region  ·  " + _image_label(metadata), _image_subtitle(metadata), status,
-        "red/amber (hatched) pixels are not used: they should be only overscan, "
+        "Red (hatched) pixels are excluded: they should be only overscan, "
         "blank, damaged or ramped edges; the violet box is the frame every later "
         "stage works on.",
         rows=2, columns=3, width_ratios=[1.35, 1.0, 0.95],
@@ -1201,9 +1246,8 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
             x0, x1, y0, y1 = bounds
             outside[:] = True
             outside[y0:y1, x0:x1] = False
-        trimmed = ~valid & ~outside
-        overlay_mask(image_axis, outside, RED, 0.55)
-        overlay_mask(image_axis, trimmed, AMBER, 0.6)
+        excluded = ~valid | outside
+        overlay_mask(image_axis, excluded, RED, 0.55)
         # Whole unused columns and rows can be a few pixels wide; outline them
         # with hatched boxes so they are visible at any zoom.
         unused_columns = ~np.any(valid, axis=0)
@@ -1223,7 +1267,7 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
         callouts += [("rows", start, stop, (nx * 0.3, (start + stop) / 2.0))
                      for start, stop in _runs(unused_rows)]
         for name, start, stop, (px, py) in callouts[:6]:
-            text = "{} {} not used".format(name if stop > start else name[:-1],
+            text = "{} {} not used".format((name if stop > start else name[:-1]).capitalize(),
                                            "{}–{}".format(start, stop) if stop > start else start)
             tx = px + (0.12 * nx if px < nx / 2 else -0.12 * nx) if name == "columns" else px
             ty = py + (0.08 * ny if py < ny / 2 else -0.08 * ny) if name == "rows" else py
@@ -1233,12 +1277,8 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
                                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
                                           edgecolor=RED, linewidth=0.8, alpha=0.95),
                                 arrowprops=dict(arrowstyle="-|>", color=RED, linewidth=1.0))
-        if outside.any():
-            image_axis.plot([], [], "s", color=RED, markersize=7,
-                            label="not used: outside {} ({:,} px)".format(keyword, int(outside.sum())))
-        if trimmed.any():
-            image_axis.plot([], [], "s", color=AMBER, markersize=7,
-                            label="not used: edge trim / NaN ({:,} px)".format(int(trimmed.sum())))
+        if excluded.any():
+            image_axis.plot([], [], "s", color=RED, markersize=7, label="Excluded (data trim)")
     if bounds and section.get("applied"):
         x0, x1, y0, y1 = bounds
         image_axis.add_patch(Rectangle((x0 - 0.5, y0 - 0.5), x1 - x0, y1 - y0,
@@ -1251,7 +1291,7 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
         crop_applied = (region.get("crop") or {}).get("applied")
         image_axis.add_patch(Rectangle((x0 - 0.5, y0 - 0.5), x1 - x0, y1 - y0,
                                        fill=False, edgecolor=VIOLET, linewidth=1.4,
-                                       label="working frame ({}×{} px{})".format(
+                                       label="Working frame ({}×{} px{})".format(
                                            x1 - x0, y1 - y0,
                                            ", cropped" if crop_applied else "")))
     tx, ty = region.get("target_x"), region.get("target_y")
@@ -1264,7 +1304,7 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
     for index, (axis_name, label) in enumerate((("x", "column"), ("y", "row"))):
         cell = grid[index, 1].subgridspec(2, 2, height_ratios=[2.0, 1.0])
         axis = figure.add_subplot(cell[0, :])
-        axis.set_title("Median level of each {} (edge check)".format(label))
+        axis.set_title("Median level of each {}".format(label))
         if data is None:
             _empty(axis, "Not available")
             continue
@@ -1284,11 +1324,11 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
             section_pair = (bounds[0], bounds[1]) if axis_name == "x" else (bounds[2], bounds[3])
         _edge_profile(axis, profile, unused, low, high, section_pair, legend=True)
         axis.set_xlabel("{} [pixel]".format(axis_name))
-        axis.set_ylabel("median value")
+        axis.set_ylabel("Median value")
         # Close-ups of the two ends, where unused lines are only a few pixels wide.
         width = int(max(30, 4 * max([stop - start + 1 for start, stop in _runs(unused)] or [0])))
-        for column, (start, stop, side) in enumerate(((0, width, "first"),
-                                                      (profile.size - width, profile.size, "last"))):
+        for column, (start, stop, side) in enumerate(((0, width, "First"),
+                                                      (profile.size - width, profile.size, "Last"))):
             zoom = figure.add_subplot(cell[1, column])
             zoom.set_title("{} {} {}s".format(side, width, label), fontsize=8.5)
             _edge_profile(zoom, profile, unused, low, high, section_pair,
@@ -1297,37 +1337,30 @@ def plot_region_diagnostics(ccd, region, diagnostics=None, metadata=None,
     table = figure.add_subplot(grid[:, 2])
     valid_fraction = _finite(region.get("valid_fraction_full"))
     trimmed = ", ".join(
-        "{} {}".format(side, edges.get(side, 0))
+        "{} {}".format(side.capitalize(), edges.get(side, 0))
         for side in ("bottom", "top", "left", "right") if edges.get(side)
-    ) or "none"
-    outside = ", ".join(
-        "{} {}".format(side, edges.get(side + "_outside_section"))
-        for side in ("bottom", "top", "left", "right")
-        if edges.get(side + "_outside_section")
-    ) or "none"
+    ) or "None"
     crop = region.get("crop") or {}
     level = ", ".join(
-        "{} {}".format(side, edges.get(side + "_level"))
+        "{} {}".format(side.capitalize(), edges.get(side + "_level"))
         for side in ("bottom", "top", "left", "right") if edges.get(side + "_level")
-    ) or "none"
+    ) or "None"
     working_shape = crop.get("shape")
     rows = [
         ("Usable fraction of frame", _fmt(None if valid_fraction is None else 100 * valid_fraction, "{:.1f}", "%"),
          _check_status(valid_fraction, 0.80, 0.50, "low")),
-        ("Header section", "{} {}".format(section.get("keyword") or "", bounds or "").strip() or "none", None),
+        ("Header section", "{} {}".format(section.get("keyword") or "", bounds or "").strip() or "None", None),
         ("Unused columns", _compress_ranges(np.flatnonzero(unused_columns).tolist()), None),
         ("Unused rows", _compress_ranges(np.flatnonzero(unused_rows).tolist()), None),
-        ("Lines outside section", outside, None),
-        ("Bad edge lines trimmed", trimmed, "WARN" if trimmed != "none" else "PASS"),
+        ("Bad edge lines trimmed", trimmed, "WARN" if trimmed != "None" else "PASS"),
         ("Edge lines with a different sky level", level, None,
-         "trimmed: level differs from the band inside by > {:g}σ".format(
+         "Trimmed: level differs from the band inside by > {:g}σ".format(
              edges["level_sigma_limit"]) if edges.get("level_sigma_limit") else None),
         ("Uniform border crop", _fmt(region.get("edge_crop_pixels"), "{:g}", "px"), None),
-        ("Processing crop", "applied" if crop.get("applied") else str(crop.get("reason") or "none"), None),
         ("Working frame", "{}×{} px".format(working_shape[1], working_shape[0])
-         if working_shape else "full frame", None,
-         "cut to the usable area" if crop.get("trimmed_to_valid") else None),
-        ("Target inside", "yes" if region.get("target_inside") else "no",
+         if working_shape else "Full frame", None,
+         "Cut to the usable area" if crop.get("trimmed_to_valid") else None),
+        ("Target inside", "Yes" if region.get("target_inside") else "No",
          "PASS" if region.get("target_inside") else "FAIL"),
         ("Target to edge", _fmt(region.get("target_edge_distance_pixels"), "{:.0f}", "px"), None),
     ]
@@ -1356,15 +1389,15 @@ def _edge_profile(axis, profile, unused, low, high, section_pair=None, window=No
         local = used_values[np.isfinite(used_values)]
         pad = max(0.15 * (local.max() - local.min()), 1e-3 * abs(np.median(local)) + 1e-6)
         low, high = local.min() - pad, local.max() + pad
-    axis.plot(positions, used_values, color=BLUE, linewidth=1.0, label="used")
+    axis.plot(positions, used_values, color=BLUE, linewidth=1.0, label="Used")
     if hidden.any():
         clipped = np.clip(np.where(hidden, values, np.nan), low, high)
         off_scale = hidden & ((values < low) | (values > high) | ~np.isfinite(values))
         axis.plot(positions[hidden], clipped[hidden], ".", color=FAINT, markersize=3,
-                  label="not used")
+                  label="Not used")
         if off_scale.any():
             axis.plot(positions[off_scale], np.full(int(off_scale.sum()), high), "^",
-                      color=RED, markersize=4, label="not used, off scale")
+                      color=RED, markersize=4, label="Not used, off scale")
         for start, stop in _runs(hidden):
             axis.axvspan(first + start - 0.5, first + stop + 0.5, facecolor=RED, alpha=0.2,
                          edgecolor=RED, hatch="////", linewidth=0)
