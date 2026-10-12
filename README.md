@@ -58,24 +58,29 @@ state, context = run_batch(
 
 ## Step by step
 
-`redphot.steps` runs one step at a time, so each step's plots can be checked
-before going on, and changes a step's settings by name for chosen images:
+`redphot.steps` has one function per step, named after the step and its
+number like its folder of plots in `diagnostics/` (`read_01`, `region_02`,
+`masks_03`, ... `outputs_19`). Run them one at a time, so each step's plots
+can be checked before going on, and change a step's settings by name for
+chosen images:
 
 ```python
-from redphot.steps import start_run, run_step, rerun_from, show_parameters
+from redphot.steps import start_run, read_01, region_02, background_06, star_selection_09
 
-state, context = start_run("data/*.fits", "AT2024rmj_redphot", target=target)
-run_step(state, context, 1)                    # read; then 2, 3, ... 19
-run_step(state, context, 6, images=[3], box_size=[64, 64])   # redo step 6 for image 3
-show_parameters(9)                             # settings of step 9 and their values
+run = start_run("data/*.fits", "AT2024rmj_redphot", target=target)
+read_01(run)
+region_02(run)                                 # ... and so on to outputs_19(run)
+background_06(run, images=[3], box_size=[64, 64])   # redo step 6 for image 3
+help(star_selection_09)                        # settings of step 9 and their defaults
 ```
 
 After a run (all in one or step by step), change a setting of one step for
-some images and continue from that step; steps before it are not redone, and
-later steps are redone only for images whose results change:
+some images and redo the later steps with `redo_later=True`; steps before it
+are not redone, and later steps are redone only for images whose results
+change:
 
 ```python
-rerun_from(state, context, 9, images=[3, 7], minimum_snr=20)
+star_selection_09(run, images=[3, 7], minimum_snr=20, redo_later=True)
 ```
 
 `docs/tutorials/step_by_step.rst` explains every step, what to look at and
@@ -105,7 +110,7 @@ Every stage writes plots and a `summary.csv` to
 be checked before continuing (see `docs/outputs.rst`).
 
 Runs can be resumed with `resume_pipeline("AT2024rmj_redphot")`. Configuration
-changes made with `set_image_overrides` (or `redphot.steps`) mark only the
+changes made with `set_image_overrides` (or the step functions) mark only the
 first stage that reads the changed setting and what follows it stale.
 
 ## Output size

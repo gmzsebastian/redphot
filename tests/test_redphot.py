@@ -1852,12 +1852,35 @@ def test_stages_know_which_settings_they_read():
     assert stage_reads_setting("astrometry", "catalogs.search_radius_arcmin")
 
 
+def test_every_step_has_a_function_named_after_it():
+    import redphot.steps as steps
+    from redphot.pipeline import pipeline_stage_names
+
+    names = pipeline_stage_names()
+    assert [function.stage for function in steps.STEPS] == names
+    for number, (name, function) in enumerate(zip(names, steps.STEPS), 1):
+        # The name is the step and its number, as in its diagnostics folder.
+        assert function.__name__ == "{}_{:02d}".format(name, number)
+        assert getattr(steps, function.__name__) is function
+        assert function.__name__ in steps.__all__
+        assert function.__doc__.startswith("Step {}:".format(number))
+    assert steps.background_06.__name__ == "background_06"
+    assert "box_size" in steps.background_06.__doc__
+    assert steps.step_name(steps.psf_12) == "psf"
+    assert steps.step_name("star_selection_09") == "star_selection"
+    assert steps.function_name(9) == "star_selection_09"
+    with pytest.raises(TypeError, match="run = start_run"):
+        steps.read_01({"images": {}}, {})
+
+
 def test_step_parameters_are_found_by_name():
-    from redphot.steps import find_setting, step_name, step_overrides
+    from redphot.steps import find_setting, star_selection_09, step_name, step_overrides
 
     assert step_name(9) == "star_selection"
     assert step_name("09_star_selection") == "star_selection"
     assert step_name("sources") == "source_quality"
+    assert find_setting(star_selection_09, "minimum_snr") == (
+        "catalogs.comparison_stars.minimum_snr")
     assert find_setting(9, "minimum_snr") == "catalogs.comparison_stars.minimum_snr"
     assert find_setting(9, "maximum_stars") == "psf.maximum_stars"
     assert find_setting("cosmic_rays", "enabled") == "masks.cosmic_rays.enabled"
@@ -1924,9 +1947,10 @@ def _per_image_functions():
     return functions
 
 
-def test_rerun_from_changes_only_the_selected_images(tmp_path, monkeypatch, capsys):
+def test_redo_later_changes_only_the_selected_images(tmp_path, monkeypatch, capsys):
     import redphot.pipeline as pipeline
-    from redphot.steps import rerun_from, run_step, start_run
+    from redphot.steps import (Run, alignment_11, background_06, star_selection_09,
+                               start_run)
 
     functions = _per_image_functions()
     monkeypatch.setattr(pipeline, "_default_stage_functions", lambda: dict(functions))
@@ -1934,7 +1958,8 @@ def test_rerun_from_changes_only_the_selected_images(tmp_path, monkeypatch, caps
     for name in ("one.fits", "two.fits", "three.fits"):
         _write_lco(tmp_path / name)
         files.append(tmp_path / name)
-    state, context = start_run(files, tmp_path / "run", settings=NO_PLOTS)
+    run = start_run(files, tmp_path / "run", settings=NO_PLOTS)
+    state, context = run
     pipeline.run_pipeline_through(state, context)
     one, two, three = "one.fits", "two.fits", "three.fits"
     assert list(state["images"]) == [one, three, two]  # sorted by name
@@ -1942,7 +1967,7 @@ def test_rerun_from_changes_only_the_selected_images(tmp_path, monkeypatch, caps
     before = dict(calls)
 
     # Step 9 with a new comparison-star cut for image two only (number 3).
-    rerun_from(state, context, 9, images=[3], minimum_snr=20)
+    star_selection_09(run, images=[3], minimum_snr=20, redo_later=True)
     assert state["images"][two]["overrides"] == {
         "catalogs": {"comparison_stars": {"minimum_snr": 20}}}
     assert state["images"][one]["overrides"] == {}
@@ -1963,20 +1988,33 @@ def test_rerun_from_changes_only_the_selected_images(tmp_path, monkeypatch, caps
     pipeline.refresh_pipeline_staleness(state, context)
     pipeline.run_pipeline_through(state, context)
     assert context["shared"]["calls"] == before
+    run = Run(state, context)
 
     # One image step with a changed setting runs only for that image.
     calls = context["shared"]["calls"]
     before = dict(calls)
-    run_step(state, context, "background", images="two", box_size=[64, 64])
+    background_06(run, images="two", box_size=[64, 64])
     assert {key for key in calls if calls[key] != before.get(key)} == {two + ":background"}
     assert state["images"][two]["stages"]["astrometry"]["status"] == "STALE"
     assert state["images"][one]["stages"]["astrometry"]["status"] == "PASS"
     assert state["batch_stages"]["star_selection"]["status"] == "STALE"
-    assert "out of date now" in capsys.readouterr().out
+    assert "out of date now: source_quality_07 and later steps" in capsys.readouterr().out
+
+    # A later change with redo_later first brings image two's steps 7-8 up to
+    # date instead of going on from step 9 with them out of date.
+    before = dict(calls)
+    star_selection_09(run, images=[1], minimum_snr=15, redo_later=True)
+    assert "source_quality_07 is out of date" in capsys.readouterr().out
+    changed = {key for key in calls if calls[key] != before.get(key)}
+    assert {two + ":source_quality", two + ":astrometry"} <= changed
+    assert one + ":source_quality" not in changed
+    assert not any(entry.get("status") == "STALE"
+                   for image in state["images"].values()
+                   for entry in image["stages"].values())
 
     # Settings of steps that use one value for all images cannot be per image.
-    with pytest.raises(ValueError, match="same settings for every image"):
-        run_step(state, context, "alignment", images=[1], relative_alignment_sigma_clip=4.0)
+    with pytest.raises(ValueError, match="alignment_11 uses the same settings"):
+        alignment_11(run, images=[1], relative_alignment_sigma_clip=4.0)
 
 
 def test_reloaded_run_keeps_the_image_order(tmp_path):

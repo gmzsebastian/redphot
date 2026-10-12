@@ -50,7 +50,9 @@ Resume marks products stale
 This is expected after an input timestamp/size, relevant setting, dependency,
 or review decision changes. Each stage depends only on the settings it reads,
 so a change marks stale the first stage that reads it and what follows.
-``redphot.steps.rerun_from`` (or ``rerun_image``) rebuilds from there. A
+A step function with ``redo_later=True`` (for example
+``background_06(run, redo_later=True)``), or ``rerun_image``, rebuilds from
+there. A
 missing checkpoint also marks completed work stale because arrays cannot be
 recovered safely from JSON alone.
 

@@ -6,8 +6,9 @@ can be mixed:
 
 * **All in one**: :func:`redphot.pipeline.run_batch` runs every step on every
   image in one call (below).
-* **Step by step**: :mod:`redphot.steps` runs one step at a time so each
-  step's plots can be checked first (see :doc:`step_by_step`).
+* **Step by step**: :mod:`redphot.steps` has one function per step
+  (``read_01``, ``region_02``, ... ``outputs_19``) to run one step at a time,
+  so each step's plots can be checked first (see :doc:`step_by_step`).
 
 Either way, a setting of any step can be changed afterwards for some images
 (or all) and the run continued from that step; see
@@ -70,12 +71,11 @@ faint comparison stars:
 
 .. code-block:: python
 
-   from redphot.pipeline import load_pipeline_state
-   from redphot.steps import list_images, rerun_from
+   from redphot.steps import start_run, list_images, star_selection_09
 
-   state, context = load_pipeline_state(RUN_DIR)   # not needed if the run is still open
-   list_images(state, context)                     # the image numbers
-   rerun_from(state, context, 9, images=[3, 7], minimum_snr=20)
+   run = start_run(INPUT_DIR, RUN_DIR)       # reopens the saved run; not needed if it is open
+   list_images(run)                          # the image numbers
+   star_selection_09(run, images=[3, 7], minimum_snr=20, redo_later=True)
 
 This
 
@@ -83,7 +83,7 @@ This
   only (the other images keep 10);
 * does not redo steps 1-8 for any image;
 * redoes step 9 and every later step up to the last step the run had reached
-  (``through=`` stops earlier, e.g. ``through=12``).
+  (``redo_later=psf_12`` stops at step 12 instead).
 
 Steps 9, 10, 11, 14, 15, 18 and 19 work on all images together, so they run
 again for the whole batch, but each image's own selection uses its own
@@ -99,33 +99,33 @@ forced photometry by about 10⁻⁴ mag in 1-2 arcsec seeing; 0 compares it
 exactly) of the position the kept images were measured at.
 
 The keyword is the setting's name, without its section;
-``show_parameters(9)`` lists every setting of step 9. Without ``images=`` the
-change applies to every image:
+``help(star_selection_09)`` lists every setting of step 9 with its default, and
+``show_parameters(star_selection_09, run)`` with its value in this run. Without
+``images=`` the change applies to every image:
 
 .. code-block:: python
 
-   rerun_from(state, context, 9, minimum_snr=20)        # all images
-   rerun_from(state, context, 16, images=[11], kernel_order=0)
-   rerun_from(state, context, 6, images="aa0629", box_size=[64, 64], through=8)
+   star_selection_09(run, minimum_snr=20, redo_later=True)          # all images
+   subtraction_16(run, images=[11], kernel_order=0, redo_later=True)
+   background_06(run, images="aa0629", box_size=[64, 64], redo_later=astrometry_08)
 
 Settings of alignment (11), templates (15), batch consistency (18) and outputs
 (19) are the same for all images, so they are changed without ``images=``.
 
-To run only the step that changed and look at it before continuing, use
-:func:`~redphot.steps.run_step` with the same arguments; later steps of the
-changed images are then marked out of date (``~`` in
-``show_status(state)``) until they are run:
+To run only the step that changed and look at it before continuing, leave out
+``redo_later``; later steps of the changed images are then marked out of date
+(``~`` in ``show_status(run)``) until they are run:
 
 .. code-block:: python
 
-   from redphot.steps import run_step, show_status
+   from redphot.steps import show_status, usability_10
 
-   run_step(state, context, 9, images=[3, 7], minimum_snr=20)
-   show_status(state)
-   rerun_from(state, context, 10)        # continue from step 10 with no change
+   star_selection_09(run, images=[3, 7], minimum_snr=20)
+   show_status(run)
+   usability_10(run, redo_later=True)    # continue from step 10 with no change
 
-Changes are saved with the run: reopening it later (``load_pipeline_state`` or
-``start_run``) keeps them, and each image's changes are listed under
+Changes are saved with the run: reopening it later (``start_run`` or
+``load_pipeline_state``) keeps them, and each image's changes are listed under
 ``"overrides"`` in ``pipeline_state.json``.
 
 Dropping an image by hand
@@ -133,13 +133,14 @@ Dropping an image by hand
 
 .. code-block:: python
 
-   from redphot.steps import keep_images, reject_images
+   from redphot.steps import alignment_11, keep_images, reject_images
 
-   reject_images(state, context, [4], note="thin clouds")
-   rerun_from(state, context, 11)
-   keep_images(state, context, [4])      # undo
+   reject_images(run, [4], note="thin clouds")
+   alignment_11(run, redo_later=True)
+   keep_images(run, [4])                 # undo
 
-The image is dropped at the latest gate it reached (usability or PSF), keeps
+The image is dropped at the latest gate it reached (``usability_10`` or
+``psf_12``), keeps
 everything computed before, and is skipped by later steps.
 :func:`redphot.pipeline.review_image` does the same for one image and one gate.
 
@@ -181,7 +182,8 @@ Lower-level control
 -------------------
 
 :mod:`redphot.steps` is built on these functions of :mod:`redphot.pipeline`,
-which take stage names and nested settings:
+which take stage names, nested settings, and the ``state, context`` that a
+step-by-step ``run`` holds (``state, context = run``):
 
 .. code-block:: python
 

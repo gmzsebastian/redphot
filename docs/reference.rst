@@ -16,10 +16,11 @@ Pipeline functions
 runs exactly one stage, while ``run_pipeline_through`` runs through a selected
 stage. ``resume_pipeline`` continues a saved run. ``review_image``,
 ``set_image_overrides``, and ``rerun_image`` support review and correction.
-``redphot.steps`` wraps these for interactive use: ``start_run``,
-``run_step`` (one step, settings by name, ``images=``), ``rerun_from``
-(change a step and continue), ``show_parameters``, ``show_status``,
-``reject_images`` and ``keep_images``.
+``redphot.steps`` wraps these for interactive use: ``start_run`` (returns the
+run), one function per step named after the step and its number
+(``read_01`` ... ``outputs_19``; settings by name, ``images=``, and
+``redo_later=True`` to change a step and continue), ``show_parameters``,
+``show_status``, ``reject_images`` and ``keep_images``.
 
 States
 ------

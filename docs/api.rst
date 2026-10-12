@@ -4,7 +4,8 @@ Function API
 RedPhot intentionally exposes functions from their defining modules rather
 than building a large top-level namespace. The most useful entry points are
 ``redphot.pipeline.run_batch`` (everything in one call) and ``redphot.steps``
-(one step at a time, and changing a step for chosen images); lower-level
+(one function per step, ``read_01`` ... ``outputs_19``, and changing a step for
+chosen images); lower-level
 functions support interactive review and custom workflows.
 
 Step by step

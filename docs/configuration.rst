@@ -152,15 +152,14 @@ Call ``validate_settings(settings)`` after constructing settings manually.
 Changing a running image
 ------------------------
 
-``redphot.steps.run_step`` and ``rerun_from`` change a setting by name for
-chosen images (see :ref:`change-one-setting`):
+The step functions of ``redphot.steps`` change a setting by name for chosen
+images (see :ref:`change-one-setting`):
 
 .. code-block:: python
 
-   from redphot.steps import rerun_from
+   from redphot.steps import background_06
 
-   rerun_from(state, context, "background", images="difficult_epoch",
-              box_size=[96, 96])
+   background_06(run, images="difficult_epoch", box_size=[96, 96], redo_later=True)
 
 With nested settings, ``set_image_overrides`` does the same for one image. The
 controller stores the change and marks the first stage that reads it, and the
