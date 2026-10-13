@@ -747,6 +747,10 @@ def _step_docstring(stage):
         "editing the RedPhot code).",
         "settings : dict, optional",
         "    Nested settings to change, for names that are ambiguous.",
+    ]
+    for name, description in EXTRA_PARAMETERS.get(stage, []):
+        lines += [name, "    " + description]
+    lines += [
         "**parameters",
         "    Settings of this step by name, ``name=value``; see Other Parameters.",
         "",
@@ -765,42 +769,217 @@ def _step_docstring(stage):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _step_function(stage):
-    """The function that runs one step, e.g. ``background_06``."""
+# Extra keyword parameters of some step functions (beyond the settings).
+EXTRA_PARAMETERS = {
+    "subtraction": [
+        ("save_subtraction : bool, optional",
+         "Also write the science image, the template as subtracted (convolved and "
+         "scaled to the science image) and the difference image of each image as FITS "
+         "files to ``<run_directory>/diagnostics/16_subtraction/fits/``, to blink "
+         "them in DS9. Writing them does not redo the subtraction."),
+    ],
+}
 
-    def step(run, images=None, *, redo_later=False, force=False, settings=None,
-             **parameters):
-        run_step(run, stage, images, redo_later=redo_later, force=force,
-                 settings=settings, **parameters)
 
-    step.__name__ = step.__qualname__ = function_name(stage)
-    step.__module__ = __name__
-    step.__doc__ = _step_docstring(stage)
-    step.stage = stage
-    return step
+def _step(function):
+    """Make ``function`` a step function: the step comes from its name
+    (``background_06`` is step 6, background) and the help text lists the
+    settings of the step with their defaults."""
+
+    stage = step_name(function.__name__)
+    if function.__name__ != function_name(stage):
+        raise ValueError("{} is not named after its step".format(function.__name__))
+    function.stage = stage
+    function.__doc__ = _step_docstring(stage)
+    return function
 
 
 # One function per step, named after the step and its number (the same as the
-# step's folder in diagnostics/).
-read_01 = _step_function("read")
-region_02 = _step_function("region")
-masks_03 = _step_function("masks")
-cosmic_rays_04 = _step_function("cosmic_rays")
-fringe_05 = _step_function("fringe")
-background_06 = _step_function("background")
-source_quality_07 = _step_function("source_quality")
-astrometry_08 = _step_function("astrometry")
-star_selection_09 = _step_function("star_selection")
-usability_10 = _step_function("usability")
-alignment_11 = _step_function("alignment")
-psf_12 = _step_function("psf")
-science_photometry_13 = _step_function("science_photometry")
-calibration_14 = _step_function("calibration")
-templates_15 = _step_function("templates")
-subtraction_16 = _step_function("subtraction")
-difference_photometry_17 = _step_function("difference_photometry")
-batch_consistency_18 = _step_function("batch_consistency")
-outputs_19 = _step_function("outputs")
+# step's folder in diagnostics/). Each one runs its step through run_step, so
+# they all take the same arguments; help(<function>) lists the settings.
+@_step
+def read_01(run, images=None, *, redo_later=False, force=False, settings=None, **parameters):
+    run_step(run, "read", images, redo_later=redo_later, force=force, settings=settings,
+             **parameters)
+
+
+@_step
+def region_02(run, images=None, *, redo_later=False, force=False, settings=None,
+              **parameters):
+    run_step(run, "region", images, redo_later=redo_later, force=force, settings=settings,
+             **parameters)
+
+
+@_step
+def masks_03(run, images=None, *, redo_later=False, force=False, settings=None,
+             **parameters):
+    run_step(run, "masks", images, redo_later=redo_later, force=force, settings=settings,
+             **parameters)
+
+
+@_step
+def cosmic_rays_04(run, images=None, *, redo_later=False, force=False, settings=None,
+                   **parameters):
+    run_step(run, "cosmic_rays", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def fringe_05(run, images=None, *, redo_later=False, force=False, settings=None,
+              **parameters):
+    run_step(run, "fringe", images, redo_later=redo_later, force=force, settings=settings,
+             **parameters)
+
+
+@_step
+def background_06(run, images=None, *, redo_later=False, force=False, settings=None,
+                  **parameters):
+    run_step(run, "background", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def source_quality_07(run, images=None, *, redo_later=False, force=False, settings=None,
+                      **parameters):
+    run_step(run, "source_quality", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def astrometry_08(run, images=None, *, redo_later=False, force=False, settings=None,
+                  **parameters):
+    run_step(run, "astrometry", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def star_selection_09(run, images=None, *, redo_later=False, force=False, settings=None,
+                      **parameters):
+    run_step(run, "star_selection", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def usability_10(run, images=None, *, redo_later=False, force=False, settings=None,
+                 **parameters):
+    run_step(run, "usability", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def alignment_11(run, images=None, *, redo_later=False, force=False, settings=None,
+                 **parameters):
+    run_step(run, "alignment", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def psf_12(run, images=None, *, redo_later=False, force=False, settings=None, **parameters):
+    run_step(run, "psf", images, redo_later=redo_later, force=force, settings=settings,
+             **parameters)
+
+
+@_step
+def science_photometry_13(run, images=None, *, redo_later=False, force=False, settings=None,
+                          **parameters):
+    run_step(run, "science_photometry", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def calibration_14(run, images=None, *, redo_later=False, force=False, settings=None,
+                   **parameters):
+    run_step(run, "calibration", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def templates_15(run, images=None, *, redo_later=False, force=False, settings=None,
+                 **parameters):
+    run_step(run, "templates", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def subtraction_16(run, images=None, *, redo_later=False, force=False, settings=None,
+                   save_subtraction=False, **parameters):
+    run_step(run, "subtraction", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+    if save_subtraction:
+        save_subtraction_images(run, images)
+
+
+@_step
+def difference_photometry_17(run, images=None, *, redo_later=False, force=False,
+                             settings=None, **parameters):
+    run_step(run, "difference_photometry", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def batch_consistency_18(run, images=None, *, redo_later=False, force=False, settings=None,
+                         **parameters):
+    run_step(run, "batch_consistency", images, redo_later=redo_later, force=force,
+             settings=settings, **parameters)
+
+
+@_step
+def outputs_19(run, images=None, *, redo_later=False, force=False, settings=None,
+               **parameters):
+    run_step(run, "outputs", images, redo_later=redo_later, force=force, settings=settings,
+             **parameters)
+
+
+def save_subtraction_images(run, images=None):
+    """Write the subtraction of each image as FITS files to look at by hand.
+
+    For every image (or the ``images`` given) whose subtraction ran, writes
+    ``<stem>_science.fits``, ``<stem>_template.fits`` (the template as it was
+    subtracted: on the science grid, convolved and scaled to the science
+    image, i.e. science - difference) and ``<stem>_difference.fits``, all
+    with the science WCS, to ``<run_directory>/diagnostics/16_subtraction/fits/``.
+    Load the three in DS9 frames (locked by WCS) and blink them. Returns the
+    folder.
+    """
+
+    import numpy as np
+    from astropy.io import fits
+
+    from .stage_reports import image_file_stem, stage_directory
+    from .subtraction import _record_data, _record_wcs
+
+    state, context = _as_run(run)
+    folder = stage_directory(state, "subtraction") / "fits"
+    written = 0
+    for image_id in _image_ids(state, images):
+        image = context["images"][image_id]
+        result = (image.get("products") or {}).get("subtraction") or {}
+        difference = result.get("difference")
+        if difference is None:
+            continue
+        record = image["record"]
+        science = np.asarray(_record_data(record), dtype=np.float32)
+        difference = np.asarray(difference, dtype=np.float32)
+        wcs = _record_wcs(record)
+        header = wcs.to_header(relax=True) if wcs is not None else fits.Header()
+        header["OBJECT"] = str((record.get("metadata") or {}).get("object") or "")
+        header["SUBSTAT"] = str(result.get("status", ""))
+        header["SUBMETH"] = str(result.get("method", ""))
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = image_file_stem(image_id)
+        for suffix, data, what in (
+                ("science", science, "science image (background subtracted)"),
+                ("template", science - difference,
+                 "template as subtracted (science - difference)"),
+                ("difference", difference, "difference image")):
+            header["CONTENT"] = what
+            fits.PrimaryHDU(data, header).writeto(folder / "{}_{}.fits".format(stem, suffix),
+                                                  overwrite=True)
+        written += 1
+    print("Saved the subtraction of {} image(s) (science, template, difference) to {}".format(
+        written, folder))
+    return folder
+
 
 #: The 19 step functions in order.
 STEPS = (read_01, region_02, masks_03, cosmic_rays_04, fringe_05, background_06,
@@ -945,6 +1124,7 @@ __all__ = [
     "keep_images",
     "run_step",
     "report",
+    "save_subtraction_images",
     "image_ids",
     "find_setting",
     "step_name",

@@ -197,6 +197,7 @@ def metric_specs(stage, settings):
 
     quality = settings.get("image_quality", {})
     astrometry = settings.get("astrometry", {})
+    calibration = settings.get("calibration", {})
     specs = {
         "read": [
             {"key": "sky_median", "label": "Sky level", "spec": "{:.0f}", "unit_key": "sky_unit"},
@@ -242,6 +243,8 @@ def metric_specs(stage, settings):
             {"key": "rms_arcsec", "label": "WCS RMS", "unit": "arcsec", "spec": "{:.3f}",
              "warn": astrometry.get("target_rms_arcsec"),
              "fail": astrometry.get("warning_rms_arcsec")},
+            {"key": "rms_without_distortion_arcsec", "label": "RMS without distortion",
+             "unit": "arcsec", "spec": "{:.3f}"},
             {"key": "inliers", "label": "Matched stars", "spec": "{:.0f}"},
         ],
         "star_selection": [
@@ -278,8 +281,10 @@ def metric_specs(stage, settings):
         "calibration": [
             {"key": "zeropoint_mag", "label": "Zeropoint (PSF)", "unit": "mag", "spec": "{:.3f}"},
             {"key": "zeropoint_scatter_mag", "label": "Star scatter", "unit": "mag",
-             "spec": "{:.3f}"},
-            {"key": "stars", "label": "Calibration stars", "spec": "{:.0f}"},
+             "spec": "{:.3f}", "warn": calibration.get("zeropoint_scatter_warn_mag", 0.10),
+             "fail": calibration.get("zeropoint_scatter_fail_mag", 0.30)},
+            {"key": "stars", "label": "Calibration stars", "spec": "{:.0f}",
+             "fail": calibration.get("minimum_stars", 3), "direction": "low"},
             {"key": "limit_5sigma_mag", "label": "5σ limit", "unit": "mag", "spec": "{:.2f}"},
         ],
         "subtraction": [
@@ -362,8 +367,15 @@ def _image_metrics(stage, context, image_id):
     elif stage == "astrometry":
         info = product.get("info") or {}
         values["rms_arcsec"] = info.get("refined_rms_arcsec") or info.get("original_rms_arcsec")
+        values["rms_without_distortion_arcsec"] = info.get("similarity_rms_arcsec")
+        values["distortion_adopted"] = bool(info.get("distortion_adopted"))
+        values["distortion_degree"] = info.get("distortion_degree") \
+            if info.get("distortion_adopted") else None
+        values["distortion_reason"] = info.get("distortion_reason")
         values["inliers"] = info.get("inlier_count")
         values["matches"] = info.get("match_count")
+        if info.get("distortion_adopted"):
+            values["label_note"] = "SIP {}".format(info.get("distortion_degree"))
     elif stage == "star_selection":
         summary = _star_summary(context, image_id) or {}
         roles = summary.get("role_counts") or {}
@@ -475,7 +487,7 @@ def stage_summary_rows(state, context, stage):
     """One summary row per image for ``stage`` (status, flags, key numbers)."""
 
     rows = []
-    for image_id, image in state["images"].items():
+    for number, (image_id, image) in enumerate(state["images"].items(), 1):
         entry = _entry(state, stage, image_id) or {}
         if not entry and stage in BATCH_STAGES and image.get("status") != "REJECTED" \
                 and not image.get("failed_stage"):
@@ -484,6 +496,7 @@ def stage_summary_rows(state, context, stage):
         metadata = record.get("metadata") or {}
         error = str(entry.get("error") or "").strip().splitlines()
         row = {
+            "number": number,
             "image_id": image_id,
             "label": image_file_stem(image_id),
             "filter": metadata.get("filter"),
@@ -509,11 +522,11 @@ def write_stage_summary(state, context, stage):
     rows = stage_summary_rows(state, context, stage)
     directory = stage_directory(state, stage)
     directory.mkdir(parents=True, exist_ok=True)
-    base = ["image_id", "filter", "mjd", "status", "review", "flags", "note"]
+    base = ["number", "image_id", "filter", "mjd", "status", "review", "flags", "note"]
     extra = []
     for row in rows:
         for key in row:
-            if key not in base and key != "label" and key not in extra:
+            if key not in base and key not in ("label", "label_note") and key not in extra:
                 extra.append(key)
     path = directory / "summary.csv"
     with path.open("w", newline="") as handle:
@@ -698,7 +711,8 @@ def stage_figure(state, context, stage, image_id=None):
                                                   flags=(product or {}).get("flags"))
         return None
     if stage == "batch_consistency":
-        return plots.plot_batch_consistency_diagnostics(_shared(context, stage), status=status)
+        return plots.plot_batch_consistency_diagnostics(_shared(context, stage), status=status,
+                                                        settings=settings)
     return None
 
 
@@ -767,6 +781,11 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
         image_id for image_id in image_ids if image_id in state["images"]]
     interactive = matplotlib.is_interactive()
     plt.ioff()
+    from .diagnostics import figure_context
+
+    numbers = image_numbers(state)
+    run_context = figure_context(image_numbers=numbers)
+    run_context.__enter__()
     try:
         if not is_batch or stage in PER_IMAGE_BATCH_STAGES:
             from .progress import progress
@@ -792,7 +811,8 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
                     continue
                 path = directory / "{}.png".format(image_file_stem(image_id))
                 try:
-                    figure = stage_figure(state, context, stage, image_id)
+                    with figure_context(numbers.get(image_id), numbers):
+                        figure = stage_figure(state, context, stage, image_id)
                     if figure is None:
                         if path.exists():
                             path.unlink()
@@ -809,8 +829,9 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
                         # The stage's own figure could not be drawn: at least
                         # say why the image failed.
                         try:
-                            written[image_id] = _save(
-                                _status_card(state, context, stage, image_id, entry), path, dpi)
+                            with figure_context(numbers.get(image_id), numbers):
+                                card = _status_card(state, context, stage, image_id, entry)
+                            written[image_id] = _save(card, path, dpi)
                         except Exception:
                             plt.close("all")
             if skipped:
@@ -860,14 +881,27 @@ def write_stage_diagnostics(state, context, stage, image_ids=None, batch=True, p
             except Exception:
                 plt.close("all")
     finally:
+        run_context.__exit__(None, None, None)
         if interactive:
             plt.ion()
     return written
 
 
+def image_numbers(state):
+    """Image IDs (and file stems) mapped to their numbers in the run, the
+    numbers ``images=[n]`` takes and :func:`redphot.steps.list_images` prints."""
+
+    numbers = {}
+    for number, image_id in enumerate(state["images"], 1):
+        numbers[image_id] = number
+        numbers.setdefault(image_file_stem(image_id), number)
+    return numbers
+
+
 __all__ = [
     "STAGE_TITLES",
     "image_file_stem",
+    "image_numbers",
     "metric_specs",
     "stage_directory",
     "stage_figure",

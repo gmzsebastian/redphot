@@ -808,8 +808,65 @@ def _fit_similarity(x, y, target_x, target_y, settings):
     return transform, np.array([tx, ty]), scale, np.rad2deg(angle)
 
 
+def _poly_multiply(first, second):
+    """Product of two 2-D polynomials given as coefficient arrays ``c[i, j]``
+    (the coefficient of ``u**i * v**j``)."""
+
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    output = np.zeros((first.shape[0] + second.shape[0] - 1,
+                       first.shape[1] + second.shape[1] - 1))
+    for (i, j), value in np.ndenumerate(first):
+        if value != 0.0:
+            output[i:i + second.shape[0], j:j + second.shape[1]] += value * second
+    return output
+
+
+def _sip_in_transformed_frame(coefficients, transform, inverse_transform):
+    """Re-express SIP polynomials for pixel offsets ``u`` from ``T u``.
+
+    For a pair of SIP polynomials ``(A, B)`` of the offsets ``u' = T u``, this
+    returns ``(A_new, B_new) = T^-1 (A(T u), B(T u))``: the same distortion
+    written for the offsets ``u`` of a WCS whose matrix is ``M T``. A linear
+    map keeps every term at its degree, so the result is exact and of the same
+    order. Used for both the forward (A, B) and the inverse (AP, BP) terms.
+    """
+
+    first, second = (np.asarray(item, dtype=float) for item in coefficients)
+    size = max(first.shape[0], second.shape[0])
+    x_form = np.zeros((2, 2))
+    y_form = np.zeros((2, 2))
+    x_form[1, 0], x_form[0, 1] = transform[0, 0], transform[0, 1]
+    y_form[1, 0], y_form[0, 1] = transform[1, 0], transform[1, 1]
+    x_powers = [np.ones((1, 1))]
+    y_powers = [np.ones((1, 1))]
+    for _ in range(size):
+        x_powers.append(_poly_multiply(x_powers[-1], x_form))
+        y_powers.append(_poly_multiply(y_powers[-1], y_form))
+    composed = []
+    for polynomial in (first, second):
+        total = np.zeros((size, size))
+        for (p, q), value in np.ndenumerate(polynomial):
+            if value == 0.0:
+                continue
+            term = _poly_multiply(x_powers[p], y_powers[q]) * value
+            total[:min(size, term.shape[0]), :min(size, term.shape[1])] += \
+                term[:size, :size]
+        composed.append(total)
+    new_first = inverse_transform[0, 0] * composed[0] + inverse_transform[0, 1] * composed[1]
+    new_second = inverse_transform[1, 0] * composed[0] + inverse_transform[1, 1] * composed[1]
+    return new_first, new_second
+
+
 def _compose_similarity_wcs(original_wcs, transform, translation):
-    """Compose a pixel-space similarity correction with an existing WCS."""
+    """Compose a pixel-space similarity correction with an existing WCS.
+
+    The refined WCS puts each pixel ``p`` where the original WCS puts
+    ``transform @ p + translation``. SIP distortion of the original moves with
+    it: its reference pixel follows CRPIX and its polynomials are rewritten
+    for the rotated and scaled pixel offsets, so the WCS in memory and the
+    header written from it give the same positions.
+    """
 
     refined = deepcopy(original_wcs.celestial)
     old_matrix = np.asarray(refined.pixel_scale_matrix, dtype=float)
@@ -826,6 +883,23 @@ def _compose_similarity_wcs(original_wcs, transform, translation):
     refined.wcs.pc = new_matrix
     refined.wcs.cdelt = np.ones(len(new_crpix))
     refined.wcs.crpix = new_crpix
+    sip = getattr(original_wcs, "sip", None)
+    if sip is not None:
+        # The SIP polynomials are functions of the offsets from the SIP
+        # reference pixel. Before this, the reference pixel stayed at the old
+        # CRPIX while the header written to disk used the new one, so the
+        # file and the WCS in memory disagreed.
+        from astropy.wcs import Sip
+
+        transform = np.asarray(transform, dtype=float)
+        inverse = np.linalg.inv(transform)
+        a, b = _sip_in_transformed_frame((sip.a, sip.b), transform, inverse)
+        ap = bp = None
+        if sip.ap is not None and sip.bp is not None:
+            ap, bp = _sip_in_transformed_frame((sip.ap, sip.bp), transform, inverse)
+            # The inverse polynomials map focal-plane offsets back to pixel
+            # offsets: u = f + AP(f). With f' = T f the same rewriting applies.
+        refined.sip = Sip(a, b, ap, bp, new_crpix)
     refined.wcs.set()
     return refined
 
@@ -1055,93 +1129,357 @@ def plate_solve_with_astrometry_net(ccd, metadata=None, settings=None):
         return solved_wcs
 
 
-def refine_wcs_from_matches(wcs, matches, settings=None, shape=None, target=None):
-    """Verify and conservatively refine a WCS from matched sources.
+DISTORTION_MODES = ("auto", "never", "always")
 
-    Iterative robust clipping rejects mismatches. The candidate solution is
-    adopted only when enough matches remain, it improves the absolute RMS by
-    the configured amount, and translation/rotation/scale changes remain
-    within safety limits.
+# Reasons recorded in ``info["distortion_reason"]``.
+DISTORTION_REASONS = {
+    "adopted": "SIP distortion improves the held-out residuals",
+    "always": "distortion_mode is 'always'",
+    "disabled": "distortion_mode is 'never'",
+    "too_few_stars": "too few matched stars for a distortion fit",
+    "poor_coverage": "matched stars do not cover the frame (or the target)",
+    "no_significant_improvement": "held-out residuals do not improve enough",
+    "unsafe": "the correction is larger than the shift cap somewhere in the frame",
+    "similarity_not_adopted": "the similarity refinement itself was not usable",
+    "fit_failed": "the SIP fit did not converge",
+}
 
-    Returns
-    -------
-    refined_wcs : astropy.wcs.WCS
-        Adopted refined WCS, or an independent copy of the original.
-    matches : astropy.table.Table
-        Match table with inlier and final residual columns.
-    info : dict
-        Match counts, RMS values, fitted changes, flags, and WCS headers.
+
+def _distortion_settings(astrometry, mode=None):
+    """Distortion-fit settings with their defaults."""
+
+    degrees = astrometry.get("distortion_sip_degrees", [2, 3])
+    if isinstance(degrees, (int, float)):
+        degrees = [degrees]
+    return {
+        "mode": str(mode if mode is not None
+                    else astrometry.get("distortion_mode", "auto")).lower(),
+        "degrees": sorted({int(degree) for degree in degrees}),
+        "minimum_stars": int(astrometry.get("distortion_minimum_stars", 30)),
+        "minimum_cells": int(astrometry.get("distortion_minimum_grid_cells", 7)),
+        "minimum_fraction": float(
+            astrometry.get("distortion_minimum_improvement_fraction", 0.25)),
+        "minimum_arcsec": float(
+            astrometry.get("distortion_minimum_improvement_arcsec", 0.05)),
+        "maximum_shift": float(astrometry.get("distortion_maximum_shift_pixels", 10.0)),
+        "splits": max(1, int(astrometry.get("distortion_validation_splits", 5))),
+    }
+
+
+def _sky_separations(wcs, x, y, sky):
+    """Angular distance (arcsec) between ``wcs`` positions of pixels and ``sky``."""
+
+    detected = _plain_icrs(wcs.pixel_to_world(np.asarray(x, dtype=float),
+                                              np.asarray(y, dtype=float)))
+    return np.asarray(detected.separation(sky).arcsec, dtype=float)
+
+
+def _monomials(first, second, degree, minimum=0):
+    """Design matrix of ``first**p * second**q`` for ``minimum <= p+q <= degree``."""
+
+    terms = [(p, q) for p in range(degree + 1) for q in range(degree + 1)
+             if minimum <= p + q <= degree]
+    return terms, np.column_stack([first ** p * second ** q for p, q in terms])
+
+
+def _add_inverse_sip(wcs, shape, degree):
+    """Fit the inverse SIP terms (AP, BP) of a forward-only SIP WCS.
+
+    ``fit_wcs_from_points`` fits only the forward terms and leaves AP/BP at
+    zero, which tools reading the header take as "no distortion" when going
+    from sky to pixels. The inverse is fitted on a grid over the frame with
+    one order more than the forward terms (standard practice).
     """
 
-    if settings is None:
-        settings = get_default_settings()
-    astrometry = settings.get("astrometry", {})
-    original = deepcopy(wcs.celestial)
-    matches = Table(matches, masked=True, copy=True)
-    minimum = int(astrometry.get("minimum_matches", 6))
-    original_radial = np.asarray(
-        matches["separation_original_arcsec"], dtype=float
-    )
-    original_rms = _rms(original_radial)
-    info = {
-        "match_count": len(matches),
-        "inlier_count": 0,
-        "rejected_match_count": 0,
-        "original_rms_arcsec": original_rms,
-        "refined_rms_arcsec": None,
-        "improvement_fraction": None,
-        "translation_x_pixels": None,
-        "translation_y_pixels": None,
-        "translation_pixels": None,
-        "rotation_degrees": None,
-        "scale": None,
-        "scale_change_fraction": None,
-        "refinement_attempted": False,
-        "refinement_adopted": False,
-        "refinement_reason": None,
-        "quality_status": "PASS",
-        "flags": [],
-        "original_wcs_header": original.to_header(relax=True),
-        "refined_wcs_header": original.to_header(relax=True),
-        "target_original": None,
-        "target_refined": None,
-    }
-    if shape is not None:
-        info["target_original"] = _target_projection_record(original, target, shape)
+    from astropy.wcs import Sip
 
-    if len(matches) < minimum:
-        info["refinement_reason"] = "too_few_matches"
-        info["quality_status"] = "FAIL"
-        info["flags"].append("WCS_TOO_FEW_MATCHES")
-        matches["inlier"] = np.zeros(len(matches), dtype=bool)
-        return original, matches, info
+    sip = wcs.sip
+    ny, nx = shape
+    xs, ys = np.meshgrid(np.linspace(0, nx - 1, 40), np.linspace(0, ny - 1, 40))
+    crpix = np.asarray(wcs.wcs.crpix, dtype=float)
+    u_offset = xs.ravel() + 1.0 - crpix[0]
+    v_offset = ys.ravel() + 1.0 - crpix[1]
+    terms, _ = _monomials(u_offset, v_offset, degree, 2)
+    forward_u = u_offset.copy()
+    forward_v = v_offset.copy()
+    for p, q in terms:
+        forward_u += sip.a[p, q] * u_offset ** p * v_offset ** q
+        forward_v += sip.b[p, q] * u_offset ** p * v_offset ** q
+    inverse_degree = degree + 1
+    scale = max(float(np.max(np.abs(forward_u))), float(np.max(np.abs(forward_v))), 1.0)
+    inverse_terms, design = _monomials(forward_u / scale, forward_v / scale,
+                                       inverse_degree, 1)
+    ap = np.zeros((inverse_degree + 1, inverse_degree + 1))
+    bp = np.zeros((inverse_degree + 1, inverse_degree + 1))
+    for values, output in ((u_offset - forward_u, ap), (v_offset - forward_v, bp)):
+        solution = np.linalg.lstsq(design, values, rcond=None)[0]
+        for (p, q), value in zip(inverse_terms, solution):
+            output[p, q] = value / scale ** (p + q)
+    wcs.sip = Sip(sip.a, sip.b, ap, bp, crpix)
+    wcs.wcs.set()
+    return wcs
 
-    target_rms = float(astrometry.get("target_rms_arcsec", 0.5))
-    if not astrometry.get("refine_wcs", True) or (
-        original_rms is not None and original_rms <= target_rms
-    ):
-        info["refinement_reason"] = (
-            "disabled" if not astrometry.get("refine_wcs", True) else "already_good"
+
+def _fit_sip_wcs(x, y, sky, proj_point, degree, shape):
+    """TAN-SIP WCS of ``degree`` fitted to pixel positions and sky positions."""
+
+    from astropy.wcs.utils import fit_wcs_from_points
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fitted = fit_wcs_from_points(
+            (np.asarray(x, dtype=float), np.asarray(y, dtype=float)), sky,
+            proj_point=proj_point, projection="TAN", sip_degree=int(degree),
         )
-        ra_residual, dec_residual, radial = _residuals_for_wcs(matches, original)
-        inliers = _sigma_clip_inliers(radial, settings)
-        matches["inlier"] = inliers
-        matches["residual_ra_final_arcsec"] = ra_residual * u.arcsec
-        matches["residual_dec_final_arcsec"] = dec_residual * u.arcsec
-        matches["separation_final_arcsec"] = radial * u.arcsec
-        info["inlier_count"] = int(np.count_nonzero(inliers))
-        info["rejected_match_count"] = int(len(matches) - np.count_nonzero(inliers))
-        info["refined_rms_arcsec"] = _rms(radial[inliers])
-        if shape is not None:
-            info["target_refined"] = _target_projection_record(original, target, shape)
-        return original, matches, info
+    if shape is not None:
+        fitted.pixel_shape = (int(shape[1]), int(shape[0]))
+        _add_inverse_sip(fitted, shape, int(degree))
+    else:
+        span = (int(np.ceil(np.max(y))) + 1, int(np.ceil(np.max(x))) + 1)
+        _add_inverse_sip(fitted, span, int(degree))
+    return fitted
 
-    info["refinement_attempted"] = True
+
+def _occupied_cells(x, y, shape, grid=3, minimum_per_cell=2):
+    """Number of cells of a ``grid`` x ``grid`` division of the frame holding
+    at least ``minimum_per_cell`` stars."""
+
+    if shape is None:
+        x0, x1 = float(np.min(x)), float(np.max(x)) + 1.0
+        y0, y1 = float(np.min(y)), float(np.max(y)) + 1.0
+    else:
+        x0, x1, y0, y1 = 0.0, float(shape[1]), 0.0, float(shape[0])
+    column = np.clip(((np.asarray(x) - x0) / max(x1 - x0, 1e-9) * grid).astype(int),
+                     0, grid - 1)
+    row = np.clip(((np.asarray(y) - y0) / max(y1 - y0, 1e-9) * grid).astype(int),
+                  0, grid - 1)
+    counts = np.bincount(row * grid + column, minlength=grid * grid)
+    return int(np.count_nonzero(counts >= minimum_per_cell))
+
+
+def _inside_star_coverage(x, y, point):
+    """Whether ``point`` lies inside the convex hull of the stars."""
+
+    if point is None or len(x) < 3:
+        return False
+    try:
+        from scipy.spatial import Delaunay
+
+        hull = Delaunay(np.column_stack([x, y]))
+        return bool(hull.find_simplex(np.asarray([point], dtype=float))[0] >= 0)
+    except Exception:
+        return False
+
+
+def _maximum_correction(distorted, linear, shape, points=None):
+    """Largest pixel displacement between two WCS anywhere in the frame."""
+
+    if shape is not None:
+        ny, nx = shape
+        gx, gy = np.meshgrid(np.linspace(0, nx - 1, 25), np.linspace(0, ny - 1, 25))
+    else:
+        gx, gy = np.meshgrid(np.linspace(np.min(points[0]), np.max(points[0]), 25),
+                             np.linspace(np.min(points[1]), np.max(points[1]), 25))
+    gx, gy = gx.ravel(), gy.ravel()
+    sky = distorted.pixel_to_world(gx, gy)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        px, py = linear.world_to_pixel(sky)
+    shift = np.hypot(np.asarray(px) - gx, np.asarray(py) - gy)
+    return float(np.nanmax(shift)) if np.any(np.isfinite(shift)) else np.inf
+
+
+def _fit_distortion(base_wcs, matches, inliers, settings, shape, target, mode):
+    """Try a SIP distortion fit on the stars kept by the similarity fit.
+
+    Returns ``(wcs or None, record)``: the SIP WCS to adopt (``None`` keeps
+    ``base_wcs``) and a dictionary with the RMS values, degree, decision and
+    reason, plus per-match separations of the SIP fit (``separations``).
+
+    Rule in ``"auto"`` mode (all must hold): at least
+    ``distortion_minimum_stars`` matched stars, spread over at least
+    ``distortion_minimum_grid_cells`` cells of a 3x3 grid (two stars per
+    cell); the target inside the area covered by the stars (its position is
+    not extrapolated); the RMS on stars left out of the fit (about five
+    random 80/20 splits) better than the similarity fit's by both
+    ``distortion_minimum_improvement_fraction`` and
+    ``distortion_minimum_improvement_arcsec``; and the correction smaller
+    than ``distortion_maximum_shift_pixels`` everywhere in the frame. Degree
+    2 is tried first; degree 3 only when degree 2 does not improve enough.
+    ``"always"`` adopts the fit with the best held-out RMS whenever there are
+    enough stars; ``"never"`` does not fit.
+    """
+
+    options = _distortion_settings(settings.get("astrometry", {}), mode)
+    record = {
+        "distortion_mode": options["mode"],
+        "distortion_attempted": False,
+        "distortion_adopted": False,
+        "distortion_reason": None,
+        "distortion_detail": None,
+        "distortion_degree": None,
+        "distortion_rms_arcsec": None,
+        "distortion_heldout_rms_arcsec": None,
+        "similarity_heldout_rms_arcsec": None,
+        "distortion_improvement_fraction": None,
+        "distortion_improvement_arcsec": None,
+        "distortion_max_shift_pixels": None,
+        "distortion_star_count": int(np.count_nonzero(inliers)),
+        "distortion_grid_cells": None,
+        "distortion_target_covered": None,
+        "distortion_tried": [],
+        "separations": None,
+    }
+    if options["mode"] == "never":
+        record["distortion_reason"] = "disabled"
+        return None, record
+    x_all = np.asarray(matches["x"], dtype=float)
+    y_all = np.asarray(matches["y"], dtype=float)
+    sky_all = SkyCoord(np.asarray(matches["catalog_ra"], dtype=float) * u.deg,
+                       np.asarray(matches["catalog_dec"], dtype=float) * u.deg,
+                       frame="icrs")
+    use = np.asarray(inliers, dtype=bool) & np.isfinite(x_all) & np.isfinite(y_all)
+    x, y, sky = x_all[use], y_all[use], sky_all[use]
+    count = int(x.size)
+    record["distortion_star_count"] = count
+    if count < options["minimum_stars"]:
+        record["distortion_reason"] = "too_few_stars"
+        record["distortion_detail"] = "{} stars, {} needed".format(
+            count, options["minimum_stars"])
+        return None, record
+    cells = _occupied_cells(x, y, shape)
+    record["distortion_grid_cells"] = cells
+    target_pixel = None
+    if target is not None:
+        try:
+            tx, ty = base_wcs.world_to_pixel(target)
+            target_pixel = (float(tx), float(ty))
+        except Exception:
+            target_pixel = None
+    covered = True if target_pixel is None else _inside_star_coverage(x, y, target_pixel)
+    record["distortion_target_covered"] = covered
+    if options["mode"] == "auto" and cells < options["minimum_cells"]:
+        record["distortion_reason"] = "poor_coverage"
+        record["distortion_detail"] = "stars in {} of 9 grid cells, {} needed".format(
+            cells, options["minimum_cells"])
+        return None, record
+    if options["mode"] == "auto" and not covered:
+        record["distortion_reason"] = "poor_coverage"
+        record["distortion_detail"] = "target outside the area covered by matched stars"
+        return None, record
+
+    base_core = base_wcs.wcs
+    proj_point = SkyCoord(float(base_core.crval[0]) * u.deg, float(base_core.crval[1]) * u.deg,
+                          frame="icrs")
+    base_separation = _sky_separations(base_wcs, x, y, sky)
+    rng = np.random.default_rng(12345 + count)
+    held_out = max(1, int(round(0.2 * count)))
+    splits = [rng.permutation(count) for _ in range(options["splits"])]
+    record["distortion_attempted"] = True
+    candidates = []
+    for degree in options["degrees"]:
+        try:
+            fitted = _fit_sip_wcs(x, y, sky, proj_point, degree, shape)
+            test_sip, test_base = [], []
+            for order in splits:
+                test, train = order[:held_out], order[held_out:]
+                partial = _fit_sip_wcs(x[train], y[train], sky[train], proj_point, degree,
+                                       shape)
+                test_sip.append(_sky_separations(partial, x[test], y[test], sky[test]))
+                test_base.append(base_separation[test])
+        except Exception as problem:  # a failed fit keeps the similarity WCS
+            record["distortion_tried"].append({"degree": degree, "error": str(problem)})
+            continue
+        heldout = _rms(np.concatenate(test_sip))
+        baseline = _rms(np.concatenate(test_base))
+        in_sample = _rms(_sky_separations(fitted, x, y, sky))
+        shift = _maximum_correction(fitted, base_wcs, shape, (x, y))
+        gain = None if heldout is None or baseline is None else baseline - heldout
+        fraction = None if gain is None or not baseline else gain / baseline
+        candidate = {
+            "degree": degree, "wcs": fitted, "heldout_rms_arcsec": heldout,
+            "similarity_heldout_rms_arcsec": baseline, "rms_arcsec": in_sample,
+            "improvement_arcsec": gain, "improvement_fraction": fraction,
+            "max_shift_pixels": shift,
+        }
+        candidates.append(candidate)
+        record["distortion_tried"].append(
+            {key: value for key, value in candidate.items() if key != "wcs"})
+        if options["mode"] == "auto":
+            improved = (gain is not None and gain >= options["minimum_arcsec"]
+                        and fraction is not None and fraction >= options["minimum_fraction"])
+            if improved:
+                break  # a higher degree is tried only when this one is not enough
+
+    if not candidates:
+        record["distortion_reason"] = "fit_failed"
+        return None, record
+
+    def describe(candidate):
+        record.update({
+            "distortion_degree": candidate["degree"],
+            "distortion_rms_arcsec": candidate["rms_arcsec"],
+            "distortion_heldout_rms_arcsec": candidate["heldout_rms_arcsec"],
+            "similarity_heldout_rms_arcsec": candidate["similarity_heldout_rms_arcsec"],
+            "distortion_improvement_fraction": candidate["improvement_fraction"],
+            "distortion_improvement_arcsec": candidate["improvement_arcsec"],
+            "distortion_max_shift_pixels": candidate["max_shift_pixels"],
+        })
+        record["separations"] = _sky_separations(candidate["wcs"], x_all, y_all, sky_all)
+
+    if options["mode"] == "always":
+        best = min(candidates, key=lambda item: (
+            np.inf if item["heldout_rms_arcsec"] is None else item["heldout_rms_arcsec"]))
+        describe(best)
+        record["distortion_adopted"] = True
+        record["distortion_reason"] = "always"
+        return best["wcs"], record
+
+    def enough_gain(candidate):
+        return (candidate["improvement_arcsec"] is not None
+                and candidate["improvement_arcsec"] >= options["minimum_arcsec"]
+                and candidate["improvement_fraction"] is not None
+                and candidate["improvement_fraction"] >= options["minimum_fraction"])
+
+    improved = enough_gain(candidates[-1])
+    # The degree that passed, or (none passed) the one with the best held-out RMS.
+    chosen = candidates[-1] if improved else min(candidates, key=lambda item: (
+        np.inf if item["heldout_rms_arcsec"] is None else item["heldout_rms_arcsec"]))
+    describe(chosen)
+    if not improved:
+        record["distortion_reason"] = "no_significant_improvement"
+        record["distortion_detail"] = "held-out RMS {} -> {}".format(
+            _fmt_arcsec(chosen["similarity_heldout_rms_arcsec"]),
+            _fmt_arcsec(chosen["heldout_rms_arcsec"]))
+    elif not chosen["max_shift_pixels"] <= options["maximum_shift"]:
+        record["distortion_reason"] = "unsafe"
+        record["distortion_detail"] = "correction up to {:.1f} px (cap {:g} px)".format(
+            chosen["max_shift_pixels"], options["maximum_shift"])
+    else:
+        record["distortion_adopted"] = True
+        record["distortion_reason"] = "adopted"
+        record["distortion_detail"] = "held-out RMS {} -> {}".format(
+            _fmt_arcsec(chosen["similarity_heldout_rms_arcsec"]),
+            _fmt_arcsec(chosen["heldout_rms_arcsec"]))
+        return chosen["wcs"], record
+    return None, record
+
+
+def _fmt_arcsec(value):
+    return "—" if value is None else "{:.3f}″".format(float(value))
+
+
+def _similarity_candidate(original, matches, inliers, settings, minimum):
+    """Iterative similarity fit (with sigma clipping) of ``original`` to the
+    matches. Returns ``(wcs, inliers, transform, translation, scale,
+    rotation_degrees)``."""
+
+    astrometry = settings.get("astrometry", {})
     x = np.asarray(matches["x"], dtype=float)
     y = np.asarray(matches["y"], dtype=float)
     target_x = np.asarray(matches["catalog_x_original"], dtype=float)
     target_y = np.asarray(matches["catalog_y_original"], dtype=float)
-    inliers = np.ones(len(matches), dtype=bool)
+    inliers = np.asarray(inliers, dtype=bool).copy()
     candidate = original
     transform = np.eye(2)
     translation = np.zeros(2)
@@ -1159,49 +1497,210 @@ def refine_wcs_from_matches(wcs, matches, settings=None, shape=None, target=None
         if np.array_equal(updated, inliers):
             break
         inliers = updated
+    return candidate, inliers, transform, translation, scale, rotation
 
-    ra_residual, dec_residual, radial = _residuals_for_wcs(matches, candidate)
-    refined_rms = _rms(radial[inliers])
-    translation_size = float(np.hypot(*translation))
-    scale_change = abs(float(scale) - 1.0)
-    improvement = (
-        None
-        if original_rms in {None, 0.0} or refined_rms is None
-        else 1.0 - refined_rms / original_rms
-    )
-    safe = (
-        translation_size
-        <= float(astrometry.get("maximum_translation_pixels", 50.0))
-        and abs(rotation)
-        <= float(astrometry.get("maximum_rotation_degrees", 10.0))
-        and scale_change
-        <= float(astrometry.get("maximum_scale_change_fraction", 0.10))
-    )
-    improved = (
-        improvement is not None
-        and improvement
-        >= float(astrometry.get("minimum_improvement_fraction", 0.05))
-    )
-    enough = np.count_nonzero(inliers) >= minimum
-    adopted = enough and improved and (
-        safe or not astrometry.get("reject_unsafe_solution", True)
-    )
 
-    final_wcs = candidate if adopted else original
-    if not adopted:
+def refine_wcs_from_matches(wcs, matches, settings=None, shape=None, target=None,
+                            distortion_mode=None):
+    """Verify and conservatively refine a WCS from matched sources.
+
+    Iterative robust clipping rejects mismatches. The translation, rotation
+    and scale solution is adopted only when enough matches remain, it
+    improves the absolute RMS by the configured amount, and the changes
+    remain within safety limits.
+
+    A SIP distortion fit is then tried on the stars kept by that fit
+    (``astrometry.distortion_mode``; ``distortion_mode`` here overrides the
+    setting, e.g. ``"never"`` for the relative alignment). In ``"auto"`` mode
+    it is adopted only when the data clearly need it; see
+    :func:`_fit_distortion` for the rule. When it is adopted the flag
+    ``WCS_DISTORTION_FITTED`` is set (informational; it does not change the
+    status).
+
+    Returns
+    -------
+    refined_wcs : astropy.wcs.WCS
+        Adopted refined WCS, or an independent copy of the original.
+    matches : astropy.table.Table
+        Match table with inlier and final residual columns, plus
+        ``separation_similarity_arcsec`` (without distortion) and, when a
+        distortion fit was made, ``separation_distortion_arcsec``.
+    info : dict
+        Match counts, RMS values, fitted changes, distortion decision, flags,
+        and WCS headers.
+    """
+
+    if settings is None:
+        settings = get_default_settings()
+    astrometry = settings.get("astrometry", {})
+    original = deepcopy(wcs.celestial)
+    matches = Table(matches, masked=True, copy=True)
+    minimum = int(astrometry.get("minimum_matches", 6))
+    original_radial = np.asarray(
+        matches["separation_original_arcsec"], dtype=float
+    )
+    original_rms = _rms(original_radial)
+    mode = _distortion_settings(astrometry, distortion_mode)["mode"]
+    info = {
+        "match_count": len(matches),
+        "inlier_count": 0,
+        "rejected_match_count": 0,
+        "original_rms_arcsec": original_rms,
+        "refined_rms_arcsec": None,
+        "improvement_fraction": None,
+        "translation_x_pixels": None,
+        "translation_y_pixels": None,
+        "translation_pixels": None,
+        "rotation_degrees": None,
+        "scale": None,
+        "scale_change_fraction": None,
+        "refinement_attempted": False,
+        "refinement_adopted": False,
+        "refinement_reason": None,
+        "similarity_rms_arcsec": None,
+        "distortion_mode": mode,
+        "distortion_rms_arcsec": None,
+        "distortion_degree": None,
+        "distortion_adopted": False,
+        "distortion_reason": None,
+        "distortion_max_shift_pixels": None,
+        "quality_status": "PASS",
+        "flags": [],
+        "original_wcs_header": original.to_header(relax=True),
+        "refined_wcs_header": original.to_header(relax=True),
+        "target_original": None,
+        "target_refined": None,
+    }
+    if shape is not None:
+        info["target_original"] = _target_projection_record(original, target, shape)
+
+    if len(matches) < minimum:
+        info["refinement_reason"] = "too_few_matches"
+        info["distortion_reason"] = "too_few_stars"
+        info["quality_status"] = "FAIL"
+        info["flags"].append("WCS_TOO_FEW_MATCHES")
+        matches["inlier"] = np.zeros(len(matches), dtype=bool)
+        return original, matches, info
+
+    target_rms = float(astrometry.get("target_rms_arcsec", 0.5))
+    translation = None
+    # The distortion fit is judged against the best WCS without distortion:
+    # the similarity fit (also when the header WCS is kept as already good,
+    # so the SIP fit, which refits the linear terms too, gets no credit for
+    # a shift, rotation or scale).
+    comparison_wcs = comparison_inliers = None
+    if not astrometry.get("refine_wcs", True) or (
+        original_rms is not None and original_rms <= target_rms
+    ):
+        info["refinement_reason"] = (
+            "disabled" if not astrometry.get("refine_wcs", True) else "already_good"
+        )
+        base_wcs = original
         ra_residual, dec_residual, radial = _residuals_for_wcs(matches, original)
         inliers = _sigma_clip_inliers(radial, settings)
-        info["refinement_reason"] = (
-            "too_few_inliers"
-            if not enough
-            else "unsafe_solution"
-            if not safe
-            else "insufficient_improvement"
-        )
-        info["flags"].append("WCS_REFINEMENT_FAILED")
-        info["quality_status"] = "WARN"
+        usable_base = True
+        if mode != "never" and np.count_nonzero(inliers) >= minimum:
+            candidate, candidate_inliers, *_ = _similarity_candidate(
+                original, matches, inliers, settings, minimum)
+            _, _, candidate_radial = _residuals_for_wcs(matches, candidate)
+            if _rms(candidate_radial[candidate_inliers]) is not None and (
+                    _rms(candidate_radial[candidate_inliers]) < _rms(radial[inliers])):
+                comparison_wcs, comparison_inliers = candidate, candidate_inliers
     else:
-        info["refinement_reason"] = "improved"
+        info["refinement_attempted"] = True
+        (candidate, inliers, transform, translation, scale,
+         rotation) = _similarity_candidate(
+            original, matches, np.ones(len(matches), dtype=bool), settings, minimum)
+
+        ra_residual, dec_residual, radial = _residuals_for_wcs(matches, candidate)
+        refined_rms = _rms(radial[inliers])
+        translation_size = float(np.hypot(*translation))
+        scale_change = abs(float(scale) - 1.0)
+        improvement = (
+            None
+            if original_rms in {None, 0.0} or refined_rms is None
+            else 1.0 - refined_rms / original_rms
+        )
+        safe = (
+            translation_size
+            <= float(astrometry.get("maximum_translation_pixels", 50.0))
+            and abs(rotation)
+            <= float(astrometry.get("maximum_rotation_degrees", 10.0))
+            and scale_change
+            <= float(astrometry.get("maximum_scale_change_fraction", 0.10))
+        )
+        improved = (
+            improvement is not None
+            and improvement
+            >= float(astrometry.get("minimum_improvement_fraction", 0.05))
+        )
+        enough = np.count_nonzero(inliers) >= minimum
+        adopted = enough and improved and (
+            safe or not astrometry.get("reject_unsafe_solution", True)
+        )
+
+        base_wcs = candidate if adopted else original
+        if not adopted:
+            ra_residual, dec_residual, radial = _residuals_for_wcs(matches, original)
+            inliers = _sigma_clip_inliers(radial, settings)
+            info["refinement_reason"] = (
+                "too_few_inliers"
+                if not enough
+                else "unsafe_solution"
+                if not safe
+                else "insufficient_improvement"
+            )
+            info["flags"].append("WCS_REFINEMENT_FAILED")
+            info["quality_status"] = "WARN"
+        else:
+            info["refinement_reason"] = "improved"
+        # A distortion fit can still help when the similarity fit was merely
+        # not better than the header WCS; not when it was unsafe or starved.
+        usable_base = adopted or info["refinement_reason"] == "insufficient_improvement"
+        info.update(
+            {
+                "improvement_fraction": improvement,
+                "translation_x_pixels": float(translation[0]),
+                "translation_y_pixels": float(translation[1]),
+                "translation_pixels": translation_size,
+                "rotation_degrees": float(rotation),
+                "scale": float(scale),
+                "scale_change_fraction": scale_change,
+                "refinement_adopted": adopted,
+            }
+        )
+
+    # Residuals of the WCS without distortion (the similarity fit, or the
+    # header WCS when that is kept).
+    similarity_radial = np.asarray(radial, dtype=float)
+    info["similarity_rms_arcsec"] = _rms(similarity_radial[inliers])
+    matches["separation_similarity_arcsec"] = similarity_radial * u.arcsec
+    final_wcs = base_wcs
+    if usable_base:
+        distorted, record = _fit_distortion(
+            base_wcs if comparison_wcs is None else comparison_wcs, matches,
+            inliers if comparison_inliers is None else comparison_inliers,
+            settings, shape, target, mode
+        )
+    else:
+        distorted, record = None, {
+            "distortion_reason": "similarity_not_adopted", "distortion_attempted": False,
+            "separations": None}
+    separations = record.pop("separations", None)
+    info.update(record)
+    if separations is not None:
+        matches["separation_distortion_arcsec"] = np.asarray(separations) * u.arcsec
+    if distorted is not None:
+        final_wcs = distorted
+        ra_residual, dec_residual, radial = _residuals_for_wcs(matches, final_wcs)
+        inliers = _sigma_clip_inliers(radial, settings)
+        info["flags"].append("WCS_DISTORTION_FITTED")
+        if "WCS_REFINEMENT_FAILED" in info["flags"]:
+            # The header WCS needed distortion terms, not a similarity change.
+            info["flags"].remove("WCS_REFINEMENT_FAILED")
+            info["quality_status"] = "PASS"
+        if info["refinement_reason"] in ("already_good", "insufficient_improvement"):
+            info["refinement_reason"] = "distortion"
 
     matches["inlier"] = inliers
     matches["residual_ra_final_arcsec"] = ra_residual * u.arcsec
@@ -1213,21 +1712,14 @@ def refine_wcs_from_matches(wcs, matches, settings=None, shape=None, target=None
             "inlier_count": int(np.count_nonzero(inliers)),
             "rejected_match_count": int(len(matches) - np.count_nonzero(inliers)),
             "refined_rms_arcsec": final_rms,
-            "improvement_fraction": improvement,
-            "translation_x_pixels": float(translation[0]),
-            "translation_y_pixels": float(translation[1]),
-            "translation_pixels": translation_size,
-            "rotation_degrees": float(rotation),
-            "scale": float(scale),
-            "scale_change_fraction": scale_change,
-            "refinement_adopted": adopted,
             "refined_wcs_header": final_wcs.to_header(relax=True),
         }
     )
-    warning_rms = float(astrometry.get("warning_rms_arcsec", 1.0))
-    if final_rms is None or final_rms > warning_rms:
-        info["quality_status"] = "WARN" if final_rms is not None else "FAIL"
-        info["flags"].append("WCS_POOR")
+    if info["refinement_attempted"] or distorted is not None:
+        warning_rms = float(astrometry.get("warning_rms_arcsec", 1.0))
+        if final_rms is None or final_rms > warning_rms:
+            info["quality_status"] = "WARN" if final_rms is not None else "FAIL"
+            info["flags"].append("WCS_POOR")
     if shape is not None:
         info["target_refined"] = _target_projection_record(final_wcs, target, shape)
     return final_wcs, matches, info
@@ -2355,6 +2847,75 @@ def _screen_measurements(master, measurements, settings, image_settings=None):
     return output
 
 
+def calibration_preference(snr, preferred_snr=100.0):
+    """Ranking score for zeropoint stars: highest at ``preferred_snr`` and
+    falling off symmetrically in log S/N (S/N 30 and 330 rank the same)."""
+
+    snr = np.asarray(snr, dtype=float)
+    preferred = max(float(preferred_snr or 100.0), 1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        distance = np.abs(np.log10(np.where(snr > 0, snr, np.nan) / preferred))
+    return np.where(np.isfinite(distance), 1.0 / (1.0 + distance), 0.0)
+
+
+def _screen_photometric_outliers(measurements, settings, image_settings=None):
+    """Reject stars whose quick aperture magnitude disagrees with the catalog.
+
+    For each image the offset ``catalog - instrumental`` of every accepted
+    star is compared with the median offset; stars further than
+    ``photometric_outlier_sigma`` times the robust scatter (with their own
+    error added in quadrature), and at least
+    ``photometric_outlier_minimum_mag``, get the reason PHOTOMETRIC_OUTLIER
+    (blends, mismatches, variables, galaxies). They stay available for
+    astrometry.
+    """
+
+    output = measurements
+    if not len(output) or "aperture_flux" not in output.colnames:
+        return output
+    image_settings = image_settings or {}
+    reasons = [str(value) for value in output["rejection_reasons"]]
+    accepted = np.asarray(output["image_accepted"], dtype=bool)
+    flux = np.asarray(output["aperture_flux"].filled(np.nan)
+                      if hasattr(output["aperture_flux"], "filled")
+                      else output["aperture_flux"], dtype=float)
+    error_column = output["aperture_flux_error"] if "aperture_flux_error" in output.colnames \
+        else None
+    flux_error = (np.full(len(output), np.nan) if error_column is None else np.asarray(
+        error_column.filled(np.nan) if hasattr(error_column, "filled") else error_column,
+        dtype=float))
+    magnitude = np.asarray(output["magnitude"].filled(np.nan)
+                           if hasattr(output["magnitude"], "filled") else output["magnitude"],
+                           dtype=float)
+    image_ids = np.asarray([str(value) for value in output["image_id"]])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        offset = magnitude + 2.5 * np.log10(flux)
+        offset_error = 1.0857 * flux_error / flux
+    for image_id in dict.fromkeys(image_ids):
+        star_settings = (image_settings.get(image_id) or settings).get(
+            "catalogs", {}).get("comparison_stars", {})
+        sigma = star_settings.get("photometric_outlier_sigma", 5.0)
+        if sigma is None:
+            continue
+        floor = float(star_settings.get("photometric_outlier_minimum_mag", 0.15))
+        rows = (image_ids == image_id) & accepted & np.isfinite(offset) & (flux > 0)
+        if np.count_nonzero(rows) < 5:
+            continue
+        values = offset[rows]
+        median = float(np.median(values))
+        scatter = float(1.4826 * np.median(np.abs(values - median)))
+        errors = np.nan_to_num(offset_error, nan=0.0)
+        limit = np.maximum(float(sigma) * np.sqrt(scatter ** 2 + errors ** 2), floor)
+        outliers = rows & (np.abs(offset - median) > limit)
+        for index in np.flatnonzero(outliers):
+            existing = [item for item in reasons[index].split(";") if item and item != "--"]
+            reasons[index] = _reason_string(sorted(set(existing) | {"PHOTOMETRIC_OUTLIER"}))
+            accepted[index] = False
+    output["image_accepted"] = accepted
+    output["rejection_reasons"] = np.asarray(reasons, dtype="U512")
+    return output
+
+
 def _role_candidates(measurements, role, settings):
     """Return role-specific eligibility without coupling unrelated criteria."""
 
@@ -2387,6 +2948,7 @@ def _role_candidates(measurements, role, settings):
             "FWHM_OUTLIER",
             "NEIGHBOR_CONTAMINATION",
             "CATALOG_CROWDING",
+            "PHOTOMETRIC_OUTLIER",
         },
         "calibration": None,
         "ensemble": None,
@@ -2570,6 +3132,7 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
     image_settings = image_settings or {}
     master = _screen_master_catalog(master, settings)
     measurements = _screen_measurements(master, measurements, settings, image_settings)
+    measurements = _screen_photometric_outliers(measurements, settings, image_settings)
     image_ids = list(dict.fromkeys(str(value) for value in measurements["image_id"]))
     total_images = max(1, len(image_ids))
     detection_fraction = {
@@ -2606,7 +3169,15 @@ def select_comparison_and_psf_stars(master, measurements, settings=None, overrid
         psf_score = snr / (1.0 + 5.0 * ellipticity) / (
             1.0 + np.nan_to_num(np.abs(fwhm - image_fwhm) / image_fwhm, nan=1.0)
         )
-        calibration_score = snr / (1.0 + 20.0 * magnitude_error)
+        # Zeropoint stars: those closest to calibration_preferred_snr come
+        # first (in log S/N), so the sample reaches the faint stars that are
+        # most like the science targets instead of only the brightest ones,
+        # whose cores are nearest saturation and whose catalog magnitudes are
+        # the least reliable. Beyond S/N ~100 the star-to-star scatter
+        # dominates anyway.
+        calibration_score = calibration_preference(
+            snr, star_settings.get("calibration_preferred_snr", 100.0)
+        ) / (1.0 + 20.0 * magnitude_error)
         qc_score = -magnitude + 1.0e-4 * np.log1p(snr)
 
         astrometry_candidates = _role_candidates(image_table, "astrometry", local)

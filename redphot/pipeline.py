@@ -2649,6 +2649,14 @@ def _working_ccd(context, image_id):
 def _metadata_instrument_profile(metadata):
     """Infer a supported instrument profile from normalized metadata."""
 
+    from .config import known_instrument
+
+    # A known instrument decides (IMACS at Las Campanas has the site code
+    # "LCO", which is also Las Cumbres Observatory).
+    entry = known_instrument((metadata or {}).get("instrument"),
+                             (metadata or {}).get("detector"))
+    if entry is not None:
+        return entry.get("profile")
     for name in ("instrument", "detector", "telescope", "site"):
         value = (metadata or {}).get(name)
         profile = normalize_instrument_name(value)

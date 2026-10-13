@@ -1216,20 +1216,36 @@ def _local_background(data, standard_deviation, mask, x, y, fwhm, settings):
     return result
 
 
-def _artifact_flags(source_type, masks, slices, weights):
-    """Return explicit flags for artifact masks overlapping one footprint."""
+def _masked_weight_fraction(mask, weights):
+    """Fraction of a footprint's weight on masked pixels."""
+
+    weights = np.asarray(weights, dtype=float)
+    total = float(np.sum(weights[weights > 0]))
+    if mask is None or total <= 0:
+        return 0.0
+    return float(np.sum(weights[np.asarray(mask, dtype=bool) & (weights > 0)])) / total
+
+
+def _artifact_flags(source_type, masks, slices, weights, minimum_fraction=0.0):
+    """Return explicit flags for artifact masks overlapping one footprint.
+
+    A mask counts when it carries more than ``minimum_fraction`` of the
+    footprint's weight: any overlap for apertures (0), a small fraction of
+    the PSF for PSF fits, whose box reaches far into the wings.
+    """
 
     flags = []
-    footprint = weights > 0
-    combined = masks.get("combined")
-    if combined is not None and np.any(combined[slices] & footprint):
-        flags.append("TARGET_MASKED" if source_type == "target" else "MASKED_PIXELS")
-    cosmic = masks.get("cosmic_rays")
-    if cosmic is not None and np.any(cosmic[slices] & footprint):
-        flags.append("TARGET_COSMIC_RAY" if source_type == "target" else "COSMIC_RAY_OVERLAP")
-    trails = masks.get("trails")
-    if trails is not None and np.any(trails[slices] & footprint):
-        flags.append("TARGET_TRAIL" if source_type == "target" else "TRAIL_OVERLAP")
+    for name, target_flag, star_flag in (
+        ("combined", "TARGET_MASKED", "MASKED_PIXELS"),
+        ("cosmic_rays", "TARGET_COSMIC_RAY", "COSMIC_RAY_OVERLAP"),
+        ("trails", "TARGET_TRAIL", "TRAIL_OVERLAP"),
+    ):
+        mask = masks.get(name)
+        if mask is None:
+            continue
+        fraction = _masked_weight_fraction(mask[slices], weights)
+        if fraction > minimum_fraction:
+            flags.append(target_flag if source_type == "target" else star_flag)
     return flags
 
 
@@ -1344,7 +1360,37 @@ def _psf_footprint(data, variance, masks, x, y, model):
         "mask": np.asarray(masks["combined"][slices], dtype=bool),
         "model": shifted[my0:my1, mx0:mx1],
         "origin": (x0, y0),
+        # To place the same PSF at a slightly different position in this
+        # window (free-centroid fits): the native model, the subpixel shift
+        # used here and the part of the shifted model inside the frame.
+        "native_model": model,
+        "subpixel_shift": (float(y - iy), float(x - ix)),
+        "model_slices": (slice(my0, my1), slice(mx0, mx1)),
     }
+
+
+def _psf_model_offset(footprint, offset):
+    """The footprint's PSF moved by ``offset`` = (dx, dy) pixels, in the same
+    window and normalized the same way as :func:`_psf_footprint`.
+
+    Shifting the native model by the subpixel shift plus the offset keeps
+    the model a smooth function of the offset (shifting the already shifted
+    window again is not: a zero shift skips the spline, so fits started at
+    the forced position saw a step there and did not move).
+    """
+
+    native = footprint.get("native_model")
+    if native is None:
+        return ndimage.shift(footprint["model"], (offset[1], offset[0]), order=3,
+                             mode="constant", cval=0.0, prefilter=True)
+    fy, fx = footprint["subpixel_shift"]
+    shifted = ndimage.shift(native, (fy + offset[1], fx + offset[0]), order=3,
+                            mode="constant", cval=0.0, prefilter=True)
+    shifted = np.maximum(np.where(np.isfinite(shifted), shifted, 0.0), 0.0)
+    total = float(np.sum(shifted))
+    if total > 0:
+        shifted = shifted / total
+    return shifted[footprint["model_slices"]]
 
 
 def _fit_psf_flux(footprint, background):
@@ -1395,16 +1441,10 @@ def _diagnostic_free_centroid(footprint, background, forced_flux, search_pixels)
         return None
     sky = background["value"] if background["valid"] else 0.0
     inverse_sigma = 1.0 / np.sqrt(variance[valid])
+    del base_model
 
     def model_and_flux(offset):
-        shifted = ndimage.shift(
-            base_model,
-            (offset[1], offset[0]),
-            order=3,
-            mode="constant",
-            cval=0.0,
-            prefilter=True,
-        )
+        shifted = _psf_model_offset(footprint, offset)
         denominator = float(np.sum(shifted[valid] ** 2 / variance[valid]))
         if denominator <= 0:
             return shifted, forced_flux
@@ -1423,14 +1463,30 @@ def _diagnostic_free_centroid(footprint, background, forced_flux, search_pixels)
             residual,
             [0.0, 0.0],
             bounds=([-search_pixels, -search_pixels], [search_pixels, search_pixels]),
+            diff_step=1.0e-4,
         )
     except (FloatingPointError, RuntimeError, ValueError):
         return None
     shifted, amplitude = model_and_flux(fit.x)
+    # Position uncertainty from the fit (the residuals are in units of the
+    # pixel noise, so (J^T J)^-1 is the covariance of the offsets).
+    uncertainty = None
+    try:
+        covariance = np.linalg.inv(fit.jac.T @ fit.jac)
+        variances = np.clip(np.diag(covariance), 0.0, None)
+        radius = float(np.hypot(*fit.x))
+        if radius > 0:
+            uncertainty = float(np.sqrt((fit.x[0] ** 2 * variances[0]
+                                         + fit.x[1] ** 2 * variances[1]) / radius ** 2))
+        else:
+            uncertainty = float(np.sqrt(np.mean(variances)))
+    except (np.linalg.LinAlgError, ValueError):
+        uncertainty = None
     return {
         "offset_x_pixels": float(fit.x[0]),
         "offset_y_pixels": float(fit.x[1]),
         "offset_pixels": float(np.hypot(*fit.x)),
+        "offset_uncertainty_pixels": uncertainty,
         "flux": amplitude,
         "success": bool(fit.success),
         "cost": float(fit.cost),
@@ -1490,11 +1546,13 @@ def _psf_measurement(
     flux, uncertainty, valid = _fit_psf_flux(footprint, background)
     model_weights = footprint["model"]
     coverage = float(np.sum(model_weights[valid]))
+    weight_limit = float(settings.get("apertures", {}).get("psf_masked_weight_fraction", 0.01))
     flags.extend(
         _artifact_flags(
-            source["source_type"], masks, footprint["slices"], model_weights
+            source["source_type"], masks, footprint["slices"], model_weights, weight_limit
         )
     )
+    masked_weight = _masked_weight_fraction(footprint["mask"], model_weights)
     minimum = float(settings.get("apertures", {}).get("minimum_unmasked_fraction", 0.80))
     if coverage < minimum:
         flags.append("INSUFFICIENT_UNMASKED_PIXELS")
@@ -1528,8 +1586,11 @@ def _psf_measurement(
                 target_settings.get("maximum_diagnostic_offset_arcsec", 1.0)
             )
             comparison = free["offset_arcsec"] if pixel_scale else free["offset_pixels"]
-            limit = threshold if pixel_scale else threshold
-            if comparison is not None and comparison > limit:
+            error = free.get("offset_uncertainty_pixels")
+            significant = error is None or error <= 0 or free["offset_pixels"] > 3.0 * error
+            detected = snr is not None and snr >= float(
+                target_settings.get("diagnostic_offset_minimum_snr", 10.0))
+            if comparison is not None and comparison > threshold and significant and detected:
                 flags.append("TARGET_CENTROID_OFFSET")
     diagnostics = {
         "data": footprint["data"],
@@ -1540,6 +1601,8 @@ def _psf_measurement(
         "fixed_x": source["x"],
         "fixed_y": source["y"],
         "free_centroid": free,
+        "masked_weight_fraction": masked_weight,
+        "masked_weight_limit": weight_limit,
     }
     return {
         "method": "psf",
@@ -1560,6 +1623,116 @@ def _psf_measurement(
             )
         ),
     }, diagnostics
+
+
+def _recentered_psf_measurement(data, variance, masks, source, background, psf_result,
+                                settings, pixel_scale, forced, free):
+    """PSF photometry of the target with the centroid left free.
+
+    Made only when the forced PSF fit of the target has S/N of at least
+    ``apertures.recentered_psf_minimum_snr`` (the source is clearly there):
+    the PSF is fitted at the free-centroid position and the flux, error and
+    residual measured there. ``TARGET_RECENTERED`` (WARN) is raised when the
+    centroid moved more than ``apertures.recentered_psf_warn_offset_arcsec``.
+    Returns ``(measurement, diagnostics)`` or ``(None, None)``.
+    """
+
+    apertures = settings.get("apertures", {})
+    if not apertures.get("recentered_psf", True) or free is None:
+        return None, None
+    snr = forced.get("snr")
+    minimum = float(apertures.get("recentered_psf_minimum_snr", 20.0))
+    if snr is None or not np.isfinite(snr) or snr < minimum:
+        return None, None
+    model = psf_result.get("model_native")
+    x, y = free["x"], free["y"]
+    try:
+        footprint = _psf_footprint(data, variance, masks, x, y, model)
+    except ValueError:
+        footprint = None
+    if footprint is None:
+        return None, None
+    flux, uncertainty, valid = _fit_psf_flux(footprint, background)
+    weights = footprint["model"]
+    coverage = float(np.sum(weights[valid]))
+    weight_limit = float(apertures.get("psf_masked_weight_fraction", 0.01))
+    flags = _artifact_flags(source["source_type"], masks, footprint["slices"], weights,
+                            weight_limit)
+    minimum_coverage = float(apertures.get("minimum_unmasked_fraction", 0.80))
+    if coverage < minimum_coverage:
+        flags.append("INSUFFICIENT_UNMASKED_PIXELS")
+    if flux is None or uncertainty is None:
+        flags.append("TARGET_FIT_FAILED")
+    offset_arcsec = free.get("offset_arcsec")
+    limit = float(apertures.get("recentered_psf_warn_offset_arcsec", 0.1))
+    significance_limit = float(apertures.get("recentered_psf_warn_sigma", 3.0))
+    moved = offset_arcsec if offset_arcsec is not None else (
+        free["offset_pixels"] * (pixel_scale or 0.0))
+    error = free.get("offset_uncertainty_pixels")
+    significance = (free["offset_pixels"] / error
+                    if error is not None and error > 0 else None)
+    # A move larger than the limit and than the noise of the centroid (a
+    # faint target scatters around the frozen position by itself).
+    if moved is not None and moved > limit and (
+            significance is None or significance > significance_limit):
+        flags.append("TARGET_RECENTERED")
+    sky = background["value"] if background["valid"] else 0.0
+    fitted = None if flux is None else flux * weights + sky
+    residual = None
+    if fitted is not None:
+        residual = footprint["data"] - fitted
+        residual[~valid] = np.nan
+    measurement = {
+        "method": "psf_recentered",
+        "flux": flux,
+        "flux_uncertainty": uncertainty,
+        "snr": flux / uncertainty if flux is not None and uncertainty not in (None, 0) else None,
+        "aperture_radius_pixels": None,
+        "model_type": psf_result.get("model_type"),
+        "coverage_fraction": float(np.clip(coverage, 0.0, 1.0)),
+        "unmasked_weight": float(np.count_nonzero(valid)),
+        "flags": list(dict.fromkeys(flags)),
+        "valid": bool(flux is not None and coverage >= minimum_coverage and (
+            background["valid"] or not apertures.get("local_background", True))),
+        "x": x,
+        "y": y,
+    }
+    diagnostics = {
+        "data": footprint["data"],
+        "model": fitted,
+        "residual": residual,
+        "mask": footprint["mask"],
+        "origin": footprint["origin"],
+        "x": x,
+        "y": y,
+        "offset_x_pixels": free["offset_x_pixels"],
+        "offset_y_pixels": free["offset_y_pixels"],
+        "offset_pixels": free["offset_pixels"],
+        "offset_arcsec": offset_arcsec,
+        "offset_significance": significance,
+        "warn_offset_arcsec": limit,
+        "warn_sigma": significance_limit,
+        "minimum_snr": minimum,
+        "flux": flux,
+        "flux_uncertainty": uncertainty,
+        "forced_flux": forced.get("flux"),
+        "forced_flux_uncertainty": forced.get("flux_uncertainty"),
+    }
+    return measurement, diagnostics
+
+
+# Flags that describe one method only and are not copied to the other
+# measurements of the target.
+METHOD_ONLY_FLAGS = {"TARGET_RECENTERED"}
+
+# Methods calibrated with another method's zeropoint (same PSF model).
+ZEROPOINT_METHODS = {"psf_recentered": "psf"}
+
+
+def _zeropoint_method(method):
+    """Method whose zeropoint calibrates ``method``."""
+
+    return ZEROPOINT_METHODS.get(str(method), str(method))
 
 
 def _science_sources(image_id, measurements, target_solution, wcs):
@@ -1668,6 +1841,63 @@ def _measurement_table(rows, flux_unit):
     return table
 
 
+def _preliminary_zeropoints(table, star_measurements, image_id, settings):
+    """Quick zeropoint of each method from the stars measured in this step.
+
+    The median of catalog minus instrumental magnitude of the zeropoint
+    ("calibration" role) stars, used to show the target in magnitudes in the
+    science-photometry figure. The calibration step solves the final
+    zeropoints (weighted, clipped, unstable stars removed).
+    """
+
+    output = {}
+    if table is None or not len(table) or star_measurements is None \
+            or not len(star_measurements) or "magnitude" not in star_measurements.colnames:
+        return output
+    rows = star_measurements[np.asarray([str(value) for value in star_measurements["image_id"]])
+                             == str(image_id)]
+    catalog = {}
+    for row in rows:
+        if "role_calibration" in rows.colnames and not bool(row["role_calibration"]):
+            continue
+        magnitude = _finite_float(_row_value(row, "magnitude"))
+        if magnitude is not None:
+            catalog[str(row["persistent_id"])] = magnitude
+    filter_name = None
+    for row in table:
+        if str(row["source_type"]) == "target":
+            filter_name = str(row["filter"])
+            break
+    routed, _ = route_calibration_catalog(filter_name, settings)
+    system = settings.get("calibration", {}).get("magnitude_system_by_catalog", {}).get(
+        routed or "", "")
+    minimum = float(settings.get("calibration", {}).get("minimum_star_snr", 10.0))
+    for method in dict.fromkeys(str(value) for value in table["method"]):
+        values = []
+        for row in table:
+            if str(row["method"]) != method or str(row["source_id"]) not in catalog:
+                continue
+            if not bool(row["valid"]) or (_finite_float(row["snr"]) or 0.0) < minimum:
+                continue
+            instrumental, _ = _instrumental_magnitude(
+                _finite_float(row["flux"]), _finite_float(row["flux_uncertainty"]),
+                _finite_float(row["exposure_time"]))
+            if instrumental is not None:
+                values.append(catalog[str(row["source_id"])] - instrumental)
+        if len(values) >= 3:
+            output[method] = {
+                "zeropoint_mag": float(np.median(values)),
+                "scatter_mag": _robust_scatter(values),
+                "star_count": len(values),
+                "catalog": routed,
+                "magnitude_system": system,
+            }
+    for alias, source in ZEROPOINT_METHODS.items():
+        if source in output and alias not in output:
+            output[alias] = dict(output[source], from_method=source)
+    return output
+
+
 def perform_science_image_photometry(
     image_record,
     target_solution,
@@ -1772,6 +2002,14 @@ def perform_science_image_photometry(
             source_measurements.append(psf_measurement)
             if source["source_type"] == "target":
                 target_diagnostics = diagnostics
+                recentered, recentered_diagnostics = _recentered_psf_measurement(
+                    data, variance, masks, source, background, psf_result, settings,
+                    pixel_scale, psf_measurement,
+                    None if diagnostics is None else diagnostics.get("free_centroid"),
+                )
+                if recentered is not None:
+                    source_measurements.append(recentered)
+                    target_diagnostics["recentered"] = recentered_diagnostics
         if source["source_type"] == "target":
             target_flags = list(
                 dict.fromkeys(
@@ -1788,7 +2026,9 @@ def perform_science_image_photometry(
         for measurement in source_measurements:
             flags = list(measurement["flags"])
             if source["source_type"] == "target":
-                flags = list(dict.fromkeys(flags + target_flags))
+                flags = list(dict.fromkeys(flags + [
+                    flag for flag in target_flags
+                    if flag not in METHOD_ONLY_FLAGS or flag in measurement["flags"]]))
             rows.append(
                 {
                     "image_id": image_id,
@@ -1805,10 +2045,10 @@ def perform_science_image_photometry(
                     "source_type": source["source_type"],
                     "roles": source["roles"],
                     "method": measurement["method"],
-                    "fixed_position": True,
+                    "fixed_position": measurement["method"] != "psf_recentered",
                     "coordinate_version": target_solution.get("version", ""),
-                    "x": source["x"],
-                    "y": source["y"],
+                    "x": measurement.get("x", source["x"]),
+                    "y": measurement.get("y", source["y"]),
                     "ra_deg": source["ra_deg"],
                     "dec_deg": source["dec_deg"],
                     "flux": measurement["flux"],
@@ -1888,9 +2128,11 @@ def perform_science_image_photometry(
                 ),
             }
         )
+    preliminary = _preliminary_zeropoints(table, measurements, image_id, settings)
     return {
         "image_id": image_id,
         "filename": metadata.get("filename", image_id),
+        "preliminary_zeropoints": preliminary,
         "target_coordinate_version": target_solution.get("version"),
         "fixed_target_ra_deg": float(target_solution["ra_deg"]),
         "fixed_target_dec_deg": float(target_solution["dec_deg"]),
@@ -2272,7 +2514,15 @@ def _solve_zeropoint_group(records, indices, unstable_pairs, settings):
             continue
         if record["input_accepted"] and record["individual_zeropoint"] is not None:
             usable.append(index)
-    usable.sort(key=lambda index: -(records[index]["snr"] or 0.0))
+    # Stars closest to the preferred S/N first (see
+    # catalogs.calibration_preference), not simply the brightest.
+    from .catalogs import calibration_preference
+
+    preference = calibration_preference(
+        [records[index]["snr"] or 0.0 for index in usable],
+        calibration.get("preferred_star_snr", 100.0),
+    )
+    usable = [usable[position] for position in np.argsort(-preference, kind="stable")]
     usable = usable[: int(calibration.get("maximum_stars", 200))]
     inlier = np.ones(len(usable), dtype=bool)
     sigma = float(calibration.get("sigma_clip", 3.0))
@@ -2436,7 +2686,9 @@ def _aperture_corrections(measurements, settings, image_settings=None):
     image_settings = image_settings or {}
     rows = []
     image_ids = list(dict.fromkeys(str(value) for value in measurements["image_id"]))
-    methods = list(dict.fromkeys(str(value) for value in measurements["method"]))
+    # Target-only methods (psf_recentered) use the correction of their source method.
+    methods = [method for method in dict.fromkeys(str(value) for value in measurements["method"])
+               if method not in ZEROPOINT_METHODS]
     for image_id in image_ids:
         calibration = (image_settings.get(image_id) or settings).get("calibration", {})
         reference = calibration.get("reference_aperture_method", "large_aperture")
@@ -2519,7 +2771,7 @@ def _calibration_trends(records, settings):
     variables = {
         "magnitude": "catalog_magnitude",
         "color": "catalog_color",
-        "snr": "snr",
+        "log_snr": "snr",
         "detector_x": "x",
         "detector_y": "y",
         "airmass": "airmass",
@@ -2528,10 +2780,13 @@ def _calibration_trends(records, settings):
         selected = [record for record in records if record["method"] == method and record["inlier"]]
         residuals = [record["calibrated_residual"] for record in selected]
         for variable, key in variables.items():
-            slope, correlation, count = _linear_trend(
-                [np.nan if record[key] is None else record[key] for record in selected],
-                residuals,
-            )
+            values = [np.nan if record[key] is None else record[key] for record in selected]
+            if variable == "log_snr":
+                # In log S/N: a linear S/N span is set by the few brightest
+                # stars, so a slope over it measured only those.
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    values = np.log10(np.asarray(values, dtype=float))
+            slope, correlation, count = _linear_trend(values, residuals)
             warning = (
                 slope is not None
                 and abs(slope) > float(calibration.get("trend_slope_warn_mag", 0.05))
@@ -2668,7 +2923,7 @@ def _empty_aperture_noise(record, science_result, psf_result, method, settings):
             max(np.shape(psf_result.get("model_native"))) / 2.0
             if psf_result.get("model_native") is not None else fwhm * 2.5
         ),
-    }[method]
+    }[_zeropoint_method(method)]
     margin = max(
         method_radius,
         float(aperture_settings.get("sky_outer_radius_fwhm", 7.0)) * fwhm,
@@ -2785,6 +3040,10 @@ def _limit_products(
     solution_lookup = {
         (str(row["image_id"]), str(row["method"])): row for row in solutions
     }
+    for (image_id, method), row in list(solution_lookup.items()):
+        for alias, source in ZEROPOINT_METHODS.items():
+            if method == source:
+                solution_lookup.setdefault((image_id, alias), row)
     record_lookup = {
         _image_id(record, index): record for index, record in enumerate(image_records or [])
     }
@@ -2877,6 +3136,11 @@ def _calibrated_measurements(
     correction_lookup = {
         (str(row["image_id"]), str(row["method"])): row for row in corrections
     }
+    for lookup in (solution_lookup, correction_lookup):
+        for (image_id, method), row in list(lookup.items()):
+            for alias, source in ZEROPOINT_METHODS.items():
+                if method == source:
+                    lookup.setdefault((image_id, alias), row)
     calibration_lookup = {
         int(record["measurement_index"]): record for record in calibration_records
     }
@@ -3295,6 +3559,7 @@ def _zeropoint_lookup(zeropoints, image_id, method):
 
     if zeropoints is None:
         return None, None
+    method = _zeropoint_method(method)
     if isinstance(zeropoints, Mapping):
         value = zeropoints.get((str(image_id), str(method)), zeropoints.get(str(method)))
         if isinstance(value, Mapping):
@@ -3553,7 +3818,9 @@ def perform_difference_image_photometry(
     local_settings = merge_settings(
         settings,
         {
-            "apertures": {"add_poisson_noise_when_needed": False},
+            # The recentered PSF is a science-image method (step 13); the
+            # difference image is measured at the frozen position only.
+            "apertures": {"add_poisson_noise_when_needed": False, "recentered_psf": False},
             "upper_limits": {
                 "minimum_empty_apertures": configured.get("minimum_empty_apertures", 20),
                 "calculate_on_difference": True,

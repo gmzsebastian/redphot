@@ -131,8 +131,11 @@ gain/read-noise/saturation flags.
 Image and astrometry flags include ``BAD_EDGES``, ``TARGET_NEAR_EDGE``,
 ``TARGET_MASKED``, ``TRAIL_PRESENT``, ``TARGET_TRAIL``,
 ``TARGET_COSMIC_RAY``, ``BACKGROUND_UNRELIABLE``, ``BACKGROUND_MESHES_EXCLUDED``,
-``FRINGE_CORRECTION_FAILED``, ``WCS_MISSING``, ``WCS_POOR``, and relative
-alignment failures.
+``FRINGE_CORRECTION_FAILED``, ``WCS_MISSING``, ``WCS_POOR``,
+``WCS_DISTORTION_FITTED`` (informational: SIP distortion terms were adopted),
+and relative alignment failures. ``TARGET_RECENTERED`` (WARN) marks a target
+whose free-centroid PSF fit (method ``psf_recentered``) moved more than
+``apertures.recentered_psf_warn_offset_arcsec`` from the frozen position.
 
 Quality flags include ``TOO_FEW_SOURCES``, ``SEEING_POOR``, high ellipticity or
 background, ``TRACKING_POOR``, ``QUALITY_BATCH_OUTLIER``, low catalog recovery,

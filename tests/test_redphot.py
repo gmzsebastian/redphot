@@ -2162,3 +2162,319 @@ def test_target_moves_below_the_tolerance_keep_other_images():
     assert part(base + 9 * mas, 10.0, position)[0] == first      # 9 mas: kept
     assert part(base + 12 * mas, 10.0, position)[0] != first     # 12 mas: redone
     assert part(base + 2 * mas, 0.0, position)[0] != first       # exact comparison
+
+
+# ---------------------------------------------------------------------------
+# Astrometry: SIP distortion only when the data need it (round 10)
+# ---------------------------------------------------------------------------
+
+def _distortion_matches(count=300, distortion=0.0, clustered=False, seed=1, shape=(1000, 1000),
+                        noise_pixels=0.3):
+    """Matches of a field whose true WCS has ``distortion`` px of quadratic
+    distortion at the frame edge, against a header WCS without distortion
+    (shifted by a couple of pixels)."""
+
+    from astropy.coordinates import SkyCoord
+    from astropy.wcs import Sip
+
+    rng = np.random.default_rng(seed)
+
+    def plain():
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        wcs.wcs.crval = [103.6, 17.5]
+        wcs.wcs.crpix = [shape[1] / 2 + 0.5, shape[0] / 2 + 0.5]
+        wcs.wcs.cd = np.array([[-0.2 / 3600, 0.0], [0.0, 0.2 / 3600]])
+        wcs.wcs.set()
+        return wcs
+
+    truth = plain()
+    if distortion:
+        a = np.zeros((3, 3))
+        b = np.zeros((3, 3))
+        a[2, 0] = b[0, 2] = distortion / 500.0 ** 2
+        a[1, 1] = 0.5 * distortion / 500.0 ** 2
+        truth.wcs.ctype = ["RA---TAN-SIP", "DEC--TAN-SIP"]
+        truth.sip = Sip(a, b, None, None, truth.wcs.crpix)
+        truth.wcs.set()
+    if clustered:
+        x, y = rng.uniform(100, 300, count), rng.uniform(100, 300, count)
+    else:
+        x, y = rng.uniform(5, shape[1] - 6, count), rng.uniform(5, shape[0] - 6, count)
+    sky = truth.pixel_to_world(x, y)
+    measured_x = x + rng.normal(0, noise_pixels, count)
+    measured_y = y + rng.normal(0, noise_pixels, count)
+    header = plain()
+    header.wcs.crpix = header.wcs.crpix + np.array([1.5, -2.0])
+    header.wcs.set()
+    catalog_x, catalog_y = header.world_to_pixel(sky)
+    detected = header.pixel_to_world(measured_x, measured_y)
+    longitude, latitude = detected.spherical_offsets_to(sky)
+    matches = Table()
+    matches["x"] = measured_x
+    matches["y"] = measured_y
+    matches["catalog_x_original"] = catalog_x
+    matches["catalog_y_original"] = catalog_y
+    matches["catalog_ra"] = sky.ra.deg
+    matches["catalog_dec"] = sky.dec.deg
+    matches["separation_original_arcsec"] = detected.separation(sky).arcsec
+    matches["residual_ra_original_arcsec"] = longitude.arcsec
+    matches["residual_dec_original_arcsec"] = latitude.arcsec
+    matches["inlier"] = True
+    return header, matches, SkyCoord(103.6, 17.5, unit="deg"), truth
+
+
+def test_distortion_fit_is_adopted_for_injected_quadratic_distortion():
+    from redphot.catalogs import refine_wcs_from_matches
+
+    header, matches, target, truth = _distortion_matches(distortion=6.0)
+    wcs, matches, info = refine_wcs_from_matches(
+        header, matches, get_default_settings(), shape=(1000, 1000), target=target)
+    assert info["distortion_adopted"]
+    assert info["distortion_reason"] == "adopted"
+    assert info["distortion_degree"] == 2
+    assert "WCS_DISTORTION_FITTED" in info["flags"]
+    assert info["quality_status"] == "PASS"
+    assert info["distortion_rms_arcsec"] < 0.5 * info["similarity_rms_arcsec"]
+    assert info["refined_rms_arcsec"] < 0.5 * info["similarity_rms_arcsec"]
+    assert info["distortion_max_shift_pixels"] < 10.0
+    assert "separation_similarity_arcsec" in matches.colnames
+    assert "separation_distortion_arcsec" in matches.colnames
+    # Positions follow the true distortion, also where there are no stars
+    # in between (a grid over the frame).
+    x, y = np.meshgrid(np.linspace(0, 999, 9), np.linspace(0, 999, 9))
+    error = truth.pixel_to_world(x, y).separation(wcs.pixel_to_world(x, y)).arcsec
+    assert np.max(error) < 0.1
+    # The header written from it (with the fitted inverse terms) is the same WCS.
+    copy = WCS(info["refined_wcs_header"], relax=True)
+    assert np.max(copy.pixel_to_world(x, y).separation(wcs.pixel_to_world(x, y)).arcsec) < 1e-6
+    back_x, back_y = copy.sip_foc2pix(*copy.sip_pix2foc(x.ravel(), y.ravel(), 0), 0)
+    assert np.max(np.hypot(back_x - x.ravel(), back_y - y.ravel())) < 0.05
+
+
+def test_distortion_fit_is_not_adopted_without_distortion():
+    from redphot.catalogs import refine_wcs_from_matches
+
+    header, matches, target, _ = _distortion_matches(distortion=0.0)
+    wcs, matches, info = refine_wcs_from_matches(
+        header, matches, get_default_settings(), shape=(1000, 1000), target=target)
+    assert not info["distortion_adopted"]
+    assert info["distortion_reason"] == "no_significant_improvement"
+    assert "WCS_DISTORTION_FITTED" not in info["flags"]
+    assert getattr(wcs, "sip", None) is None
+    assert info["refined_rms_arcsec"] == pytest.approx(info["similarity_rms_arcsec"])
+
+
+@pytest.mark.parametrize("kind", ["few", "clustered", "target_outside"])
+def test_distortion_fit_needs_enough_stars_spread_over_the_frame(kind):
+    from astropy.coordinates import SkyCoord
+    from redphot.catalogs import refine_wcs_from_matches
+
+    header, matches, target, _ = _distortion_matches(
+        count=20 if kind == "few" else 300, distortion=6.0, clustered=kind == "clustered")
+    if kind == "target_outside":
+        target = header.pixel_to_world(1200.0, 1200.0)
+        target = SkyCoord(target.ra, target.dec)
+    _, _, info = refine_wcs_from_matches(
+        header, matches, get_default_settings(), shape=(1000, 1000), target=target)
+    assert not info["distortion_adopted"]
+    assert info["distortion_reason"] == ("too_few_stars" if kind == "few" else "poor_coverage")
+
+
+def test_distortion_modes_never_and_always():
+    from redphot.catalogs import refine_wcs_from_matches
+
+    header, matches, target, _ = _distortion_matches(distortion=6.0)
+    settings = get_default_settings()
+    settings["astrometry"]["distortion_mode"] = "never"
+    wcs, _, info = refine_wcs_from_matches(header, matches, settings, shape=(1000, 1000),
+                                           target=target)
+    assert not info["distortion_adopted"] and info["distortion_reason"] == "disabled"
+    assert getattr(wcs, "sip", None) is None
+    # The keyword wins over the setting (the relative alignment uses "never").
+    header, matches, target, _ = _distortion_matches(distortion=0.0)
+    wcs, _, info = refine_wcs_from_matches(header, matches, get_default_settings(),
+                                           shape=(1000, 1000), target=target,
+                                           distortion_mode="always")
+    assert info["distortion_adopted"] and info["distortion_reason"] == "always"
+    assert wcs.sip is not None
+    validate_settings(settings)
+    settings["astrometry"]["distortion_mode"] = "sometimes"
+    with pytest.raises(ValueError, match="distortion_mode"):
+        validate_settings(settings)
+
+
+def test_relative_alignment_never_fits_distortion():
+    from redphot.alignment import _relative_astrometry_settings
+
+    settings = get_default_settings()
+    settings["astrometry"]["distortion_mode"] = "always"
+    assert _relative_astrometry_settings(settings)["astrometry"]["distortion_mode"] == "never"
+
+
+def test_similarity_refinement_moves_sip_terms_with_the_wcs():
+    """Header written to disk and the WCS in memory agree for a SIP WCS."""
+
+    from astropy.wcs import Sip
+    from redphot.catalogs import _add_inverse_sip, _compose_similarity_wcs
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN-SIP", "DEC--TAN-SIP"]
+    wcs.wcs.crval = [103.6, 17.5]
+    wcs.wcs.crpix = [400.0, 900.0]
+    wcs.wcs.pc = np.array([[1.0, 0.02], [-0.01, 1.0]])
+    wcs.wcs.cdelt = [-5.4e-5, 5.4e-5]
+    a = np.zeros((4, 4))
+    b = np.zeros((4, 4))
+    a[2, 0], a[1, 1], a[3, 0] = 3e-6, -2e-6, 2e-9
+    b[0, 2], b[2, 0], b[1, 2] = 4e-6, 1e-6, -3e-9
+    wcs.sip = Sip(a, b, None, None, wcs.wcs.crpix)
+    wcs.wcs.set()
+    _add_inverse_sip(wcs, (1800, 800), 3)
+    angle = np.deg2rad(0.3)
+    transform = 1.002 * np.array([[np.cos(angle), -np.sin(angle)],
+                                  [np.sin(angle), np.cos(angle)]])
+    translation = np.array([2.5, -3.0])
+    refined = _compose_similarity_wcs(wcs, transform, translation)
+    x, y = np.meshgrid(np.linspace(0, 799, 9), np.linspace(0, 1799, 9))
+    moved = transform @ np.vstack([x.ravel(), y.ravel()]) + translation[:, None]
+    expected = wcs.pixel_to_world(moved[0], moved[1])
+    got = refined.pixel_to_world(x.ravel(), y.ravel())
+    assert np.max(expected.separation(got).arcsec) < 1e-6
+    assert np.allclose(refined.sip.crpix, refined.wcs.crpix)
+    header = WCS(refined.to_header(relax=True), relax=True)
+    assert np.max(header.pixel_to_world(x.ravel(), y.ravel()).separation(got).arcsec) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Read, cosmic rays, star selection and photometry updates (round 10)
+# ---------------------------------------------------------------------------
+
+def test_known_instruments_give_telescope_site_and_profile(tmp_path):
+    from redphot.config import known_instrument
+    from redphot.pipeline import _metadata_instrument_profile
+
+    assert known_instrument("LDSS3c")["telescope"].startswith("Magellan Clay")
+    assert known_instrument("IMACS Short-Camera")["telescope"].startswith("Magellan Baade")
+    assert known_instrument("kepcam")["site"].startswith("Fred Lawrence Whipple")
+    assert known_instrument("fa04") is None
+    # IMACS headers say SITENAME = 'LCO' (Las Campanas), not the LCO profile.
+    assert _metadata_instrument_profile({"instrument": "IMACS", "site": "LCO"}) is None
+    assert _metadata_instrument_profile({"detector": "kepcam"}) == "keplercam"
+    header = _wcs_header((64, 64))
+    header.update({"OBJECT": "AT_TEST", "INSTRUME": "LDSS3-C", "EXPTIME": 60.0,
+                   "MJD-OBS": 61000.0, "FILTER": "g", "SITENAME": "LCO"})
+    path = tmp_path / "ldss3.fits"
+    fits.PrimaryHDU(np.ones((64, 64), dtype=np.float32), header).writeto(path)
+    _, metadata = read_fits_image(path)
+    assert metadata["telescope"] == "Magellan Clay 6.5 m"
+    assert metadata["site"] == "Las Campanas Observatory"
+    assert metadata["_sources"]["site"]["header_value"] == "LCO"
+    # No pixel-scale keyword: from the WCS (0.4"/px in _wcs_header).
+    assert metadata["pixel_scale"] == pytest.approx(0.4)
+    assert metadata["_sources"]["pixel_scale"] == {"wcs": True}
+
+
+def test_cosmic_ray_on_the_target_core_is_kept_and_nearby_hits_are_masked():
+    pytest.importorskip("astroscrappy")
+    rng = np.random.default_rng(5)
+    shape = (120, 120)
+    data = rng.normal(100.0, 5.0, shape)
+    # A sharp transient at the target and a hit 8 px away (off the core).
+    data[60, 60] += 4000.0
+    data[60, 68] += 3000.0
+    wcs = WCS(_wcs_header(shape))
+    ccd = CCDData(data, unit=u.adu, wcs=wcs)
+    target = wcs.pixel_to_world(60.0, 60.0)
+    settings = get_default_settings()
+    settings["masks"]["cosmic_rays"]["enabled"] = True
+    metadata = {"gain": 1.0, "read_noise": 5.0, "saturation": 60000.0}
+    _, products, info = apply_cosmic_rays(ccd, metadata, settings, target=target)
+    assert info["target_overlap"]
+    assert "TARGET_COSMIC_RAY" in info["flags"]
+    assert products["target_protected_mask"][60, 60]
+    assert not products["cosmic_mask"][60, 60]
+    assert products["cosmic_mask"][60, 68]
+    assert info["target_nearby_masked_pixels"] > 0
+
+
+def test_photometric_outliers_are_not_zeropoint_stars():
+    from redphot.catalogs import _screen_photometric_outliers, calibration_preference
+
+    count = 40
+    magnitude = np.linspace(16, 20, count)
+    flux = 10 ** (-0.4 * (magnitude - 25.0))
+    flux[5] *= 6.0  # a blend or mismatch: 2 mag too bright
+    table = Table({
+        "image_id": ["one"] * count, "magnitude": magnitude, "aperture_flux": flux,
+        "aperture_flux_error": 0.01 * flux, "image_accepted": np.ones(count, dtype=bool),
+        "rejection_reasons": [""] * count,
+    })
+    screened = _screen_photometric_outliers(table, get_default_settings())
+    assert not screened["image_accepted"][5]
+    assert "PHOTOMETRIC_OUTLIER" in str(screened["rejection_reasons"][5])
+    assert screened["image_accepted"].sum() == count - 1
+    # Zeropoint stars near S/N 100 rank first; very bright stars last.
+    scores = calibration_preference([30, 100, 100 * 100 / 30, 3000])
+    assert scores[1] > scores[0] > scores[3]
+    assert scores[0] == pytest.approx(scores[2])
+
+
+def _psf_target_record(shape=(80, 80), offset=(0.0, 0.0), flux=50000.0, mask=None):
+    rng = np.random.default_rng(31)
+    wcs = WCS(_wcs_header(shape))
+    sigma = 1.7
+    data = rng.normal(0.0, 2.0, shape)
+    _gaussian_star(data, shape[1] / 2 - 0.5 + offset[0], shape[0] / 2 - 0.5 + offset[1],
+                   flux, sigma)
+    ccd = CCDData(data, unit=u.adu, wcs=wcs, mask=mask)
+    model_y, model_x = np.indices((21, 21))
+    model = np.exp(-((model_x - 10) ** 2 + (model_y - 10) ** 2) / (2 * sigma ** 2))
+    model /= model.sum()
+    record = {
+        "image_id": "star", "ccd": ccd,
+        "metadata": {"filename": "star.fits", "filter": "r", "exposure_time": 30.0},
+        "quality": {"background_rms": 2.0, "fwhm_pixels": 4.0},
+    }
+    target = wcs.pixel_to_world(shape[1] / 2 - 0.5, shape[0] / 2 - 0.5)
+    solution = {"ra_deg": float(target.ra.deg), "dec_deg": float(target.dec.deg),
+                "frozen": True, "version": "test"}
+    psf = {"image_id": "star", "model": model, "model_native": model, "fwhm_pixels": 4.0,
+           "approved_for_photometry": True, "status": "PASS", "review_state": "REVIEWED",
+           "model_type": "gaussian", "normalization": 1.0}
+    return record, solution, psf
+
+
+def test_recentered_psf_photometry_follows_an_offset_source():
+    record, solution, psf = _psf_target_record(offset=(1.0, -0.6))
+    result = perform_science_image_photometry(record, solution, psf)
+    table = result["measurements"]
+    rows = table[np.asarray(table["source_type"], dtype=str) == "target"]
+    methods = list(np.asarray(rows["method"], dtype=str))
+    assert "psf_recentered" in methods
+    forced = rows[methods.index("psf")]
+    moved = rows[methods.index("psf_recentered")]
+    # The free centroid finds the 1.17 px offset (it used to stay at 0).
+    free = result["target_diagnostics"]["free_centroid"]
+    assert free["offset_x_pixels"] == pytest.approx(1.0, abs=0.05)
+    assert free["offset_y_pixels"] == pytest.approx(-0.6, abs=0.05)
+    assert float(moved["flux"]) == pytest.approx(50000.0, rel=0.02)
+    assert float(moved["flux"]) > float(forced["flux"])
+    assert "TARGET_RECENTERED" in str(moved["flags"])
+    assert "TARGET_RECENTERED" not in str(forced["flags"])
+    assert "TARGET_RECENTERED" in result["target_flags"]
+    assert "recentered" in result["target_diagnostics"]
+
+
+def test_masked_pixels_in_the_psf_wings_do_not_flag_the_target():
+    shape = (80, 80)
+    mask = np.zeros(shape, dtype=bool)
+    mask[39 + 9, 39 + 9] = True  # in the corner of the 21x21 PSF box, ~5 sigma out
+    record, solution, psf = _psf_target_record(shape, mask=mask)
+    result = perform_science_image_photometry(record, solution, psf)
+    assert "TARGET_MASKED" not in result["target_flags"]
+    assert result["target_diagnostics"]["masked_weight_fraction"] < 0.01
+    mask[39:42, 39:42] = True  # on the core
+    record, solution, psf = _psf_target_record(shape, mask=mask)
+    result = perform_science_image_photometry(record, solution, psf)
+    assert "TARGET_MASKED" in result["target_flags"]

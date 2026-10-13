@@ -848,7 +848,7 @@ def acquire_template(image_records, filter_name=None, settings=None,
             mosaic = candidate
             if not from_cache and subtraction.get("save_downloaded_templates", True):
                 cache.mkdir(parents=True, exist_ok=True)
-                header = mosaic["wcs"].to_header()
+                header = mosaic["wcs"].to_header(relax=True)
                 header["FILTER"] = filter_name
                 header["SURVEY"] = survey
                 fits.PrimaryHDU(mosaic["data"], header).writeto(cache_path, overwrite=True)
@@ -2184,14 +2184,14 @@ def save_subtraction_products(result, output_directory, settings=None,
     aligned = result.get("aligned_template")
     if aligned is not None and subtraction.get("save_aligned_template", True):
         path = output / "{}_aligned_template.fits".format(stem)
-        fits.PrimaryHDU(aligned["data"], aligned["wcs"].to_header()).writeto(
+        fits.PrimaryHDU(aligned["data"], aligned["wcs"].to_header(relax=True)).writeto(
             path, overwrite=bool(overwrite)
         )
         paths["aligned_template"] = str(path)
     difference = result.get("difference")
     if difference is not None and subtraction.get("save_difference", True):
         path = output / "{}_difference.fits".format(stem)
-        header = aligned["wcs"].to_header() if aligned is not None else fits.Header()
+        header = aligned["wcs"].to_header(relax=True) if aligned is not None else fits.Header()
         header["SUBSTAT"] = str(result.get("status", "FAIL"))
         header["SUBMETH"] = str(result.get("method", "unknown"))
         fits.PrimaryHDU(difference, header).writeto(path, overwrite=bool(overwrite))

@@ -96,7 +96,13 @@ The main sections are deliberately aligned with the processing order:
 ``catalogs`` and ``astrometry``
    Catalog choice/routing, query radius and cache, local-catalog mapping, epoch
    propagation, matching, WCS residual limits, allowed refinement terms, and
-   optional plate-solving fallback.
+   optional plate-solving fallback. ``distortion_mode`` ("auto", "never" or
+   "always") decides SIP distortion terms; in "auto" they are adopted only
+   when ``distortion_minimum_stars`` stars cover at least
+   ``distortion_minimum_grid_cells`` of a 3×3 grid and the target, the RMS on
+   held-out stars improves by both ``distortion_minimum_improvement_fraction``
+   and ``distortion_minimum_improvement_arcsec``, and the correction stays
+   below ``distortion_maximum_shift_pixels`` (see :doc:`algorithms`).
 
 ``comparison_stars``
    Master-catalog and per-image screening, role-specific magnitude/S/N limits,

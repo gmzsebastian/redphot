@@ -135,7 +135,10 @@ against exposure time).
 
 Look at ``01_read``: one row per image. ``DEFAULT`` marks a value that came
 from the instrument defaults (no header keyword), ``CONFLICT`` a header value
-that disagrees with another one.
+that disagrees with another one. For known instruments (LDSS3, IMACS,
+KeplerCam, Binospec, ...; ``redphot.config.KNOWN_INSTRUMENTS``) the telescope
+and site come from the instrument; without a pixel-scale keyword the pixel
+scale comes from the WCS.
 
 To change, per image, any header field with ``<field>_override``:
 ``saturation_override``, ``gain_override``, ``read_noise_override``,
@@ -189,8 +192,11 @@ Step 4 -- cosmic_rays_04
 Masks cosmic rays with L.A.Cosmic (``astroscrappy``). Off unless
 ``masks.cosmic_rays.enabled`` is True.
 
-Look at ``04_cosmic_rays``: masked pixels per image; hits on the target are
-flagged ``TARGET_COSMIC_RAY``.
+Look at ``04_cosmic_rays``: masked pixels per image. Detections touching the
+target core (``target_core_radius_fwhm``, 1 FWHM) are most likely the
+transient itself: they are left unmasked, drawn in amber and flagged
+``TARGET_COSMIC_RAY``. Hits near the target but off its core are masked like
+any other.
 
 To change: ``objlim`` (5) -- raise it when star cores are masked as hits
 (sharp seeing); ``sigclip`` (4.5) -- detection threshold; ``enabled``.
@@ -254,18 +260,29 @@ Step 8 -- astrometry_08
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 Matches the sources to Gaia and checks the WCS; refines it when the match
-allows.
+allows (translation, rotation and scale), then tries SIP distortion terms and
+keeps them only when the data clearly need them: enough stars spread over the
+frame and around the target, residuals on stars left out of the fit better by
+at least 25 % and 0.05 arcsec, and a correction under 10 px everywhere. In
+practice that is a few images from cameras with real distortion (LDSS3c,
+maybe IMACS), and practically never KeplerCam.
 
-Look at ``08_astrometry``: WCS RMS (aim below 0.5 arcsec) and the number of
-matched stars.
+Look at ``08_astrometry``: WCS RMS (aim below 0.5 arcsec), the number of
+matched stars, and the residuals with and without distortion. Images with
+distortion terms have the flag ``WCS_DISTORTION_FITTED`` and "SIP n" next to
+their name in the overview.
 
 To change: ``maximum_match_separation_arcsec`` (5) -- allow larger offsets for
-a poor header WCS; ``fit_distortion`` (False) -- fit distortion terms;
-``minimum_matches`` (6).
+a poor header WCS; ``distortion_mode`` ("auto") -- ``"never"`` or ``"always"``
+to override the rule; ``distortion_sip_degrees`` ([2, 3]),
+``distortion_minimum_stars`` (30), ``distortion_minimum_improvement_fraction``
+(0.25), ``distortion_minimum_improvement_arcsec`` (0.05),
+``distortion_maximum_shift_pixels`` (10); ``minimum_matches`` (6).
 
 .. code-block:: python
 
    astrometry_08(run, images=[12], maximum_match_separation_arcsec=8.0)
+   astrometry_08(run, images=[12], distortion_mode="never")
 
 Step 9 -- star_selection_09
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -278,10 +295,15 @@ Each rejected star has its reasons listed.
 Look at ``09_star_selection``: the number of calibration and PSF stars in
 each image and why the others were rejected.
 
+Zeropoint stars closest to S/N 100 are taken first (so fainter stars, like
+the science targets, are used rather than only the brightest), and stars whose
+quick magnitude is off the catalog (``PHOTOMETRIC_OUTLIER``) are not used.
+
 To change (per image when needed): ``minimum_snr`` (10),
 ``maximum_magnitude`` / ``minimum_magnitude`` (22 / 10),
 ``maximum_ellipticity`` (0.35), ``psf_minimum_snr`` (30),
-``maximum_calibration_stars`` (200), ``maximum_stars`` (20, PSF stars).
+``maximum_calibration_stars`` (200), ``calibration_preferred_snr`` (100),
+``photometric_outlier_sigma`` (5), ``maximum_stars`` (20, PSF stars).
 
 .. code-block:: python
 
@@ -321,7 +343,7 @@ photometry is done at that position).
 
 Look at ``11_alignment``: in ``batch.png`` the check stars should sit at the
 center of every cutout; ``target_position.png`` shows where the target was
-put.
+put (the dashed circle has a 0.1 arcsec radius).
 
 To change: ``user_position_mode`` ("prior") -- "fixed" uses ``TARGET``
 exactly instead of measuring it; ``centroid_search_radius_arcsec`` (3);
@@ -353,14 +375,23 @@ Step 13 -- science_photometry_13
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Forced photometry of the target and the selected stars at the fixed positions:
-PSF fit and two apertures, with a local sky annulus.
+PSF fit and two apertures, with a local sky annulus. When the forced PSF S/N
+of the target is at least 20, the PSF is also fitted with a free centroid
+(method ``psf_recentered``, an extra light curve; the forced ones are not
+changed); a move of more than 0.1 arcsec raises ``TARGET_RECENTERED`` (WARN)
+and the figure gets a third row with the recentered fit.
 
-Look at ``13_science_photometry``: target S/N, and the free-centroid offset
-(how far a free fit would move from the fixed position).
+Look at ``13_science_photometry``: the target magnitude of each method (with
+a quick zeropoint from this step's stars; the final ones come from step 14),
+data minus PSF model on the same stretch as the data, and the free-centroid
+offset.
 
 To change: ``small_radius_fwhm`` / ``large_radius_fwhm`` (1.0 / 2.5) --
 aperture radii in units of the FWHM; ``sky_inner_radius_fwhm`` /
-``sky_outer_radius_fwhm`` (4 / 7).
+``sky_outer_radius_fwhm`` (4 / 7); ``recentered_psf_minimum_snr`` (20),
+``recentered_psf_warn_offset_arcsec`` (0.1); ``psf_masked_weight_fraction``
+(0.01) -- masked pixels flag the target only when they carry more than this
+fraction of the PSF.
 
 .. code-block:: python
 
@@ -405,9 +436,12 @@ Step 16 -- subtraction_16
 
 Registers the template to each image and subtracts it with Hotpants.
 
-Look at ``16_subtraction``: the zoom on the target, the star residuals
+Look at ``16_subtraction``: science, template (as subtracted) and difference
+on one stretch, the zoom on the target, the star residuals
 (``maximum_residual_fraction``, 0.1) and the noise ratio
-(``maximum_noise_ratio``, 2).
+(``maximum_noise_ratio``, 2). ``save_subtraction=True`` also writes the three
+images as FITS files to ``diagnostics/16_subtraction/fits/`` to blink them in
+DS9 (without redoing the subtraction).
 
 To change: ``kernel_order`` ("auto") -- 0 for an unstable kernel;
 ``stamp_count``, ``kernel_radius`` ("auto"); ``registration_order``
@@ -416,6 +450,7 @@ To change: ``kernel_order`` ("auto") -- 0 for an unstable kernel;
 .. code-block:: python
 
    subtraction_16(run, images=[11], kernel_order=0)
+   subtraction_16(run, save_subtraction=True)
 
 Step 17 -- difference_photometry_17
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -434,7 +469,11 @@ Step 18 -- batch_consistency_18
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 All images together. Light curves of the comparison stars, comparison of the
-photometry methods, outliers, and the preferred light curve.
+photometry methods, outliers, and the final light curve: one measurement per
+image, the first valid result of ``preferred_order`` (difference-image PSF,
+then the difference-image apertures, then the science-image methods). The
+figure shows it above the zeropoint, seeing, depth and WCS RMS of each epoch
+on the same MJD axis.
 
 To change: ``comparison_star_rms_warn_mag`` (0.05), ``preferred_order``,
 ``ensemble_correction`` (off).

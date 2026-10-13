@@ -180,6 +180,7 @@ def _relative_astrometry_settings(settings):
     astrometry = output.setdefault("astrometry", {})
     astrometry.update(
         {
+            "distortion_mode": "never",
             "minimum_matches": int(
                 target.get("relative_alignment_minimum_common_stars", 6)
             ),
@@ -260,7 +261,16 @@ def refine_relative_alignment(image_records, measurements, usability_decisions=N
             "No usability-approved image with a celestial WCS is available "
             "for relative alignment"
         )
-    _, reference_index, reference_id = min(candidates)
+    # The reference has to share stars with every image: only images with at
+    # least relative_alignment_reference_star_fraction of the most stars
+    # measured in any image compete (a small field with an excellent WCS, e.g.
+    # after a distortion fit, would otherwise leave the wide fields a dozen
+    # common stars).
+    fraction = float(target_settings.get("relative_alignment_reference_star_fraction", 0.5))
+    most = max(len(rows_by_image[image_id]) for _, _, image_id in candidates)
+    wide = [item for item in candidates
+            if len(rows_by_image[item[2]]) >= fraction * most]
+    _, reference_index, reference_id = min(wide or candidates)
     reference_record = image_records[reference_index]
     reference_wcs = _record_wcs(reference_record)
     reference_rows = rows_by_image[reference_id]
@@ -334,11 +344,14 @@ def refine_relative_alignment(image_records, measurements, usability_decisions=N
                 info["flags"].append("RELATIVE_ALIGNMENT_FAILED")
             else:
                 shape = record["ccd"].shape if record.get("ccd") is not None else None
+                # Relative alignment stays a similarity fit: the distortion of
+                # each image (if any) comes from its astrometry WCS.
                 refined_wcs, matches, fit_info = refine_wcs_from_matches(
                     original_wcs,
                     matches,
                     settings=fit_settings,
                     shape=shape,
+                    distortion_mode="never",
                 )
                 info["wcs"] = refined_wcs
                 for name in (

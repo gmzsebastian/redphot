@@ -30,7 +30,8 @@ from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 
-from .config import get_default_settings, normalize_filter_name, normalize_instrument_name
+from .config import (get_default_settings, known_instrument, normalize_filter_name,
+                     normalize_instrument_name)
 from .metadata import normalize_and_validate_metadata
 
 
@@ -917,6 +918,22 @@ def extract_metadata(hdulist, settings, data_index, wcs_index=None):
     if metadata_settings.get("normalize_filter", True):
         metadata["filter"] = normalize_filter_name(metadata.get("filter"))
 
+    # Telescope and site of a known instrument (headers often leave them out
+    # or give site codes); explicit overrides still win.
+    entry = known_instrument(metadata.get("instrument"), metadata.get("detector"))
+    if entry is not None:
+        for field in ("telescope", "site"):
+            if metadata_settings.get("{}_override".format(field)) is not None:
+                continue
+            header_value = metadata.get(field)
+            metadata[field] = entry[field]
+            source = {"instrument": entry["instrument"]}
+            if header_value not in (None, "") and header_value != entry[field] and \
+                    "keyword" in (sources.get(field) or {}):
+                source["header_value"] = header_value
+                source["keyword"] = sources[field]["keyword"]
+            sources[field] = source
+
     binning_x, binning_y = _parse_binning(metadata.get("binning"))
     metadata["binning_x"] = binning_x
     metadata["binning_y"] = binning_y
@@ -1091,6 +1108,20 @@ def read_fits_image(path, settings=None, target=None):
                 "finite_fraction": _finite_fraction(array),
             }
         )
+        scale_source = (metadata.get("_sources") or {}).get("pixel_scale") or {}
+        if (metadata.get("pixel_scale") is None or "fallback" in scale_source) and \
+                wcs is not None and getattr(wcs, "has_celestial", False):
+            # No pixel-scale keyword: take it from the WCS (mean of the two
+            # axes at the reference point), which also knows the binning,
+            # rather than an instrument default.
+            try:
+                scales = proj_plane_pixel_scales(wcs.celestial)
+                scale = float(np.mean(scales)) * 3600.0
+                if np.isfinite(scale) and scale > 0:
+                    metadata["pixel_scale"] = scale
+                    metadata.setdefault("_sources", {})["pixel_scale"] = {"wcs": True}
+            except Exception:
+                pass
         metadata = normalize_and_validate_metadata(
             hdulist,
             metadata,
@@ -3070,8 +3101,10 @@ def apply_cosmic_rays(ccd, metadata=None, settings=None, target=None, psf_positi
     - ``clean``: add the mask and also produce a cleaned derivative, kept
       separate so repaired pixels are not treated as measurements.
 
-    Cosmic rays intersecting the target position or a supplied PSF-star core
-    raise ``TARGET_COSMIC_RAY``. Gain, read noise, and saturation come from the
+    Detections touching the target core (``target_core_radius_fwhm``) are
+    left unmasked, since they are most likely the transient itself, and raise
+    ``TARGET_COSMIC_RAY``; detections near the target but off its core are
+    masked like any other. Gain, read noise, and saturation come from the
     metadata unless overridden. The input ``ccd`` is not modified.
 
     Returns
@@ -3197,30 +3230,40 @@ def apply_cosmic_rays(ccd, metadata=None, settings=None, target=None, psf_positi
     fwhm = _fwhm_guess_pixels(settings)
     target_xy = _project_target_pixel(ccd, metadata, settings, target)
     if target_xy is not None:
+        # Detections touching the target core (target_core_radius_fwhm) are
+        # most likely the transient itself (L.A.Cosmic can take a compact,
+        # well-sampled transient for a hit): they are not masked and raise
+        # TARGET_COSMIC_RAY for review. Detections near the target but off
+        # its core (out to target_radius_fwhm) are ordinary hits and are
+        # masked like any other.
         radius = float(cosmic_settings.get("target_radius_fwhm", 3.0)) * fwhm
-        overlap = bool(check_mask_overlaps(cosmic_mask, [target_xy], [radius])[0])
+        core = float(cosmic_settings.get("target_core_radius_fwhm", 1.0)) * fwhm
+        ndimage = _try_ndimage()
+        labels = None
+        if ndimage is not None and cosmic_mask.any():
+            labels, _ = ndimage.label(cosmic_mask, structure=np.ones((3, 3), dtype=int))
+        yy, xx = np.ogrid[:shape[0], :shape[1]]
+        distance2 = (xx - target_xy[0]) ** 2 + (yy - target_xy[1]) ** 2
+        overlap = bool(np.any(cosmic_mask & (distance2 <= core ** 2)))
         info["target_overlap"] = overlap
+        info["target_core_radius_pixels"] = core
+        info["target_region_radius_pixels"] = radius
         if overlap:
             info["flags"].append("TARGET_COSMIC_RAY")
-            if cosmic_settings.get("reject_if_target_overlap", True):
-                # L.A.Cosmic can mistake a compact, well-sampled transient for
-                # a hit. Never mask the target: drop every detection that
-                # touches the target region and keep the flag for review.
-                ndimage = _try_ndimage()
-                if ndimage is not None:
-                    labels, _ = ndimage.label(cosmic_mask, structure=np.ones((3, 3), dtype=int))
-                    yy, xx = np.ogrid[:shape[0], :shape[1]]
-                    near = (xx - target_xy[0]) ** 2 + (yy - target_xy[1]) ** 2 <= radius ** 2
-                    touching = np.unique(labels[near & cosmic_mask])
-                    touching = touching[touching > 0]
-                    protected = np.isin(labels, touching)
-                    info["target_protected_pixels"] = int(protected.sum())
-                    cosmic_mask = cosmic_mask & ~protected
-                    products["cosmic_mask"] = cosmic_mask
-                    info["cosmic_pixel_count"] = int(cosmic_mask.sum())
-                    info["cosmic_pixel_fraction"] = (
-                        float(cosmic_mask.mean()) if cosmic_mask.size else 0.0
-                    )
+            if cosmic_settings.get("reject_if_target_overlap", True) and labels is not None:
+                touching = np.unique(labels[(distance2 <= core ** 2) & cosmic_mask])
+                touching = touching[touching > 0]
+                protected = np.isin(labels, touching)
+                info["target_protected_pixels"] = int(protected.sum())
+                products["target_protected_mask"] = protected
+                cosmic_mask = cosmic_mask & ~protected
+                products["cosmic_mask"] = cosmic_mask
+                info["cosmic_pixel_count"] = int(cosmic_mask.sum())
+                info["cosmic_pixel_fraction"] = (
+                    float(cosmic_mask.mean()) if cosmic_mask.size else 0.0
+                )
+        info["target_nearby_masked_pixels"] = int(np.count_nonzero(
+            cosmic_mask & (distance2 <= radius ** 2)))
 
     if psf_positions:
         radius = float(cosmic_settings.get("psf_core_radius_fwhm", 1.0)) * fwhm

@@ -267,9 +267,38 @@ two-dimensional similarity transform,
 
 Translation is always the least invasive candidate; rotation and scale are
 accepted only with enough well-distributed matches and a justified reduction
-in residual RMS. The refined WCS/header is derived metadata: science pixels
-are not resampled. Astrometry.net is an optional configured fallback, not a
-routine dependency.
+in residual RMS. When the header WCS carries SIP distortion terms, they move
+with the similarity correction (reference pixel and polynomials), so the WCS
+written to disk is the one used in memory.
+
+A SIP distortion fit (``astrometry.distortion_mode``) is then tried on the
+matches kept by the similarity fit, with ``astropy.wcs.utils.fit_wcs_from_points``
+and the similarity CRVAL as projection point. In ``"auto"`` mode (default) it
+is adopted only when the data clearly need it; all of these must hold:
+
+* at least ``distortion_minimum_stars`` (30) matched stars, with two or more in
+  at least ``distortion_minimum_grid_cells`` (7) cells of a 3×3 grid over the
+  frame, and the target inside the area covered by the stars (its position is
+  interpolated, never extrapolated);
+* the RMS on stars left out of the fit (``distortion_validation_splits`` = 5
+  random 80/20 splits, so an overfit cannot pass) better than the similarity
+  fit's on the same stars by both ``distortion_minimum_improvement_fraction``
+  (25 %) and ``distortion_minimum_improvement_arcsec`` (0.05″);
+* the correction smaller than ``distortion_maximum_shift_pixels`` (10 px)
+  everywhere in the frame.
+
+``distortion_sip_degrees`` lists the degrees tried in order ([2, 3]); a higher
+degree is tried only when the lower one does not improve enough. Otherwise the
+similarity WCS is kept and the reason recorded (``too_few_stars``,
+``poor_coverage``, ``no_significant_improvement``, ``unsafe``). An adopted fit
+sets the informational flag ``WCS_DISTORTION_FITTED`` (it does not change the
+status) and gets fitted inverse terms (AP/BP), so other tools reading the
+header map sky to pixels correctly. ``"never"`` skips the fit; ``"always"``
+adopts the degree with the best held-out RMS whenever there are enough stars.
+The relative alignment between images always stays a similarity fit.
+
+The refined WCS/header is derived metadata: science pixels are not resampled.
+Astrometry.net is an optional configured fallback, not a routine dependency.
 
 Comparison and PSF-star selection
 ---------------------------------
@@ -281,11 +310,21 @@ screens then apply edge, saturation/halo, nonlinearity (brighter than the
 FWHM broadening onset), mask/trail, S/N, shape, neighbor, and detector-region
 criteria.
 
+Stars whose quick aperture magnitude disagrees with the catalog (more than
+``photometric_outlier_sigma`` robust sigmas from the image's median offset,
+and at least ``photometric_outlier_minimum_mag``) are rejected as
+``PHOTOMETRIC_OUTLIER`` (blends, mismatches, variables) for every role but
+astrometry.
+
 Roles are independent: astrometry, PSF, calibration, ensemble comparison, and
 bright quality-control anchor. A star rejected for PSF shape can still be an
 astrometric match. Candidate scores combine the relevant quality terms, while
 grid-based selection prevents all PSF or calibration stars from occupying one
-small detector region. Every rejection reason and manual global/per-image
+small detector region. Zeropoint (calibration) stars closest to
+``calibration_preferred_snr`` (100, in log S/N) are taken first, so the
+sample reaches the fainter stars that resemble the science targets rather
+than only the brightest stars, nearest saturation and with the least reliable
+catalog magnitudes. Every rejection reason and manual global/per-image
 addition or removal is retained.
 
 Usability and limiting depth

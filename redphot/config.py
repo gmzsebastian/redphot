@@ -162,6 +162,7 @@ QUALITY_FLAGS = {
         "WCS_POOR",
         "WCS_TOO_FEW_MATCHES",
         "WCS_REFINEMENT_FAILED",
+        "WCS_DISTORTION_FITTED",
         "RELATIVE_ALIGNMENT_FAILED",
         "RELATIVE_ALIGNMENT_POOR",
     ],
@@ -194,6 +195,7 @@ QUALITY_FLAGS = {
         "TARGET_MASKED",
         "TARGET_FIT_FAILED",
         "TARGET_CENTROID_OFFSET",
+        "TARGET_RECENTERED",
         "TARGET_POSITION_UNCERTAIN",
         "TARGET_FILTER_SHIFT",
         "TARGET_CENTROID_HOST_DOMINATED",
@@ -253,6 +255,65 @@ INSTRUMENT_ALIASES = {
     "flwo": "keplercam",
     "flwo-1.2m": "keplercam",
 }
+
+
+# Where known instruments are mounted. When an image's instrument (or
+# detector) matches one of these, its telescope and site come from here
+# (headers often leave them out or use codes such as "flwo2" or "LCO", which
+# is both Las Campanas and Las Cumbres). Patterns are matched against the
+# instrument name in lower case without spaces or punctuation. ``profile`` is
+# the instrument profile to use (None: general defaults).
+KNOWN_INSTRUMENTS = [
+    {"patterns": ["ldss3", "ldss"], "instrument": "LDSS3",
+     "telescope": "Magellan Clay 6.5 m", "site": "Las Campanas Observatory", "profile": None},
+    {"patterns": ["imacs"], "instrument": "IMACS",
+     "telescope": "Magellan Baade 6.5 m", "site": "Las Campanas Observatory", "profile": None},
+    {"patterns": ["fourstar"], "instrument": "FourStar",
+     "telescope": "Magellan Baade 6.5 m", "site": "Las Campanas Observatory", "profile": None},
+    {"patterns": ["keplercam", "kepcam"], "instrument": "KeplerCam",
+     "telescope": "FLWO 1.2 m (48-inch)",
+     "site": "Fred Lawrence Whipple Observatory (Mt. Hopkins)", "profile": "keplercam"},
+    {"patterns": ["binospec"], "instrument": "Binospec",
+     "telescope": "MMT 6.5 m", "site": "Fred Lawrence Whipple Observatory (Mt. Hopkins)",
+     "profile": None},
+    {"patterns": ["mmirs"], "instrument": "MMIRS",
+     "telescope": "MMT 6.5 m", "site": "Fred Lawrence Whipple Observatory (Mt. Hopkins)",
+     "profile": None},
+    {"patterns": ["gmosn"], "instrument": "GMOS-N",
+     "telescope": "Gemini North 8.1 m", "site": "Maunakea", "profile": None},
+    {"patterns": ["gmoss"], "instrument": "GMOS-S",
+     "telescope": "Gemini South 8.1 m", "site": "Cerro Pachón", "profile": None},
+    {"patterns": ["goodman"], "instrument": "Goodman",
+     "telescope": "SOAR 4.1 m", "site": "Cerro Pachón", "profile": None},
+    {"patterns": ["decam"], "instrument": "DECam",
+     "telescope": "Blanco 4 m", "site": "Cerro Tololo", "profile": None},
+    {"patterns": ["lris"], "instrument": "LRIS",
+     "telescope": "Keck I 10 m", "site": "Maunakea", "profile": None},
+    {"patterns": ["deimos"], "instrument": "DEIMOS",
+     "telescope": "Keck II 10 m", "site": "Maunakea", "profile": None},
+    {"patterns": ["alfosc"], "instrument": "ALFOSC",
+     "telescope": "Nordic Optical Telescope 2.56 m", "site": "Roque de los Muchachos",
+     "profile": None},
+    {"patterns": ["efosc"], "instrument": "EFOSC2",
+     "telescope": "NTT 3.58 m", "site": "La Silla", "profile": None},
+]
+
+
+def known_instrument(*names):
+    """The :data:`KNOWN_INSTRUMENTS` entry matching any of ``names``
+    (instrument or detector names), or ``None``."""
+
+    for name in names:
+        if name is None:
+            continue
+        compact = "".join(character for character in str(name).lower()
+                          if character.isalnum())
+        if not compact:
+            continue
+        for entry in KNOWN_INSTRUMENTS:
+            if any(pattern in compact for pattern in entry["patterns"]):
+                return entry
+    return None
 
 
 DEFAULT_SETTINGS = {
@@ -479,7 +540,11 @@ DEFAULT_SETTINGS = {
             "read_noise": None,
             "saturation": None,
             "grow_pixels": 1,
+            # Detections touching the target core (target_core_radius_fwhm x
+            # the FWHM guess) are left unmasked (likely the transient) and
+            # flagged; others near the target (target_radius_fwhm) are masked.
             "reject_if_target_overlap": True,
+            "target_core_radius_fwhm": 1.0,
             "target_radius_fwhm": 3.0,
             "psf_core_radius_fwhm": 1.0,
         },
@@ -619,7 +684,19 @@ DEFAULT_SETTINGS = {
         "fit_translation": True,
         "fit_rotation": True,
         "fit_scale": True,
-        "fit_distortion": False,
+        # SIP distortion after the translation/rotation/scale fit: "auto"
+        # adopts it only when the data clearly need it (enough stars spread
+        # over the frame and over the target, a held-out RMS better by both
+        # minimums below, and a correction under the shift cap everywhere);
+        # "never" or "always". Degree 3 is tried only when 2 is not enough.
+        "distortion_mode": "auto",
+        "distortion_sip_degrees": [2, 3],
+        "distortion_minimum_stars": 30,
+        "distortion_minimum_grid_cells": 7,
+        "distortion_minimum_improvement_fraction": 0.25,
+        "distortion_minimum_improvement_arcsec": 0.05,
+        "distortion_maximum_shift_pixels": 10.0,
+        "distortion_validation_splits": 5,
         "sigma_clip": 4.0,
         "maximum_iterations": 3,
         "minimum_improvement_fraction": 0.05,
@@ -713,9 +790,19 @@ DEFAULT_SETTINGS = {
             "ensemble_minimum_snr": 15.0,
             "qc_minimum_snr": 50.0,
             # Zeropoint ("calibration" role) stars per image, spread over the
-            # field; the highest-S/N candidates win, so a small number only
-            # covers the bright end of the magnitude range.
+            # field. Candidates closest to calibration_preferred_snr (in log
+            # S/N) come first, so the sample covers the faint stars most like
+            # the science targets rather than only the brightest stars, whose
+            # cores are nearest saturation and whose catalog magnitudes are
+            # least reliable.
             "maximum_calibration_stars": 200,
+            "calibration_preferred_snr": 100.0,
+            # Stars whose quick aperture magnitude is off the catalog by more
+            # than this many robust sigmas (and at least the minimum) are
+            # rejected as PHOTOMETRIC_OUTLIER (blends, mismatches, variables);
+            # None turns the check off. They can still be astrometry stars.
+            "photometric_outlier_sigma": 5.0,
+            "photometric_outlier_minimum_mag": 0.15,
             "maximum_ensemble_stars": 50,
             "maximum_qc_anchors": 1,
             "spatial_grid": [3, 3],
@@ -859,8 +946,15 @@ DEFAULT_SETTINGS = {
         "fixed_position_photometry": True,
         "diagnostic_recenter": True,
         "maximum_diagnostic_offset_arcsec": 1.0,
+        # TARGET_CENTROID_OFFSET only for targets with at least this forced
+        # PSF S/N (a faint target's free centroid wanders) and an offset
+        # beyond 3 times its own uncertainty.
+        "diagnostic_offset_minimum_snr": 10.0,
         "save_stack": True,
         "relative_alignment_enabled": True,
+        # Only images with at least this fraction of the most stars measured
+        # in any image can be the alignment reference.
+        "relative_alignment_reference_star_fraction": 0.5,
         # Alignment check figure: the target plus this many bright, isolated
         # zeropoint stars spread over the field, cut out of every image.
         "alignment_check_stars": 4,
@@ -970,6 +1064,20 @@ DEFAULT_SETTINGS = {
         "subpixel_method": "exact",
         "subpixels": 5,
         "minimum_unmasked_fraction": 0.80,
+        # The PSF fit box reaches far into the wings: masked pixels there
+        # raise TARGET_MASKED / MASKED_PIXELS (and the cosmic-ray and trail
+        # flags) only when they carry more than this fraction of the PSF.
+        "psf_masked_weight_fraction": 0.01,
+        # Extra method "psf_recentered": the PSF fitted with a free centroid,
+        # for targets whose forced PSF S/N is at least recentered_psf_minimum_snr
+        # (clearly detected). The forced measurements are unchanged.
+        # TARGET_RECENTERED (WARN) when the centroid moves more than
+        # recentered_psf_warn_offset_arcsec from the frozen position and more
+        # than recentered_psf_warn_sigma times its own uncertainty.
+        "recentered_psf": True,
+        "recentered_psf_minimum_snr": 20.0,
+        "recentered_psf_warn_offset_arcsec": 0.1,
+        "recentered_psf_warn_sigma": 3.0,
         "local_background_estimator": "median",
         "local_background_sigma_clip": 3.0,
         "local_background_maximum_iterations": 5,
@@ -996,9 +1104,11 @@ DEFAULT_SETTINGS = {
             "user": "user",
         },
         "minimum_stars": 3,
-        # Most stars used in one zeropoint fit (highest S/N first); matches
+        # Most stars used in one zeropoint fit (those closest to
+        # preferred_star_snr first); matches
         # comparison_stars.maximum_calibration_stars.
         "maximum_stars": 200,
+        "preferred_star_snr": 100.0,
         "minimum_star_snr": 10.0,
         "maximum_catalog_error_mag": 0.10,
         "allow_missing_catalog_error": True,
@@ -1476,7 +1586,7 @@ INSTRUMENT_DEFAULTS = {
         "metadata": {
             "keywords": {
                 "object": ["OBJECT"],
-                "telescope": ["TELESCOP", "SITENAME"],
+                "telescope": ["TELESCOP"],
                 "instrument": ["INSTRUME", "DETECTOR"],
                 "detector": ["DETECTOR"],
                 "site": ["SITENAME"],
@@ -1500,10 +1610,10 @@ INSTRUMENT_DEFAULTS = {
                 "pipeline_version": ["PIPEVER"],
             },
             "fallback_values": {
-                "telescope": "FLWO 1.2m",
+                "telescope": "FLWO 1.2 m (48-inch)",
                 "instrument": "KeplerCam",
                 "detector": "KeplerCam",
-                "site": "FLWO",
+                "site": "Fred Lawrence Whipple Observatory (Mt. Hopkins)",
                 "gain": 4.45,
                 "read_noise": 7.18,
                 "saturation": 50000.0,
@@ -1861,11 +1971,18 @@ def validate_settings(settings):
         raise ValueError(
             "astrometry.maximum_match_separation_arcsec must be positive"
         )
-    if astrometry_settings.get("fit_distortion", False):
-        raise ValueError(
-            "astrometry.fit_distortion is not supported; WCS refinement intentionally "
-            "fits only translation, rotation, and scale"
-        )
+    if str(astrometry_settings.get("distortion_mode", "auto")).lower() not in {
+        "auto", "never", "always"
+    }:
+        raise ValueError("astrometry.distortion_mode must be auto, never or always")
+    degrees = astrometry_settings.get("distortion_sip_degrees", [2, 3])
+    degrees = [degrees] if isinstance(degrees, (int, float)) else list(degrees)
+    if not degrees or any(int(degree) < 2 or int(degree) > 5 for degree in degrees):
+        raise ValueError("astrometry.distortion_sip_degrees must be between 2 and 5")
+    if not 1 <= int(astrometry_settings.get("distortion_minimum_grid_cells", 7)) <= 9:
+        raise ValueError("astrometry.distortion_minimum_grid_cells must be 1-9 (3x3 grid)")
+    if float(astrometry_settings.get("distortion_maximum_shift_pixels", 10.0)) <= 0:
+        raise ValueError("astrometry.distortion_maximum_shift_pixels must be positive")
     if float(astrometry_settings.get("plate_solver_timeout_seconds", 300)) <= 0:
         raise ValueError("astrometry.plate_solver_timeout_seconds must be positive")
     plate_scale_tolerance = float(
@@ -2413,7 +2530,7 @@ def validate_settings(settings):
     allowed_preferences = {
         "{}:{}".format(kind, method)
         for kind in ("science", "difference") for method in allowed_methods
-    }
+    } | {"science:psf_recentered"}
     preferred = batch_settings.get("preferred_order", [])
     if not preferred or not set(preferred).issubset(allowed_preferences):
         raise ValueError("batch_consistency.preferred_order contains an unknown result")
